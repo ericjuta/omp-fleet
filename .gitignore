@@ -1,0 +1,15 @@
+node_modules/
+coverage/
+
+# Generated fleet state (runtime state normally lives under ~/.omp/fleet/runs)
+.fleet/
+.omp-fleet/
+runs/
+
+# Temporary files
+.tmp/
+tmp/
+*.tmp
+*.temp
+*.swp
+.DS_Store
