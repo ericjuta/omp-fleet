@@ -1,5 +1,5 @@
 ---
-name: herdr-readonly-supervisor
+name: omp-fleet-supervision
 description: Use OMP Fleet to start, inspect, stop, or review reports for a bounded read-only Herdr worker supervisor. Use when asked to keep tabs on delegated agents, monitor a Herdr worker cohort, supervise a swarm, collect done or blocked output, or observe prompt-evaluation runs. Routes only to Fleet and does not monitor repository drift.
 ---
 

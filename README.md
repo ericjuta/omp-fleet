@@ -16,10 +16,10 @@ Fleet control fails closed before creating a supervisor pane when these requirem
 
 ## Install and operate
 
-Install the immutable v0.1.1 Git tag directly over HTTPS:
+Install the immutable v0.1.2 Git tag directly over HTTPS:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.1.1'
+omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.1.2'
 ```
 
 The installed package name is `@ericjuta/omp-fleet`. Disable or re-enable it for subsequent OMP processes:
@@ -72,11 +72,11 @@ The tool requires execution approval. Start-only fields are rejected for all oth
 
 ### Model skill
 
-The installed extension package also exposes the `herdr-readonly-supervisor`
+The installed extension package also exposes the `omp-fleet-supervision`
 skill. It routes requests to monitor delegated Herdr workers, supervise a
 worker cohort, or collect terminal reports through `fleet_supervisor` and
 `/fleet`; it never invokes legacy shell supervisors. Invoke it explicitly with
-`/skill:herdr-readonly-supervisor` or let OMP select it from the request.
+`/skill:omp-fleet-supervision` or let OMP select it from the request.
 
 Fleet does not monitor Git working-tree drift, launch workers, grade reports, or
 clean up worker panes. The skill preserves those boundaries and directs
