@@ -25,8 +25,10 @@ import {
 	assertReportRecord,
 	assertRunId,
 	assertRunManifest,
+	assertRunState,
 	assertStartOptions,
 	containsControlCharacter,
+	formatTaskTitleForDisplay,
 	generateRunId,
 	isTerminalLifecycle,
 	PLUGIN_VERSION,
@@ -42,6 +44,7 @@ import {
 const DEFAULT_WORKER_PREFIX = "worker-";
 const DEFAULT_DURATION_SECONDS = 6 * 60 * 60;
 const DEFAULT_POLL_SECONDS = 30;
+const STATUS_WORKER_ROW_LIMIT = 40;
 const WORKER_PREFIX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const BUN_EXECUTABLE = /^bun(?:\.exe)?$/i;
 const BUNDLED_SIDECAR_PATH = fileURLToPath(
@@ -566,7 +569,7 @@ async function startFleet(
 		supervisor = await herdr.createSupervisorTab({
 			workspaceId,
 			cwd: repoPath,
-			label: `omp-fleet-${runId}`,
+			label: `fleet ${manifest.workerPrefix} until ${manifest.deadlineAt}`,
 			env: { HERDR_ENV: "1" },
 		});
 	} catch {
@@ -755,6 +758,13 @@ async function selectRun(
 			runId === undefined
 				? await store.findLatest(selector)
 				: await store.readManifest(runId);
+		if (manifest !== undefined) {
+			assertRunManifest(manifest);
+			safeWorkerPrefix(manifest.workerPrefix);
+			if (runId !== undefined && manifest.runId !== runId) {
+				throw new Error("manifest runId does not match requested runId");
+			}
+		}
 	} catch {
 		throw conciseFailure("Fleet could not read the requested run metadata.");
 	}
@@ -765,7 +775,9 @@ async function selectRun(
 	return { manifest, store };
 }
 
-function statusText(manifest: RunManifest): string {
+function statusText(manifest: RunManifest, state: RunState, now: Date): string {
+	const staleAfterMs =
+		Math.min(20 * 60, Math.max(5 * 60, manifest.pollSeconds * 2)) * 1_000;
 	const lines = [
 		`Fleet run ${manifest.runId}: ${manifest.lifecycle}`,
 		`Coordinator: ${agentHandle(manifest.coordinatorPaneId)}`,
@@ -774,9 +786,33 @@ function statusText(manifest: RunManifest): string {
 				? "not assigned"
 				: agentHandle(manifest.supervisorPaneId)
 		}`,
+		`Worker prefix: ${manifest.workerPrefix}`,
 		`Updated: ${manifest.updatedAt}`,
+		`Observations updated: ${state.updatedAt}`,
 		`Deadline: ${manifest.deadlineAt}`,
+		"Fleet observes only; workers may still be running.",
 	];
+	if (state.agents.length === 0) {
+		lines.push("Workers: none observed.");
+	}
+	const visibleAgents = state.agents.slice(0, STATUS_WORKER_ROW_LIMIT);
+	for (const agent of visibleAgents) {
+		const possiblyStale =
+			(agent.status === "working" || agent.status === "unknown") &&
+			now.getTime() - Date.parse(agent.lastActivityAt) > staleAfterMs;
+		const taskTitle =
+			agent.taskTitle === undefined
+				? "not observed"
+				: formatTaskTitleForDisplay(agent.taskTitle);
+		lines.push(
+			`- worker: ${agentHandle(agent.paneId)} → task: ${taskTitle} → observed state: ${agent.status}${possiblyStale ? " (possibly stale)" : ""} → last activity: ${agent.lastActivityAt} → diff: not observed → verification: not assessed`,
+		);
+	}
+	if (state.agents.length > visibleAgents.length) {
+		lines.push(
+			`Workers omitted: ${state.agents.length - visibleAgents.length}.`,
+		);
+	}
 	return lines.join("\n");
 }
 
@@ -784,12 +820,24 @@ async function statusFleet(
 	input: FleetActionInput,
 	dependencies: FleetControlDeps,
 ): Promise<FleetActionResult> {
-	const { manifest } = await selectRun(input, dependencies);
+	const { manifest, store } = await selectRun(input, dependencies);
+	let state: RunState;
+	try {
+		state = await store.readState(manifest.runId);
+		assertRunState(state);
+		if (state.runId !== manifest.runId) {
+			throw new Error("state runId does not match manifest runId");
+		}
+	} catch {
+		throw conciseFailure(
+			"Fleet could not read valid observation state for the requested run.",
+		);
+	}
 	return {
 		action: "status",
 		runId: manifest.runId,
 		lifecycle: manifest.lifecycle,
-		text: statusText(manifest),
+		text: statusText(manifest, state, currentDate(dependencies)),
 	};
 }
 

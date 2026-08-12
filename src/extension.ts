@@ -27,6 +27,7 @@ import {
 	assertRunEvent,
 	assertRunId,
 	assertRunLifecycle,
+	formatTaskTitleForDisplay,
 	isUnknownRecord,
 	type RunEvent,
 	SCHEMA_VERSION,
@@ -394,12 +395,21 @@ function renderEvent(event: RunEvent, expectedRunId: string): string {
 			return `run ${event.runId}: lifecycle ${event.lifecycle}`;
 		case "agent": {
 			const handle = agentHandle(event.agent.paneId);
-			return event.outcome === "readFailed"
-				? `run ${event.runId}: ${handle} read failed; last observed ${event.agent.status}`
-				: `run ${event.runId}: ${handle} observed ${event.agent.status}`;
+			const status =
+				event.agent.status === "blocked" || event.agent.status === "done"
+					? `${event.agent.status.toUpperCase()} observed`
+					: `observed ${event.agent.status}`;
+			const taskTitle =
+				event.agent.taskTitle === undefined
+					? ""
+					: `; taskTitle=${formatTaskTitleForDisplay(event.agent.taskTitle)}`;
+			if (event.outcome === "readFailed") {
+				return `run ${event.runId}: ${handle} read failed; last ${status}${taskTitle}`;
+			}
+			return `run ${event.runId}: ${handle} ${status}${taskTitle}`;
 		}
 		case "report":
-			return `run ${event.runId}: ${agentHandle(event.report.paneId)} observed ${event.report.status}; report ${event.report.path}`;
+			return `run ${event.runId}: ${agentHandle(event.report.paneId)} ${event.report.status.toUpperCase()} observed; report ${event.report.path}`;
 	}
 }
 
@@ -625,6 +635,11 @@ export function createFleetExtension(
 				}
 			},
 		});
+
+		const keywordApi = pi as ExtensionAPI & {
+			registerInputKeyword?(keyword: string): void;
+		};
+		keywordApi.registerInputKeyword?.("fleet");
 
 		const z = pi.zod;
 		pi.registerTool({

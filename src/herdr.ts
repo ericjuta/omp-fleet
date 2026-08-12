@@ -55,6 +55,7 @@ export interface HerdrAgent {
 	readonly name: string;
 	readonly status: AgentStatus;
 	readonly revision: string;
+	readonly taskTitle?: string;
 }
 
 export interface CreatedSupervisorTab {
@@ -457,6 +458,26 @@ function stringField(
 	return undefined;
 }
 
+const MAX_TASK_TITLE_LENGTH = 512;
+
+/** Optional untrusted task title: omit empty, control, or overlong values. */
+function extractTaskTitle(agent: JsonRecord): string | undefined {
+	for (const key of ["task_title", "taskTitle"]) {
+		const value = agent[key];
+		if (
+			typeof value !== "string" ||
+			value.length === 0 ||
+			value.length > MAX_TASK_TITLE_LENGTH ||
+			containsControlCharacter(value)
+		) {
+			continue;
+		}
+		const taskTitle = value.replace(/\s+/g, " ").trim();
+		if (taskTitle.length > 0) return taskTitle;
+	}
+	return undefined;
+}
+
 function scalarField(
 	records: readonly JsonRecord[],
 	keys: readonly string[],
@@ -604,12 +625,15 @@ export function normalizeHerdrAgent(value: unknown): HerdrAgent {
 		]) ?? paneId;
 	const status = normalizeAgentStatus(statusValue(value));
 
+	const taskTitle = extractTaskTitle(value);
+
 	return {
 		paneId,
 		workspaceId,
 		name: conciseText(name),
 		status,
 		revision: deriveRevision(value, status),
+		...(taskTitle === undefined ? {} : { taskTitle }),
 	};
 }
 

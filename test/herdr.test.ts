@@ -179,6 +179,69 @@ describe("Herdr agent normalization", () => {
 		]);
 	});
 
+	test("extracts sanitized task titles only from explicit task-title fields", () => {
+		const snakeCase = normalizeHerdrAgent({
+			pane_id: "pane-alpha",
+			workspace_id: "workspace-alpha",
+			name: "worker-alpha",
+			status: "working",
+			task_title: "  Stabilize   queue ownership  ",
+		});
+		const camelCase = normalizeHerdrAgent({
+			paneId: "pane-beta",
+			workspaceId: "workspace-alpha",
+			agentName: "worker-beta",
+			status: "blocked",
+			taskTitle: "Review bounded report output",
+		});
+
+		expect(snakeCase.taskTitle).toBe("Stabilize queue ownership");
+		expect(camelCase.taskTitle).toBe("Review bounded report output");
+	});
+
+	test("omits invalid task titles and never treats worker names as task titles", () => {
+		const workerOnly = normalizeHerdrAgent({
+			pane_id: "pane-worker",
+			workspace_id: "workspace-alpha",
+			name: "worker-alpha",
+			agent_name: "agent-alpha",
+			worker_name: "worker-alpha",
+			workerName: "worker-alpha",
+			display_name: "Worker Alpha",
+			displayName: "Worker Alpha",
+			displayAgent: "Worker Alpha",
+			status: "working",
+		});
+		const invalidTitles = [
+			normalizeHerdrAgent({
+				pane_id: "pane-control",
+				workspace_id: "workspace-alpha",
+				task_title: "unsafe\ntitle",
+			}),
+			normalizeHerdrAgent({
+				pane_id: "pane-overlong",
+				workspace_id: "workspace-alpha",
+				taskTitle: "x".repeat(513),
+			}),
+			normalizeHerdrAgent({
+				pane_id: "pane-invalid",
+				workspace_id: "workspace-alpha",
+				task_title: 42,
+			}),
+			normalizeHerdrAgent({
+				pane_id: "pane-bidi",
+				workspace_id: "workspace-alpha",
+				task_title: "unsafe\u202etitle",
+			}),
+		];
+
+		expect(workerOnly.name).toBe("worker-alpha");
+		expect(workerOnly).not.toHaveProperty("taskTitle");
+		for (const agent of invalidTitles) {
+			expect(agent).not.toHaveProperty("taskTitle");
+		}
+	});
+
 	test("derives stable literal revisions and changes them only for revision inputs", () => {
 		const first = normalizeHerdrAgent({
 			pane_id: "pane-alpha",

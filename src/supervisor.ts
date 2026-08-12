@@ -110,7 +110,8 @@ function sameObservation(
 		left.workspaceId === right.workspaceId &&
 		left.name === right.name &&
 		left.status === right.status &&
-		left.revision === right.revision
+		left.revision === right.revision &&
+		left.taskTitle === right.taskTitle
 	);
 }
 
@@ -118,7 +119,11 @@ function ownedSnapshots(
 	agents: readonly HerdrAgent[],
 	manifest: RunManifest,
 	observedAt: string,
+	previous: readonly AgentSnapshot[],
 ): AgentSnapshot[] {
+	const previousByPane = new Map(
+		previous.map((snapshot) => [snapshot.paneId, snapshot]),
+	);
 	const byPane = new Map<string, AgentSnapshot>();
 	for (const agent of agents) {
 		if (
@@ -129,14 +134,27 @@ function ownedSnapshots(
 		) {
 			continue;
 		}
-		byPane.set(agent.paneId, {
+		const prior = previousByPane.get(agent.paneId);
+		const activityChanged =
+			prior === undefined ||
+			prior.status !== agent.status ||
+			prior.revision !== agent.revision ||
+			prior.taskTitle !== agent.taskTitle;
+		const snapshot: AgentSnapshot = {
 			paneId: agent.paneId,
 			workspaceId: agent.workspaceId,
 			name: agent.name,
 			status: agent.status,
 			revision: agent.revision,
 			observedAt,
-		});
+			lastActivityAt: activityChanged
+				? observedAt
+				: (prior.lastActivityAt ?? prior.observedAt),
+		};
+		if (agent.taskTitle !== undefined) {
+			snapshot.taskTitle = agent.taskTitle;
+		}
+		byPane.set(agent.paneId, snapshot);
 	}
 	return [...byPane.values()].sort(compareSnapshots);
 }
@@ -397,7 +415,7 @@ async function sample(
 	if (signal.aborted) {
 		return state;
 	}
-	const snapshots = ownedSnapshots(agents, manifest, observedAt);
+	const snapshots = ownedSnapshots(agents, manifest, observedAt, state.agents);
 	await appendChangedObservations(
 		dependencies.store,
 		manifest,

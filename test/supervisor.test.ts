@@ -261,8 +261,16 @@ function agent(
 	name: string,
 	status: HerdrAgent["status"],
 	revision: string,
+	taskTitle?: string,
 ): HerdrAgent {
-	return { paneId, workspaceId, name, status, revision };
+	return {
+		paneId,
+		workspaceId,
+		name,
+		status,
+		revision,
+		...(taskTitle === undefined ? {} : { taskTitle }),
+	};
 }
 
 async function createRealStore(
@@ -399,6 +407,7 @@ describe("runSupervisor", () => {
 				status: "blocked",
 				revision: "rev-blocked",
 				observedAt: NOW_ISO,
+				lastActivityAt: NOW_ISO,
 			},
 			{
 				paneId: "pane-owned-done",
@@ -407,6 +416,7 @@ describe("runSupervisor", () => {
 				status: "done",
 				revision: "rev-done",
 				observedAt: NOW_ISO,
+				lastActivityAt: NOW_ISO,
 			},
 			{
 				paneId: "pane-owned-exited",
@@ -415,6 +425,7 @@ describe("runSupervisor", () => {
 				status: "exited",
 				revision: "rev-exited",
 				observedAt: NOW_ISO,
+				lastActivityAt: NOW_ISO,
 			},
 			{
 				paneId: "pane-owned-idle",
@@ -423,6 +434,7 @@ describe("runSupervisor", () => {
 				status: "idle",
 				revision: "rev-idle",
 				observedAt: NOW_ISO,
+				lastActivityAt: NOW_ISO,
 			},
 			{
 				paneId: "pane-owned-unknown",
@@ -431,6 +443,7 @@ describe("runSupervisor", () => {
 				status: "unknown",
 				revision: "rev-unknown",
 				observedAt: NOW_ISO,
+				lastActivityAt: NOW_ISO,
 			},
 			{
 				paneId: "pane-owned-working",
@@ -439,6 +452,7 @@ describe("runSupervisor", () => {
 				status: "working",
 				revision: "rev-working",
 				observedAt: NOW_ISO,
+				lastActivityAt: NOW_ISO,
 			},
 		]);
 		expect(herdr.readCalls).toEqual([
@@ -465,6 +479,167 @@ describe("runSupervisor", () => {
 		expect(JSON.stringify(store.events)).not.toContain(
 			"RAW DONE WORKER OUTPUT",
 		);
+	});
+
+	test("stamps initial activity and retains it across an unchanged later poll", async () => {
+		const manifest = makeWindowManifest(2 * POLL_SECONDS * 1_000);
+		const store = makeStore(manifest);
+		const unchanged = agent(
+			"pane-worker",
+			"workspace-main",
+			"worker-one",
+			"working",
+			"rev-a",
+			"Task alpha",
+		);
+		const herdr = new FakeHerdr([[unchanged], [unchanged]]);
+		const clock = makeClock();
+
+		await runSupervisor({ manifest }, dependencies(store, herdr, clock));
+
+		expect(
+			store.stateWrites.map(({ agents }) => {
+				const snapshot = agents[0];
+				return {
+					taskTitle: snapshot?.taskTitle,
+					observedAt: snapshot?.observedAt,
+					lastActivityAt: snapshot?.lastActivityAt,
+				};
+			}),
+		).toEqual([
+			{
+				taskTitle: "Task alpha",
+				observedAt: NOW_ISO,
+				lastActivityAt: NOW_ISO,
+			},
+			{
+				taskTitle: "Task alpha",
+				observedAt: "2026-08-11T12:00:15.000Z",
+				lastActivityAt: NOW_ISO,
+			},
+		]);
+		expect(
+			store.events.filter(
+				(event) => event.type === "agent" && event.outcome === "observed",
+			),
+		).toHaveLength(1);
+	});
+
+	test("resets activity and emits observations for status, revision, and task title changes", async () => {
+		const manifest = makeWindowManifest(4 * POLL_SECONDS * 1_000);
+		const store = makeStore(manifest);
+		const herdr = new FakeHerdr([
+			[
+				agent(
+					"pane-worker",
+					"workspace-main",
+					"worker-one",
+					"working",
+					"rev-a",
+				),
+			],
+			[agent("pane-worker", "workspace-main", "worker-one", "idle", "rev-a")],
+			[agent("pane-worker", "workspace-main", "worker-one", "idle", "rev-b")],
+			[
+				agent(
+					"pane-worker",
+					"workspace-main",
+					"worker-one",
+					"idle",
+					"rev-b",
+					"Task beta",
+				),
+			],
+		]);
+		const clock = makeClock();
+
+		await runSupervisor({ manifest }, dependencies(store, herdr, clock));
+
+		expect(
+			store.stateWrites.map(({ agents }) => {
+				const snapshot = agents[0];
+				return {
+					status: snapshot?.status,
+					revision: snapshot?.revision,
+					taskTitle: snapshot?.taskTitle,
+					observedAt: snapshot?.observedAt,
+					lastActivityAt: snapshot?.lastActivityAt,
+				};
+			}),
+		).toEqual([
+			{
+				status: "working",
+				revision: "rev-a",
+				taskTitle: undefined,
+				observedAt: NOW_ISO,
+				lastActivityAt: NOW_ISO,
+			},
+			{
+				status: "idle",
+				revision: "rev-a",
+				taskTitle: undefined,
+				observedAt: "2026-08-11T12:00:15.000Z",
+				lastActivityAt: "2026-08-11T12:00:15.000Z",
+			},
+			{
+				status: "idle",
+				revision: "rev-b",
+				taskTitle: undefined,
+				observedAt: "2026-08-11T12:00:30.000Z",
+				lastActivityAt: "2026-08-11T12:00:30.000Z",
+			},
+			{
+				status: "idle",
+				revision: "rev-b",
+				taskTitle: "Task beta",
+				observedAt: "2026-08-11T12:00:45.000Z",
+				lastActivityAt: "2026-08-11T12:00:45.000Z",
+			},
+		]);
+		expect(
+			store.events.flatMap((event) =>
+				event.type === "agent" && event.outcome === "observed"
+					? [
+							{
+								timestamp: event.timestamp,
+								status: event.agent.status,
+								revision: event.agent.revision,
+								taskTitle: event.agent.taskTitle,
+								lastActivityAt: event.agent.lastActivityAt,
+							},
+						]
+					: [],
+			),
+		).toEqual([
+			{
+				timestamp: NOW_ISO,
+				status: "working",
+				revision: "rev-a",
+				taskTitle: undefined,
+				lastActivityAt: NOW_ISO,
+			},
+			{
+				timestamp: "2026-08-11T12:00:15.000Z",
+				status: "idle",
+				revision: "rev-a",
+				taskTitle: undefined,
+				lastActivityAt: "2026-08-11T12:00:15.000Z",
+			},
+			{
+				timestamp: "2026-08-11T12:00:30.000Z",
+				status: "idle",
+				revision: "rev-b",
+				taskTitle: undefined,
+				lastActivityAt: "2026-08-11T12:00:30.000Z",
+			},
+			{
+				timestamp: "2026-08-11T12:00:45.000Z",
+				status: "idle",
+				revision: "rev-b",
+				taskTitle: "Task beta",
+				lastActivityAt: "2026-08-11T12:00:45.000Z",
+			},
+		]);
 	});
 
 	test("harvests once per literal pane, revision, and status key and re-harvests transitions", async () => {
@@ -578,6 +753,7 @@ describe("runSupervisor", () => {
 					status: "done",
 					revision: "rev-read-failure",
 					observedAt: NOW_ISO,
+					lastActivityAt: NOW_ISO,
 				},
 				outcome: "readFailed",
 				lastError: "pane read failed",

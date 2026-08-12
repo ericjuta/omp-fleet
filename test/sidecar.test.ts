@@ -738,7 +738,7 @@ describe("sidecar main", () => {
 			expect(createdSupervisor).toEqual({
 				workspaceId,
 				cwd: repoPath,
-				label: `omp-fleet-${runId}`,
+				label: `fleet worker- until ${new Date(Date.parse(createdAt) + durationSeconds * 1_000).toISOString()}`,
 				env: { HERDR_ENV: "1" },
 			});
 			expect({
@@ -836,6 +836,7 @@ describe("sidecar main", () => {
 					status: "done",
 					revision: "smoke-revision",
 					observedAt,
+					lastActivityAt: observedAt,
 				},
 			]);
 			expect(finalState.reports).toEqual([expectedReport]);

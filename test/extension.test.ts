@@ -20,6 +20,7 @@ import type {
 } from "../src/herdr.ts";
 import { RunStore } from "../src/store.ts";
 import {
+	type AgentSnapshot,
 	type ReportRecord,
 	type RunEvent,
 	type RunLifecycle,
@@ -359,6 +360,7 @@ class FakeExtensionApi {
 	commandName: string | undefined;
 	command: CommandRegistration | undefined;
 	tool: ToolRegistration | undefined;
+	readonly inputKeywords: string[] = [];
 
 	registerCommand(name: string, registration: unknown): void {
 		this.commandName = name;
@@ -367,6 +369,10 @@ class FakeExtensionApi {
 
 	registerTool(registration: unknown): void {
 		this.tool = registration as ToolRegistration;
+	}
+
+	registerInputKeyword(keyword: string): void {
+		this.inputKeywords.push(keyword);
 	}
 
 	on(event: string, handler: unknown): void {
@@ -646,6 +652,7 @@ function agentEvent(
 	timestamp: string,
 	paneId = `${workerName}-pane`,
 	revision = `revision-${status}`,
+	taskTitle?: string,
 ): RunEvent {
 	return {
 		schemaVersion: 1,
@@ -659,13 +666,15 @@ function agentEvent(
 			status,
 			revision,
 			observedAt: timestamp,
+			lastActivityAt: timestamp,
+			...(taskTitle === undefined ? {} : { taskTitle }),
 		},
 		outcome: "observed",
 	};
 }
 
 describe("fleet extension", () => {
-	test("registration exposes matching command/tool actions and performs no runtime action at load", () => {
+	test("registration uses the keyword API when the host exposes it", () => {
 		const store = new MemoryFleetStore();
 		const herdr = new FakeHerdr();
 		const api = installExtension({
@@ -679,6 +688,7 @@ describe("fleet extension", () => {
 
 		expect(api.commandName).toBe("fleet");
 		expect(api.requireTool().name).toBe("fleet_supervisor");
+		expect(api.inputKeywords).toEqual(["fleet"]);
 		expect(api.zod.enumCalls).toEqual([["start", "status", "stop", "reports"]]);
 		expect(api.zod.objectFieldCalls).toEqual([
 			["action", "hours", "pollSeconds", "prefix", "runId"],
@@ -700,6 +710,27 @@ describe("fleet extension", () => {
 		expect(herdr.runInPaneCalls).toEqual([]);
 		expect(herdr.interruptPaneCalls).toEqual([]);
 		expect(api.sentNotices).toEqual([]);
+	});
+
+	test("registration remains compatible when the host lacks the keyword API", () => {
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const api = new FakeExtensionApi();
+		Object.defineProperty(api, "registerInputKeyword", { value: undefined });
+
+		expect(() =>
+			createFleetExtension({
+				control: controlDependencies(
+					"/tmp/omp-fleet-legacy-registration-repo",
+					"/tmp/omp-fleet-legacy-registration-state",
+					store,
+					herdr,
+				),
+			})(api as unknown as ExtensionAPI),
+		).not.toThrow();
+		expect(api.commandName).toBe("fleet");
+		expect(api.requireTool().name).toBe("fleet_supervisor");
+		expect(api.inputKeywords).toEqual([]);
 	});
 
 	test("slash command and model tool map every action and parameter to the same control behavior", async () => {
@@ -735,8 +766,12 @@ describe("fleet extension", () => {
 					`Fleet run ${SURFACE_RUN_ID}: running`,
 					`Coordinator: ${agentHandle("coordinator-main")}`,
 					`Supervisor: ${agentHandle("surface-existing-pane")}`,
+					"Worker prefix: worker-",
 					"Updated: 2026-08-11T00:00:00.000Z",
+					"Observations updated: 2026-08-11T00:00:00.000Z",
 					"Deadline: 2026-08-11T06:00:00.000Z",
+					"Fleet observes only; workers may still be running.",
+					"Workers: none observed.",
 					FALSE_SUCCESS_WARNING,
 				].join("\n"),
 			},
@@ -870,6 +905,48 @@ describe("fleet extension", () => {
 		}
 	});
 
+	test("status bounds path-like task metadata and larger worker cohorts", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		populateSurfaceStore(store, canonicalRepo);
+		const agents: AgentSnapshot[] = Array.from({ length: 41 }, (_, index) => ({
+			paneId: `worker-bounded-${index}`,
+			workspaceId: "workspace-main",
+			name: `worker-${index}`,
+			status: "working",
+			revision: `revision-${index}`,
+			observedAt: "2030-01-02T03:04:05.000Z",
+			lastActivityAt: "2030-01-02T03:04:05.000Z",
+			taskTitle: "/".repeat(512),
+		}));
+		store.states.set(
+			SURFACE_RUN_ID,
+			makeState({ runId: SURFACE_RUN_ID, agents }),
+		);
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, herdr),
+		});
+		const context = new FakeExtensionContext(repoPath);
+
+		await api
+			.requireCommand()
+			.handler(`status ${SURFACE_RUN_ID}`, context.value);
+
+		const notification = context.notifications[0];
+		expect(notification?.level).toBe("info");
+		expect(notification?.text).toContain("Workers omitted: 1.");
+		expect(
+			notification?.text
+				.split("\n")
+				.filter((line) => line.startsWith("- worker:")),
+		).toHaveLength(40);
+		expect(notification?.text).toContain("\\u002f");
+		expect(notification?.text).not.toContain(" /");
+		expect(notification?.text.length).toBeLessThan(32_768);
+	});
+
 	test("managed reconciliation installs only in a valid Herdr session and shutdown clears its timer", async () => {
 		const { repoPath, stateRoot } = await fixturePaths();
 
@@ -989,7 +1066,7 @@ describe("fleet extension", () => {
 					content: [
 						METADATA_WARNING,
 						"Fleet supervisor metadata update (1 new event):",
-						`- run run-match: ${agentHandle(matchingPaneId)} observed done; report ${matchingPath}`,
+						`- run run-match: ${agentHandle(matchingPaneId)} DONE observed; report ${matchingPath}`,
 						FALSE_SUCCESS_WARNING,
 					].join("\n"),
 					display: true,
@@ -1036,6 +1113,9 @@ describe("fleet extension", () => {
 				"worker-durable-blocked",
 				"blocked",
 				"2030-01-02T03:31:00.000Z",
+				"worker-durable-blocked-pane",
+				"revision-blocked",
+				"Investigate /tmp durable blocked transition",
 			),
 			reportEvent(
 				runId,
@@ -1072,8 +1152,8 @@ describe("fleet extension", () => {
 		expect(firstNotice).toContain(
 			"Fleet supervisor metadata update (2 new events):",
 		);
-		expect(firstNotice).toContain(
-			`${agentHandle("worker-durable-blocked-pane")} observed blocked`,
+		expect(firstNotice?.split("\n")).toContain(
+			`- run ${runId}: ${agentHandle("worker-durable-blocked-pane")} BLOCKED observed; taskTitle="Investigate \\u002ftmp durable blocked transition"`,
 		);
 		expect(firstNotice).not.toContain("worker-durable-blocked");
 		expect(firstNotice).not.toContain("revision-blocked");
@@ -1087,6 +1167,8 @@ describe("fleet extension", () => {
 		expect(cursorStore.writes).toEqual([{ runId, cursor: 3 }]);
 		expect(cursorStore.values.get(runId)).toBe(3);
 		expect(JSON.stringify(api.sentNotices)).not.toContain(RAW_REPORT_SENTINEL);
+		expect(firstNotice?.split("\n").at(-1)).toBe(FALSE_SUCCESS_WARNING);
+		expect(firstNotice).not.toMatch(/verified success/i);
 
 		await context.runInterval();
 		expect(api.sentNotices).toHaveLength(1);
@@ -1109,12 +1191,13 @@ describe("fleet extension", () => {
 		context.idle = true;
 		await context.runInterval();
 		expect(api.sentNotices).toHaveLength(2);
-		expect(api.sentNotices[1]?.message.content).toContain(
-			`${agentHandle("worker-durable-done-pane")} observed done`,
+		const secondNotice = api.sentNotices[1]?.message.content;
+		expect(secondNotice?.split("\n")).toContain(
+			`- run ${runId}: ${agentHandle("worker-durable-done-pane")} DONE observed`,
 		);
-		expect(api.sentNotices[1]?.message.content).not.toContain(
-			"worker-durable-done",
-		);
+		expect(secondNotice).not.toContain("worker-durable-done");
+		expect(secondNotice?.split("\n").at(-1)).toBe(FALSE_SUCCESS_WARNING);
+		expect(secondNotice).not.toMatch(/verified success/i);
 		expect(api.sentNotices[1]?.message.content.split("\n")[0]).toBe(
 			METADATA_WARNING,
 		);
@@ -1225,8 +1308,8 @@ describe("fleet extension", () => {
 				METADATA_WARNING,
 				"Fleet supervisor metadata update (3 new events):",
 				`- run ${runId}: lifecycle stopping`,
-				`- run ${runId}: ${agentHandle(paneId)} observed blocked`,
-				`- run ${runId}: ${agentHandle(paneId)} observed done; report ${path}`,
+				`- run ${runId}: ${agentHandle(paneId)} BLOCKED observed`,
+				`- run ${runId}: ${agentHandle(paneId)} DONE observed; report ${path}`,
 				FALSE_SUCCESS_WARNING,
 			].join("\n"),
 		);
@@ -1307,7 +1390,7 @@ describe("fleet extension", () => {
 				METADATA_WARNING,
 				"Fleet supervisor metadata update (2 new events):",
 				`- run ${runId}: lifecycle running`,
-				`- run ${runId}: ${agentHandle(paneId)} observed done; report ${report.path}`,
+				`- run ${runId}: ${agentHandle(paneId)} DONE observed; report ${report.path}`,
 				FALSE_SUCCESS_WARNING,
 			].join("\n"),
 		);

@@ -11,6 +11,9 @@ import {
 	generateRunId,
 	PLUGIN_VERSION,
 	ProtocolValidationError,
+	parseAgentSnapshot,
+	parseRunEvent,
+	parseRunState,
 	reportKey,
 	reportRelativePath,
 	SCHEMA_VERSION,
@@ -316,6 +319,85 @@ describe("protocol identity invariants", () => {
 		expect(() => assertRunId(first)).not.toThrow();
 		for (const traversal of ["..", "../escape", "nested/run", "nested\\run"]) {
 			expect(() => assertRunId(traversal)).toThrow(ProtocolValidationError);
+		}
+	});
+});
+
+describe("agent snapshot protocol", () => {
+	const observedAt = "2026-08-11T12:34:56.789Z";
+	const legacySnapshot = () => ({
+		paneId: "pane-worker-17",
+		workspaceId: "workspace-alpha",
+		name: "worker-alpha",
+		status: "working",
+		revision: "refs/heads/main",
+		observedAt,
+	});
+
+	test("accepts bounded task metadata and an explicit activity timestamp", () => {
+		const snapshot = {
+			...legacySnapshot(),
+			taskTitle: "Implement snapshot activity metadata",
+			lastActivityAt: "2026-08-11T12:30:00.000Z",
+		};
+
+		expect(parseAgentSnapshot(snapshot)).toBe(snapshot);
+		expect(snapshot.taskTitle).toBe("Implement snapshot activity metadata");
+		expect(snapshot.lastActivityAt).toBe("2026-08-11T12:30:00.000Z");
+	});
+
+	test("normalizes legacy snapshots in direct state and event parses", () => {
+		const direct = legacySnapshot();
+		const stateAgent = legacySnapshot();
+		const eventAgent = legacySnapshot();
+
+		expect(parseAgentSnapshot(direct).lastActivityAt).toBe(observedAt);
+		expect(
+			parseRunState({
+				schemaVersion: SCHEMA_VERSION,
+				runId: "fleet-run",
+				updatedAt: observedAt,
+				agents: [stateAgent],
+				reports: [],
+			}).agents[0]?.lastActivityAt,
+		).toBe(observedAt);
+		const event = parseRunEvent({
+			schemaVersion: SCHEMA_VERSION,
+			runId: "fleet-run",
+			timestamp: observedAt,
+			type: "agent",
+			agent: eventAgent,
+			outcome: "observed",
+		});
+		expect(event.type).toBe("agent");
+		if (event.type !== "agent") throw new Error("expected agent event");
+		expect(event.agent.lastActivityAt).toBe(observedAt);
+	});
+
+	test("rejects invalid snapshot metadata", () => {
+		for (const taskTitle of [
+			"",
+			"line one\nline two",
+			"unsafe\u0085title",
+			"unsafe\u202etitle",
+			"x".repeat(513),
+			42,
+		]) {
+			expect(() =>
+				parseAgentSnapshot({
+					...legacySnapshot(),
+					taskTitle,
+				}),
+			).toThrow(/agent\.taskTitle/);
+		}
+
+		for (const lastActivityAt of ["", "not-a-timestamp", 42]) {
+			expect(() =>
+				parseAgentSnapshot({
+					...legacySnapshot(),
+					lastActivityAt,
+				}),
+			).toThrow(/agent\.lastActivityAt/);
 		}
 	});
 });

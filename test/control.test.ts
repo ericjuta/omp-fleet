@@ -17,6 +17,8 @@ import type {
 } from "../src/herdr.ts";
 import { RunStore } from "../src/store.ts";
 import {
+	type AgentSnapshot,
+	agentHandle,
 	type RunEvent,
 	type RunLifecycle,
 	type RunManifest,
@@ -322,6 +324,19 @@ function controlDependencies(
 	};
 }
 
+function agentSnapshot(overrides: Partial<AgentSnapshot> = {}): AgentSnapshot {
+	return {
+		paneId: "worker-pane",
+		workspaceId: "workspace-main",
+		name: "worker",
+		status: "working",
+		revision: "revision",
+		observedAt: FIXED_NOW.toISOString(),
+		lastActivityAt: FIXED_NOW.toISOString(),
+		...overrides,
+	};
+}
+
 interface PreconditionContext {
 	input: FleetActionInput;
 	dependencies: FleetControlDeps;
@@ -534,7 +549,7 @@ describe("fleet control", () => {
 			{
 				workspaceId: "workspace-main",
 				cwd: canonicalRepo,
-				label: "omp-fleet-run-fixed-001",
+				label: "fleet worker- until 2030-01-02T09:04:05.000Z",
 				env: { HERDR_ENV: "1" },
 			},
 		]);
@@ -836,6 +851,7 @@ describe("fleet control", () => {
 		});
 		store.latestManifest = selected;
 		store.manifests.set(selected.runId, selected);
+		store.states.set(selected.runId, makeState({ runId: selected.runId }));
 
 		const result = await executeFleetAction(
 			"status",
@@ -855,6 +871,271 @@ describe("fleet control", () => {
 		expect(result.text).not.toContain(canonicalRepo);
 		expect(result.text).not.toContain("workspace-main");
 		expect(result.text).not.toContain("coordinator-main");
+	});
+
+	test("status renders the metadata-only worker dashboard and observation boundary", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-dashboard";
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const manifest = makeManifest({
+			runId,
+			lifecycle: "running",
+			repoPath: canonicalRepo,
+			coordinatorPaneId: "coordinator-main",
+			supervisorTabId: "supervisor-tab",
+			supervisorPaneId: "supervisor-main",
+			supervisorCommand: "bun sidecar",
+			workerPrefix: "eval-",
+			createdAt: "2030-01-02T03:03:00.000Z",
+			updatedAt: "2030-01-02T03:03:00.000Z",
+			durationSeconds: 21_665,
+			deadlineAt: "2030-01-02T09:04:05.000Z",
+		});
+		store.manifests.set(runId, manifest);
+		store.states.set(
+			runId,
+			makeState({
+				runId,
+				updatedAt: FIXED_NOW.toISOString(),
+				agents: [
+					agentSnapshot({
+						paneId: "worker-pane-alpha",
+						name: "eval-alpha",
+						revision: "revision-alpha",
+						taskTitle: "Implement /tmp/parser",
+						lastActivityAt: "2030-01-02T03:03:00.000Z",
+					}),
+					agentSnapshot({
+						paneId: "worker-pane-beta",
+						name: "eval-beta",
+						status: "blocked",
+						revision: "revision-beta",
+						lastActivityAt: "2030-01-02T03:02:00.000Z",
+					}),
+				],
+			}),
+		);
+
+		const result = await executeFleetAction(
+			"status",
+			{ runId },
+			controlDependencies(repoPath, stateRoot, store, herdr),
+		);
+
+		expect(result).toEqual({
+			action: "status",
+			runId,
+			lifecycle: "running",
+			text: [
+				"Fleet run run-dashboard: running",
+				`Coordinator: ${agentHandle("coordinator-main")}`,
+				`Supervisor: ${agentHandle("supervisor-main")}`,
+				"Worker prefix: eval-",
+				"Updated: 2030-01-02T03:03:00.000Z",
+				"Observations updated: 2030-01-02T03:04:05.000Z",
+				"Deadline: 2030-01-02T09:04:05.000Z",
+				"Fleet observes only; workers may still be running.",
+				`- worker: ${agentHandle("worker-pane-alpha")} → task: "Implement \\u002ftmp\\u002fparser" → observed state: working → last activity: 2030-01-02T03:03:00.000Z → diff: not observed → verification: not assessed`,
+				`- worker: ${agentHandle("worker-pane-beta")} → task: not observed → observed state: blocked → last activity: 2030-01-02T03:02:00.000Z → diff: not observed → verification: not assessed`,
+			].join("\n"),
+		});
+		expect(store.readStateIds).toEqual([runId]);
+		expect(result.text).not.toContain("worker-pane-alpha");
+		expect(result.text).not.toContain("workspace-main");
+	});
+
+	test("status renders an explicit empty cohort", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-empty-cohort";
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		store.manifests.set(
+			runId,
+			makeManifest({ runId, lifecycle: "running", repoPath: canonicalRepo }),
+		);
+		store.states.set(runId, makeState({ runId }));
+
+		const result = await executeFleetAction(
+			"status",
+			{ runId },
+			controlDependencies(repoPath, stateRoot, store, herdr),
+		);
+
+		expect(result.text).toContain(
+			"Fleet observes only; workers may still be running.",
+		);
+		expect(result.text).toContain("Workers: none observed.");
+		expect(result.text).not.toContain("diff: not observed");
+	});
+
+	test("status marks only working or unknown agents beyond the cadence-aware stale boundary", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const lowerClampRunId = "run-stale-lower-clamp";
+		store.manifests.set(
+			lowerClampRunId,
+			makeManifest({
+				runId: lowerClampRunId,
+				lifecycle: "running",
+				repoPath: canonicalRepo,
+				pollSeconds: 15,
+			}),
+		);
+		store.states.set(
+			lowerClampRunId,
+			makeState({
+				runId: lowerClampRunId,
+				agents: [
+					agentSnapshot({
+						paneId: "worker-boundary",
+						taskTitle: "at five minutes",
+						lastActivityAt: "2030-01-02T02:59:05.000Z",
+					}),
+					agentSnapshot({
+						paneId: "worker-stale",
+						status: "unknown",
+						taskTitle: "over five minutes",
+						lastActivityAt: "2030-01-02T02:59:04.999Z",
+					}),
+					agentSnapshot({
+						paneId: "worker-blocked",
+						status: "blocked",
+						taskTitle: "old but blocked",
+						lastActivityAt: "2030-01-02T00:00:00.000Z",
+					}),
+				],
+			}),
+		);
+
+		const lowerClamp = await executeFleetAction(
+			"status",
+			{ runId: lowerClampRunId },
+			controlDependencies(repoPath, stateRoot, store, herdr),
+		);
+		const lowerRows = lowerClamp.text
+			.split("\n")
+			.filter((line) => line.startsWith("- worker:"));
+		expect(lowerRows).toHaveLength(3);
+		expect(lowerRows[0]).not.toContain("possibly stale");
+		expect(lowerRows[1]).toContain("possibly stale");
+		expect(lowerRows[2]).not.toContain("possibly stale");
+		expect(lowerClamp.text).not.toMatch(/\b(?:restart|resume|stop|cleanup)\b/i);
+
+		const cadenceRunId = "run-stale-cadence";
+		store.manifests.set(
+			cadenceRunId,
+			makeManifest({
+				runId: cadenceRunId,
+				lifecycle: "running",
+				repoPath: canonicalRepo,
+				pollSeconds: 240,
+			}),
+		);
+		store.states.set(
+			cadenceRunId,
+			makeState({
+				runId: cadenceRunId,
+				agents: [
+					agentSnapshot({
+						paneId: "worker-cadence-boundary",
+						status: "unknown",
+						taskTitle: "at eight minutes",
+						lastActivityAt: "2030-01-02T02:56:05.000Z",
+					}),
+					agentSnapshot({
+						paneId: "worker-cadence-stale",
+						taskTitle: "over eight minutes",
+						lastActivityAt: "2030-01-02T02:56:04.999Z",
+					}),
+				],
+			}),
+		);
+
+		const cadence = await executeFleetAction(
+			"status",
+			{ runId: cadenceRunId },
+			controlDependencies(repoPath, stateRoot, store, herdr),
+		);
+		const cadenceRows = cadence.text
+			.split("\n")
+			.filter((line) => line.startsWith("- worker:"));
+		expect(cadenceRows).toHaveLength(2);
+		expect(cadenceRows[0]).not.toContain("possibly stale");
+		expect(cadenceRows[1]).toContain("possibly stale");
+	});
+
+	test("status fails closed for unreadable invalid or mismatched observation state", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const scenarios: Array<{
+			name: string;
+			configure(store: MemoryFleetStore, runId: string): void;
+		}> = [
+			{
+				name: "unreadable",
+				configure: (store) => {
+					store.readStateError = new Error("unreadable");
+				},
+			},
+			{
+				name: "invalid",
+				configure: (store, runId) => {
+					store.states.set(runId, makeState({ runId, updatedAt: "invalid" }));
+				},
+			},
+			{
+				name: "mismatched",
+				configure: (store, runId) => {
+					store.states.set(runId, makeState({ runId: "run-other" }));
+				},
+			},
+		];
+		for (const scenario of scenarios) {
+			const runId = `run-state-${scenario.name}`;
+			const store = new MemoryFleetStore();
+			const herdr = new FakeHerdr();
+			store.manifests.set(
+				runId,
+				makeManifest({ runId, repoPath: canonicalRepo }),
+			);
+			store.states.set(runId, makeState({ runId }));
+			scenario.configure(store, runId);
+
+			await expect(
+				executeFleetAction(
+					"status",
+					{ runId },
+					controlDependencies(repoPath, stateRoot, store, herdr),
+				),
+			).rejects.toThrow(
+				"Fleet could not read valid observation state for the requested run.",
+			);
+		}
+	});
+
+	test("status rejects an invalid selected manifest before reading state", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-invalid-manifest";
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const invalidManifest = makeManifest({ runId, repoPath: canonicalRepo });
+		invalidManifest.workerPrefix = "unsafe prefix";
+		store.manifests.set(runId, invalidManifest);
+
+		await expect(
+			executeFleetAction(
+				"status",
+				{ runId },
+				controlDependencies(repoPath, stateRoot, store, herdr),
+			),
+		).rejects.toThrow("Fleet could not read the requested run metadata.");
+		expect(store.readStateIds).toEqual([]);
 	});
 
 	test("explicit run IDs reject unsafe and missing values without falling back to latest", async () => {

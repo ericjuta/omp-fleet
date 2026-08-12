@@ -59,6 +59,8 @@ export interface AgentSnapshot {
 	status: AgentStatus;
 	revision: string;
 	observedAt: string;
+	taskTitle?: string;
+	lastActivityAt: string;
 }
 
 export interface ReportRecord {
@@ -126,7 +128,19 @@ const REPORT_PATH = /^reports\/agent-[a-f0-9]{12}-report-[a-f0-9]{64}\.txt$/;
 export function containsControlCharacter(value: string): boolean {
 	for (let index = 0; index < value.length; index += 1) {
 		const codeUnit = value.charCodeAt(index);
-		if (codeUnit <= 0x1f || codeUnit === 0x7f) return true;
+		if (
+			codeUnit <= 0x1f ||
+			(codeUnit >= 0x7f && codeUnit <= 0x9f) ||
+			codeUnit === 0x061c ||
+			codeUnit === 0x200e ||
+			codeUnit === 0x200f ||
+			codeUnit === 0x2028 ||
+			codeUnit === 0x2029 ||
+			(codeUnit >= 0x202a && codeUnit <= 0x202e) ||
+			(codeUnit >= 0x2066 && codeUnit <= 0x2069)
+		) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -161,7 +175,7 @@ const MANIFEST_OPTIONAL_FIELDS = [
 	"stoppedAt",
 	"lastError",
 ] as const;
-const SNAPSHOT_FIELDS = [
+const SNAPSHOT_REQUIRED_FIELDS = [
 	"paneId",
 	"workspaceId",
 	"name",
@@ -169,6 +183,7 @@ const SNAPSHOT_FIELDS = [
 	"revision",
 	"observedAt",
 ] as const;
+const SNAPSHOT_OPTIONAL_FIELDS = ["taskTitle", "lastActivityAt"] as const;
 const REPORT_FIELDS = [
 	"key",
 	"paneId",
@@ -246,6 +261,30 @@ function assertOptionalBoundedText(
 	if (value !== undefined) {
 		assertBoundedText(value, label, maximumLength);
 	}
+}
+
+const DISPLAY_TASK_TITLE_MAX_LENGTH = 64;
+
+/** Quote, bound, and path-neutralize untrusted task metadata for one-line output. */
+export function formatTaskTitleForDisplay(value: string): string {
+	assertBoundedText(value, "taskTitle", 512);
+	let display = value;
+	if (display.length > DISPLAY_TASK_TITLE_MAX_LENGTH) {
+		let end = DISPLAY_TASK_TITLE_MAX_LENGTH - 3;
+		const preceding = display.charCodeAt(end - 1);
+		const following = display.charCodeAt(end);
+		if (
+			preceding >= 0xd800 &&
+			preceding <= 0xdbff &&
+			following >= 0xdc00 &&
+			following <= 0xdfff
+		) {
+			end -= 1;
+		}
+		display = `${display.slice(0, end)}...`;
+	}
+	const quoted = JSON.stringify(display);
+	return quoted.includes("/") ? quoted.replaceAll("/", "\\u002f") : quoted;
 }
 
 function assertIntegerInRange(
@@ -525,13 +564,24 @@ export function parseRunManifest(value: unknown): RunManifest {
 export function assertAgentSnapshot(
 	value: unknown,
 ): asserts value is AgentSnapshot {
-	const record = readRecord(value, "agent", SNAPSHOT_FIELDS);
+	const record = readRecord(
+		value,
+		"agent",
+		SNAPSHOT_REQUIRED_FIELDS,
+		SNAPSHOT_OPTIONAL_FIELDS,
+	);
 	assertOpaqueId(record["paneId"], "agent.paneId");
 	assertOpaqueId(record["workspaceId"], "agent.workspaceId");
 	assertBoundedText(record["name"], "agent.name", 512);
 	assertAgentStatus(record["status"]);
 	assertBoundedText(record["revision"], "agent.revision", 512);
 	assertIsoTimestamp(record["observedAt"], "agent.observedAt");
+	assertOptionalBoundedText(record["taskTitle"], "agent.taskTitle", 512);
+	if (record["lastActivityAt"] === undefined) {
+		record["lastActivityAt"] = record["observedAt"];
+	} else {
+		assertIsoTimestamp(record["lastActivityAt"], "agent.lastActivityAt");
+	}
 }
 
 export function parseAgentSnapshot(value: unknown): AgentSnapshot {
