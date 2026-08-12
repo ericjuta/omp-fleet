@@ -82,6 +82,13 @@ the current repository and coordinator pane.
 Prefer one evaluation case per worker. If workers modify files, isolate them
 with separate worktrees or equivalent disposable environments.
 
+Fleet stores at most 64 reports per run and stops harvesting additional eligible
+reports after the cap without a quota error. Because one worker can produce
+multiple reports across revisions or status transitions, leave headroom below
+64. Split larger case sets across runs with disjoint prefixes. Before grading,
+reconcile the dispatch ledger against distinct covered worker handles and
+report metadata rather than assuming a completed run captured every case.
+
 A worker prompt should be self-contained and end with a compact result contract:
 
 ```text
@@ -185,7 +192,7 @@ archive, redaction, and retention policy to Fleet artifacts.
 
 - Fleet captures reports only for workers observed as `done` or `blocked`.
 - Each report contains at most 262144 UTF-8 bytes and recent terminal output.
-- A run stores at most 64 reports.
+- A run stores at most 64 reports, then stops harvesting without a quota error.
 - A run completes at its deadline, not when all workers succeed.
 - Reused or overlapping prefixes can contaminate cohorts.
 - Fleet manifests do not record prompts, models, cases, rubrics, scores, or Git
