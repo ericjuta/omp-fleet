@@ -2,8 +2,6 @@
 
 `@ericjuta/omp-fleet` is an [Oh My Pi](https://github.com/can1357/oh-my-pi) extension for controlling a bounded, read-only Herdr supervisor. The OMP extension is the control plane; an independent Bun sidecar runs in its own Herdr tab/pane, polls owned workers, and records durable metadata and terminal reports outside the monitored repository.
 
-OMP Fleet is not an Obsidian taxonomy and does not organize a vault. Reports may later be deliberately exported into an `_agent/runs` taxonomy, but v0.1 performs no such export and never writes to the monitored repository.
-
 ## Requirements
 
 - Bun 1.3.0 or newer
