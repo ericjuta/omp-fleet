@@ -775,6 +775,7 @@ function statusText(manifest: RunManifest): string {
 				: agentHandle(manifest.supervisorPaneId)
 		}`,
 		`Updated: ${manifest.updatedAt}`,
+		`Deadline: ${manifest.deadlineAt}`,
 	];
 	return lines.join("\n");
 }

@@ -77,6 +77,11 @@ After `start`, retain the returned run ID and use it explicitly for `status`,
 `reports`, and `stop`. Without a run ID, Fleet selects the latest run matching
 the current repository and coordinator pane.
 
+Size each run to its expected observation window with `--hours` from 1
+through 24. Before relying on a run, check `status` for both its lifecycle and
+persisted deadline. A `completed` run is terminal and is not silently renewed;
+continued observation requires a new Fleet run.
+
 ## Worker contract
 
 Prefer one evaluation case per worker. If workers modify files, isolate them
@@ -84,10 +89,10 @@ with separate worktrees or equivalent disposable environments.
 
 Fleet stores at most 64 reports per run and stops harvesting additional eligible
 reports after the cap without a quota error. Because one worker can produce
-multiple reports across revisions or status transitions, leave headroom below
-64. Split larger case sets across runs with disjoint prefixes. Before grading,
-reconcile the dispatch ledger against distinct covered worker handles and
-report metadata rather than assuming a completed run captured every case.
+multiple reports across revisions or status transitions, leave headroom
+below 64. Split larger case sets across runs with disjoint prefixes. Before
+grading, reconcile the dispatch ledger against distinct covered worker handles
+and report metadata rather than assuming a completed run captured every case.
 
 A worker prompt should be self-contained and end with a compact result contract:
 

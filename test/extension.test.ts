@@ -736,6 +736,7 @@ describe("fleet extension", () => {
 					`Coordinator: ${agentHandle("coordinator-main")}`,
 					`Supervisor: ${agentHandle("surface-existing-pane")}`,
 					"Updated: 2026-08-11T00:00:00.000Z",
+					"Deadline: 2026-08-11T06:00:00.000Z",
 					FALSE_SUCCESS_WARNING,
 				].join("\n"),
 			},

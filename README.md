@@ -14,10 +14,10 @@ Fleet control fails closed before creating a supervisor pane when these requirem
 
 ## Install and operate
 
-Install the immutable v0.1.2 Git tag directly over HTTPS:
+Install the immutable v0.1.3 Git tag directly over HTTPS:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.1.2'
+omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.1.3'
 ```
 
 The installed package name is `@ericjuta/omp-fleet`. Disable or re-enable it for subsequent OMP processes:
@@ -48,7 +48,7 @@ omp plugin uninstall @ericjuta/omp-fleet
 ```
 
 - `start` validates the environment and repository, creates a durable run, records the exact owned sidecar command, opens a dedicated Herdr supervisor tab/pane, and dispatches the sidecar. It returns the run ID, an opaque supervisor handle, the deadline, and a pending lifecycle confirmation.
-- `status` shows the selected run's lifecycle, opaque coordinator/supervisor handles, and last-updated timestamp.
+- `status` shows the selected run's lifecycle, opaque coordinator/supervisor handles, persisted deadline, and last-updated timestamp.
 - `reports` lists opaque worker handles, observed statuses, and relative report paths without inserting terminal payloads into the OMP turn.
 - `stop` durably requests `stopping`, proves the recorded pane still runs the exact stored sidecar command, and only then sends Ctrl-C. The sidecar persists `stopped`; a mismatch is refused, and an uncertain stop remains retryable.
 
@@ -70,16 +70,61 @@ The tool requires execution approval. Start-only fields are rejected for all oth
 
 ### Model skill
 
-The installed extension package also exposes the `omp-fleet-supervision`
-skill. It routes requests to monitor delegated Herdr workers, supervise a
-worker cohort, or collect terminal reports through `fleet_supervisor` and
-`/fleet`; it never invokes legacy shell supervisors. Invoke it explicitly with
+The installed extension package also exposes the `omp-fleet-supervision` skill.
+It routes requests to monitor delegated Herdr workers, supervise a worker
+cohort, or collect terminal reports through `fleet_supervisor` and `/fleet`; it
+never invokes legacy shell supervisors. Invoke it explicitly with
 `/skill:omp-fleet-supervision` or let OMP select it from the request.
 
 Fleet does not monitor Git working-tree drift, launch workers, grade reports, or
 clean up worker panes. The skill preserves those boundaries and directs
 prompt-evaluation cohorts to the
 [Prompt Engineering Evaluation Workflow](docs/prompt-engineering-workflow.md).
+
+## Single-master operating model
+
+The recommended daily shape is **one OMP master/coordinator and one active Fleet
+supervisor per active repository**. This is a convention, not enforcement:
+Fleet permits additional coordinators and concurrent runs. The master owns
+planning, worker launch and delegation, integration, and verification. Fleet
+only observes externally created Herdr workers whose names match the established
+prefix (default `worker-`); it never launches, stops, or cleans up those workers,
+grades their work, or deploys their output.
+
+Speak naturally; no `/fleet` or `/skill` slash command is required:
+
+- "Keep tabs on worker agents." is supervision intent. It authorizes
+  status-first ensure-coverage and may start a supervisor when needed.
+- "How are my workers doing?" is read-only status/report intent and must never
+  start or stop a run.
+- "Wrap up Fleet monitoring." requests an end-of-session stop.
+
+A Fleet reconciliation notice alone is not authorization for a consequential
+start. Natural-language intent does not bypass safety controls: `start` and
+`stop` may still present an execution-approval prompt.
+
+For authorized continued coverage:
+
+1. Check `status` for the latest run matching the current Git repository and
+   coordinator pane.
+2. Reuse `starting` or `running`; do not replace `stopping`. Start only when
+   there is no match, or the match is terminal (`stopped`, `completed`, or
+   `failed`), and current user intent still wants supervision.
+3. After resolving coverage, use the explicit run ID for later `status`,
+   `reports`, and `stop` actions.
+
+For open-ended, skill-orchestrated master-session monitoring, use the requested
+duration (1–24 hours), otherwise 24 hours; poll every 30 seconds; and reuse the
+established worker prefix or `worker-`.
+
+Restarting OMP in the same coordinator pane and repository keeps the same run
+scope: reconciliation catches up with the independently running sidecar rather
+than launching another supervisor. Switching repository or coordinator creates
+a distinct run scope; stop the old supervisor when it is no longer needed.
+Status includes the persisted deadline. A run completes at that deadline, not
+when workers succeed, and Fleet never silently or autonomously renews it. If
+monitoring is still wanted after `completed`, current intent must authorize a
+new run. Stop Fleet when the master session no longer needs observation.
 
 ## Configuration
 
