@@ -12,6 +12,16 @@
 
 Fleet control fails closed before creating a supervisor pane when these requirements are not met.
 
+## Recommended companion
+
+Fleet intentionally observes existing workers without creating or controlling
+them. Pair it with
+[`pi-herdr`](https://github.com/ogulcancelik/pi-extensions/tree/main/packages/pi-herdr)
+when the coordinator also needs structured tools for Herdr layouts, terminal
+panes, and coding agents. Use `pi-herdr` to create and control the worker cohort,
+then use Fleet for bounded observation and report harvesting. It is a separate,
+optional extension; follow its upstream installation instructions.
+
 ## Install the plugin and skill
 
 Install the immutable v0.1.3 Git tag directly over HTTPS:
