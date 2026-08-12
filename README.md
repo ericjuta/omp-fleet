@@ -141,6 +141,10 @@ Stop the selected supervisor when it is no longer needed:
 
 This signals only the recorded supervisor pane after its live command exactly matches the durable ownership record. Worker panes remain untouched.
 
+For a reproducible baseline/candidate/holdout workflow around prompt-engineering
+workers, see the
+[Prompt Engineering Evaluation Workflow](docs/prompt-engineering-workflow.md).
+
 ## Safety and trust boundaries
 
 - Fleet never writes to the monitored repository.
