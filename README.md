@@ -19,8 +19,20 @@ them. Pair it with
 [`pi-herdr`](https://github.com/ogulcancelik/pi-extensions/tree/main/packages/pi-herdr)
 when the coordinator also needs structured tools for Herdr layouts, terminal
 panes, and coding agents. Use `pi-herdr` to create and control the worker cohort,
-then use Fleet for bounded observation and report harvesting. It is a separate,
-optional extension; follow its upstream installation instructions.
+then use Fleet for bounded observation and report harvesting.
+
+`pi-herdr` provides structured tools but does not bundle Herdr's standalone
+agent skill. Install the optional
+[`herdr`](https://herdr.dev/docs/agent-skill/) skill globally when the
+coordinator also needs direct access to the complete Herdr CLI:
+
+```sh
+bunx skills add "herdrdev/herdr" --skill herdr -g -a claude-code -y
+```
+
+OMP loads Claude-compatible user skills by default, so a new OMP process can
+discover this global installation. This companion skill remains separate from
+the plugin-native `omp-fleet-supervision` skill installed with Fleet below.
 
 ## Install the plugin and skill
 
