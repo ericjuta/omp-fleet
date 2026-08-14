@@ -65,6 +65,42 @@ function isDocumentedNoMatch(exitCode: number): boolean {
 	return exitCode === 1;
 }
 
+function requireCleanProbe(
+	result: CommandResult | undefined,
+	label: string,
+	allowNoMatch: boolean,
+): CommandResult {
+	if (result === undefined) {
+		throw new ProtocolStoreError(
+			`legacy lock migration could not query ${label}`,
+		);
+	}
+	if (result.timedOut === true) {
+		throw new ProtocolStoreError(
+			`legacy lock migration ${label} query timed out`,
+		);
+	}
+	if (result.stdoutTruncated === true || result.stderrTruncated === true) {
+		throw new ProtocolStoreError(
+			`legacy lock migration ${label} query was truncated`,
+		);
+	}
+	if (result.stderr.trim().length > 0) {
+		throw new ProtocolStoreError(
+			`legacy lock migration ${label} query returned stderr`,
+		);
+	}
+	if (
+		result.exitCode !== 0 &&
+		!(allowNoMatch && isDocumentedNoMatch(result.exitCode))
+	) {
+		throw new ProtocolStoreError(
+			`legacy lock migration could not query ${label}`,
+		);
+	}
+	return result;
+}
+
 export async function collectLegacyLockLiveEvidence(
 	storeRoot: string,
 	deps: LegacyLockMigrationDeps = {},
@@ -78,12 +114,11 @@ export async function collectLegacyLockLiveEvidence(
 	const root = new RunStore(storeRoot).root;
 	const lockPath = resolve(root, ".manifest-lock.sqlite");
 
-	const pgrep = await runCaptured(runner, "pgrep", ["-af", "sidecar.ts"]);
-	if (pgrep === undefined || (pgrep.exitCode !== 0 && pgrep.exitCode !== 1)) {
-		throw new ProtocolStoreError(
-			"legacy lock migration could not query sidecar PIDs",
-		);
-	}
+	const pgrep = requireCleanProbe(
+		await runCaptured(runner, "pgrep", ["-af", "sidecar.ts"]),
+		"sidecar PIDs",
+		true,
+	);
 	const sidecarPids = pgrep.stdout
 		.split("\n")
 		.map((line) => line.trim())
@@ -94,15 +129,11 @@ export async function collectLegacyLockLiveEvidence(
 		)
 		.flatMap((line) => parsePidLines(line));
 
-	const lsof = await runCaptured(runner, "lsof", ["-t", "--", lockPath]);
-	if (
-		lsof === undefined ||
-		(lsof.exitCode !== 0 && !isDocumentedNoMatch(lsof.exitCode))
-	) {
-		throw new ProtocolStoreError(
-			"legacy lock migration could not query lock holders",
-		);
-	}
+	const lsof = requireCleanProbe(
+		await runCaptured(runner, "lsof", ["-t", "--", lockPath]),
+		"lock holders",
+		true,
+	);
 	const lockHolders = isDocumentedNoMatch(lsof.exitCode)
 		? []
 		: parsePidLines(lsof.stdout);
@@ -110,7 +141,7 @@ export async function collectLegacyLockLiveEvidence(
 	const store = new RunStore(root);
 	const herdr = deps.herdr ?? new HerdrClient(runner);
 	const liveSupervisorPanes: string[] = [];
-	for (const manifest of await store.listRuns()) {
+	for (const manifest of await store.listRuns({ failOnInvalid: true })) {
 		if (
 			isTerminalLifecycle(manifest.lifecycle) ||
 			manifest.supervisorPaneId === undefined

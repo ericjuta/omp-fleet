@@ -21,8 +21,12 @@ const MANIFEST_MUTEX_DIRECTORY = ".manifest-lock.sqlite";
 const ARCHIVE_NAME = ".manifest-lock.sqlite.v0.1-file-20260814T142317Z";
 const FIXED_NOW = new Date("2026-08-14T14:23:17.000Z");
 
-function result(stdout: string, exitCode = 0): CommandResult {
-	return { stdout, stderr: "", exitCode };
+function result(
+	stdout: string,
+	exitCode = 0,
+	extra: Partial<CommandResult> = {},
+): CommandResult {
+	return { stdout, stderr: "", exitCode, ...extra };
 }
 
 function runnerFor(script: {
@@ -164,6 +168,79 @@ describe("runLegacyLockMigration", () => {
 					runner: runnerFor({ lsof: result("", 1) }),
 				}),
 			).rejects.toBeInstanceOf(ProtocolStoreError);
+		} finally {
+			await removeTempDirectory(root);
+		}
+	});
+
+	test("fails closed when a probe returns stderr, truncation, or a timeout", async () => {
+		const cases: Array<{ pgrep?: CommandResult; lsof?: CommandResult }> = [
+			{
+				pgrep: result("", 0, { stderr: "pgrep: warning\n" }),
+				lsof: result("", 1),
+			},
+			{ pgrep: result("", 0, { stdoutTruncated: true }), lsof: result("", 1) },
+			{ pgrep: result("", 0, { timedOut: true }), lsof: result("", 1) },
+			{ pgrep: result(""), lsof: result("", 1, { stderr: "lsof: warning\n" }) },
+			{ pgrep: result(""), lsof: result("12\n", 0, { stderrTruncated: true }) },
+		];
+		for (const probe of cases) {
+			const root = await makeTempDirectory("omp-fleet-migrate-cmd-");
+			try {
+				await writeFile(join(root, MANIFEST_MUTEX_DIRECTORY), "legacy\n", {
+					mode: 0o600,
+				});
+				await expect(
+					runLegacyLockMigration(root, {
+						now: FIXED_NOW,
+						runner: runnerFor(probe),
+						herdr: {
+							inspectPane: async () => {
+								throw new HerdrServerError("pane_not_found", "missing");
+							},
+						},
+					}),
+				).rejects.toBeInstanceOf(ProtocolStoreError);
+				expect(
+					(await lstat(join(root, MANIFEST_MUTEX_DIRECTORY))).isFile(),
+				).toBe(true);
+			} finally {
+				await removeTempDirectory(root);
+			}
+		}
+	});
+
+	test("fails closed when run inventory contains an invalid manifest", async () => {
+		const root = await makeTempDirectory("omp-fleet-migrate-cmd-");
+		try {
+			await writeFile(join(root, MANIFEST_MUTEX_DIRECTORY), "legacy\n", {
+				mode: 0o600,
+			});
+			const poison = join(
+				root,
+				"20260814T000000000Z-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			);
+			await mkdir(poison, { mode: 0o700 });
+			await writeFile(join(poison, "manifest.json"), "{not-json\n", {
+				mode: 0o600,
+			});
+			await expect(
+				runLegacyLockMigration(root, {
+					now: FIXED_NOW,
+					runner: runnerFor({
+						pgrep: result(""),
+						lsof: result("", 1),
+					}),
+					herdr: {
+						inspectPane: async () => {
+							throw new HerdrServerError("pane_not_found", "missing");
+						},
+					},
+				}),
+			).rejects.toThrow(/invalid manifest/);
+			expect((await lstat(join(root, MANIFEST_MUTEX_DIRECTORY))).isFile()).toBe(
+				true,
+			);
 		} finally {
 			await removeTempDirectory(root);
 		}
