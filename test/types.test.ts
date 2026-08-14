@@ -203,7 +203,7 @@ describe("start option validation", () => {
 describe("protocol identity invariants", () => {
 	test("pins protocol versions and canonical report identity to literals", () => {
 		expect(SCHEMA_VERSION).toBe(1);
-		expect(PLUGIN_VERSION).toBe("0.1.5");
+		expect(PLUGIN_VERSION).toBe("0.2.0");
 		expect(reportKey("pane-worker-17", "refs/heads/main", "done")).toBe(
 			"report-782f14e292a98a330a1f8340d6ea1f7417528ae896a24e2a8b9c9c86f111f6ba",
 		);

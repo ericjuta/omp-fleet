@@ -42,7 +42,7 @@ import {
 export { agentHandle };
 
 const COMMAND_USAGE =
-	"Usage: /fleet start [--prefix worker-] [--hours 6] [--poll-seconds 30] | /fleet status|stop|reports [run-id]";
+	"Usage: /fleet start [--prefix worker-] [--hours 6] [--poll-seconds 30] | /fleet status|stop|reports [run-id]. start requires a Herdr coordinator; stop requires the owning Herdr coordinator. status/reports are read-only across sessions. Without run-id, an in-Herdr caller selects within the current repository, Herdr workspace, and coordinator; a non-Herdr caller selects repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active. Multiple active matches in the applicable scope require an explicit run ID. An in-Herdr no-match is only coordinator-scoped, not proof that no repository-wide run exists; use a known explicit ID or non-Herdr parent discovery when another coordinator owns coverage. From another session, hand off start/stop to the appropriate Herdr coordinator.";
 const DEFAULT_RECONCILE_INTERVAL_MS = 30_000;
 const DEFAULT_NOTICE_LINE_LIMIT = 20;
 const JOURNAL_PROOF_RETRY_LIMIT = 2;
@@ -319,8 +319,17 @@ function parseToolRequest(value: unknown): ParsedFleetCommand {
 	if (prefix !== undefined && typeof prefix !== "string") {
 		throw new FleetControlError("Fleet prefix must be a string.");
 	}
-	if (hours !== undefined && typeof hours !== "number") {
-		throw new FleetControlError("Fleet hours must be a number.");
+	if (hours !== undefined) {
+		if (
+			typeof hours !== "number" ||
+			!Number.isSafeInteger(hours) ||
+			hours < 1 ||
+			hours > 24
+		) {
+			throw new FleetControlError(
+				"Fleet hours must be a safe integer from 1 through 24.",
+			);
+		}
 	}
 	if (pollSeconds !== undefined && typeof pollSeconds !== "number") {
 		throw new FleetControlError("Fleet pollSeconds must be a number.");
@@ -1293,7 +1302,8 @@ export function createFleetExtension(
 ): ExtensionFactory {
 	return (pi: ExtensionAPI): void => {
 		pi.registerCommand("fleet", {
-			description: "Control a bounded read-only Herdr fleet supervisor",
+			description:
+				"Read Fleet status/reports across sessions; without a run ID, in-Herdr selection is repository+workspace+coordinator and non-Herdr selection is repository-wide across coordinators, using sole-active then newest-terminal precedence; start requires a Herdr coordinator; stop requires the owning Herdr coordinator",
 			handler: async (arguments_, context) => {
 				try {
 					const result = await runSharedAction(
@@ -1318,17 +1328,19 @@ export function createFleetExtension(
 			name: "fleet_supervisor",
 			label: "Fleet Supervisor",
 			description:
-				"Start, inspect, stop, or list metadata-only reports for a bounded read-only Herdr supervisor. Worker states are observations, never proof of success.",
+				"Use status/reports for read-only cross-session inspection. Without runId, an in-Herdr caller selects within the current repository, Herdr workspace, and coordinator; a non-Herdr caller selects repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active. Pass an explicit run ID when more than one active run matches the applicable scope, whenever the ID is known, or when context identifies a run owned by another coordinator. An in-Herdr no-match is only coordinator-scoped, not proof that no repository-wide run exists; use a known explicit ID or non-Herdr parent discovery. start requires a Herdr coordinator; stop requires the owning Herdr coordinator; outer sessions must hand off the run ID and requested control action. Worker states are observations, never proof of success.",
 			parameters: z
 				.object({
 					action: z
 						.enum(["start", "status", "stop", "reports"])
-						.describe("Fleet action."),
+						.describe(
+							"Read-only cross-session action (status/reports) or Herdr-only control action (start/stop).",
+						),
 					runId: z
 						.string()
 						.optional()
 						.describe(
-							"Explicit run ID for status, stop, or reports; otherwise use the current matching run.",
+							"Explicit run ID for status, stop, or reports. When omitted, in-Herdr selection is scoped to the current repository, Herdr workspace, and coordinator; non-Herdr status/reports selection is repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active; multiple active matches require runId. Prefer a known ID, including for coverage owned by another coordinator. start rejects runId.",
 						),
 					prefix: z
 						.string()

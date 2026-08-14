@@ -157,10 +157,13 @@ function currentDate(dependencies: FleetControlDeps): Date {
 
 function requireHerdrEnvironment(
 	dependencies: FleetControlDeps,
+	action: "start" | "stop",
 ): Readonly<Record<string, string | undefined>> {
 	const values = dependencies.env ?? process.env;
 	if (values.HERDR_ENV !== "1") {
-		throw conciseFailure("Fleet control requires HERDR_ENV=1.");
+		throw conciseFailure(
+			`Fleet ${action} requires an OMP coordinator running inside Herdr (HERDR_ENV=1); retry this action from that coordinator.`,
+		);
 	}
 	return values;
 }
@@ -483,7 +486,7 @@ async function startFleet(
 	input: FleetActionInput,
 	dependencies: FleetControlDeps,
 ): Promise<FleetActionResult> {
-	const values = requireHerdrEnvironment(dependencies);
+	const values = requireHerdrEnvironment(dependencies, "start");
 	const workspaceId = opaqueIdentifier(
 		input.workspaceId ?? values.HERDR_WORKSPACE_ID,
 		"Workspace ID",
@@ -870,10 +873,11 @@ async function selectRun(
 	);
 	const requestedRunId =
 		input.runId === undefined ? undefined : safeRunId(input.runId);
+	const values = dependencies.env ?? process.env;
+	const inHerdr = values.HERDR_ENV === "1";
 	let coordinatorPaneId: string | undefined;
 	let workspaceId: string | undefined;
-	if (requestedRunId === undefined) {
-		const values = requireHerdrEnvironment(dependencies);
+	if (requestedRunId === undefined && inHerdr) {
 		coordinatorPaneId = opaqueIdentifier(
 			input.coordinatorPaneId ?? values.HERDR_PANE_ID,
 			"Coordinator pane ID",
@@ -907,8 +911,9 @@ async function selectRun(
 			}
 			if (
 				candidate.repoPath === repository &&
-				candidate.workspaceId === workspaceId &&
-				candidate.coordinatorPaneId === coordinatorPaneId
+				(!inHerdr ||
+					(candidate.workspaceId === workspaceId &&
+						candidate.coordinatorPaneId === coordinatorPaneId))
 			) {
 				scoped.push(candidate);
 			}
@@ -919,8 +924,11 @@ async function selectRun(
 		if (active.length > 1) {
 			const visibleIds = active.slice(0, 4).map(({ runId }) => runId);
 			const omitted = active.length - visibleIds.length;
+			const scope = inHerdr
+				? "this repository, workspace, and coordinator"
+				: "this repository across Herdr sessions";
 			throw conciseFailure(
-				`Multiple active Fleet runs match this repository, workspace, and coordinator: ${visibleIds.join(", ")}${omitted === 0 ? "" : ` (+${omitted} more)`}. Specify an explicit run ID.`,
+				`Multiple active Fleet runs match ${scope}: ${visibleIds.join(", ")}${omitted === 0 ? "" : ` (+${omitted} more)`}. Specify an explicit run ID.`,
 			);
 		}
 		selectedRunId =
@@ -941,8 +949,9 @@ async function selectRun(
 		if (
 			requestedRunId === undefined &&
 			(manifest.repoPath !== repository ||
-				manifest.workspaceId !== workspaceId ||
-				manifest.coordinatorPaneId !== coordinatorPaneId)
+				(inHerdr &&
+					(manifest.workspaceId !== workspaceId ||
+						manifest.coordinatorPaneId !== coordinatorPaneId)))
 		) {
 			throw new Error("selected manifest changed scope");
 		}
@@ -1366,7 +1375,7 @@ async function stopFleet(
 	input: FleetActionInput,
 	dependencies: FleetControlDeps,
 ): Promise<FleetActionResult> {
-	requireHerdrEnvironment(dependencies);
+	requireHerdrEnvironment(dependencies, "stop");
 	const { manifest: selected, store } = await selectRun(input, dependencies);
 	try {
 		return await store.withControlLock(selected.runId, async (current) => {

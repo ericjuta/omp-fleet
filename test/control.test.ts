@@ -1216,7 +1216,9 @@ describe("fleet control", () => {
 				{},
 				controlDependencies(repoPath, stateRoot, store, herdr),
 			),
-		).rejects.toThrow("Specify an explicit run ID");
+		).rejects.toThrow(
+			"Multiple active Fleet runs match this repository, workspace, and coordinator: run-active-beta, run-active-alpha. Specify an explicit run ID.",
+		);
 		expect(store.readManifestIds).toEqual([]);
 		expect(store.readStateIds).toEqual([]);
 	});
@@ -1258,6 +1260,283 @@ describe("fleet control", () => {
 		);
 		expect(store.readManifestIds).toEqual([active.runId]);
 		expect(store.readStateIds).toEqual([active.runId]);
+	});
+
+	test("outside Herdr, implicit status and reports recover a unique active run in the same repository", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const active = makeManifest({
+			runId: "run-unique-outer-active",
+			lifecycle: "running",
+			repoPath: canonicalRepo,
+			workspaceId: "workspace-other",
+			coordinatorPaneId: "coordinator-other",
+			createdAt: "2030-01-02T02:00:00.000Z",
+		});
+		const newerTerminal = makeManifest({
+			runId: "run-outer-terminal-newer",
+			lifecycle: "completed",
+			repoPath: canonicalRepo,
+			workspaceId: "workspace-third",
+			coordinatorPaneId: "coordinator-third",
+			createdAt: "2030-01-02T03:00:00.000Z",
+		});
+		store.manifests.set(active.runId, active);
+		store.manifests.set(newerTerminal.runId, newerTerminal);
+		store.states.set(
+			active.runId,
+			makeState({ runId: active.runId, updatedAt: FIXED_NOW.toISOString() }),
+		);
+		const dependencies = controlDependencies(
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			{
+				env: {},
+			},
+		);
+
+		for (const action of ["status", "reports"] as const) {
+			const result = await executeFleetAction(action, {}, dependencies);
+			expect(result.action).toBe(action);
+			expect(result.runId).toBe(active.runId);
+			expect(result.lifecycle).toBe("running");
+		}
+		expect(herdr.createSupervisorTabCalls).toEqual([]);
+		expect(herdr.closeTabCalls).toEqual([]);
+		expect(herdr.inspectPaneCalls).toEqual([]);
+		expect(herdr.runInPaneCalls).toEqual([]);
+	});
+
+	test("outside Herdr, implicit selection refuses multiple active repository matches with bounded IDs", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const runIds = [
+			"run-outer-active-a",
+			"run-outer-active-b",
+			"run-outer-active-c",
+			"run-outer-active-d",
+			"run-outer-active-e",
+		];
+		for (const [index, runId] of runIds.entries()) {
+			store.manifests.set(
+				runId,
+				makeManifest({
+					runId,
+					lifecycle: "running",
+					repoPath: canonicalRepo,
+					workspaceId: `workspace-${runId}`,
+					coordinatorPaneId: `coordinator-${runId}`,
+					createdAt: `2030-01-02T0${index}:00:00.000Z`,
+				}),
+			);
+		}
+
+		await expect(
+			executeFleetAction(
+				"status",
+				{},
+				controlDependencies(repoPath, stateRoot, store, herdr, { env: {} }),
+			),
+		).rejects.toThrow(
+			"Multiple active Fleet runs match this repository across Herdr sessions: run-outer-active-e, run-outer-active-d, run-outer-active-c, run-outer-active-b (+1 more). Specify an explicit run ID.",
+		);
+		expect(store.readManifestIds).toEqual([]);
+		expect(store.readStateIds).toEqual([]);
+		expect(herdr.createSupervisorTabCalls).toEqual([]);
+		expect(herdr.closeTabCalls).toEqual([]);
+	});
+
+	test("outside Herdr, implicit status and reports select the newest terminal repository match", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const older = makeManifest({
+			runId: "run-outer-terminal-older",
+			lifecycle: "completed",
+			repoPath: canonicalRepo,
+			workspaceId: "workspace-older",
+			coordinatorPaneId: "coordinator-older",
+			createdAt: "2030-01-02T01:00:00.000Z",
+		});
+		const newest = makeManifest({
+			runId: "run-outer-terminal-newest",
+			lifecycle: "completed",
+			repoPath: canonicalRepo,
+			workspaceId: "workspace-newer",
+			coordinatorPaneId: "coordinator-newer",
+			createdAt: "2030-01-02T02:00:00.000Z",
+		});
+		for (const manifest of [older, newest]) {
+			store.manifests.set(manifest.runId, manifest);
+			store.states.set(manifest.runId, makeState({ runId: manifest.runId }));
+			store.storedReports.set(manifest.runId, []);
+			store.events.set(manifest.runId, [
+				{
+					schemaVersion: 1,
+					runId: manifest.runId,
+					timestamp: manifest.updatedAt,
+					type: "lifecycle",
+					lifecycle: "completed",
+				},
+			]);
+		}
+		const dependencies = controlDependencies(
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			{
+				env: {},
+			},
+		);
+
+		for (const action of ["status", "reports"] as const) {
+			const result = await executeFleetAction(action, {}, dependencies);
+			expect(result.action).toBe(action);
+			expect(result.runId).toBe(newest.runId);
+			expect(result.lifecycle).toBe("completed");
+			expect(result.observationHealth).toBe("terminal");
+		}
+	});
+
+	test("outside Herdr, an explicit run ID is not replaced by repository fallback", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const requested = makeManifest({
+			runId: "run-outer-explicit",
+			lifecycle: "running",
+			repoPath: canonicalRepo,
+			workspaceId: "workspace-explicit",
+			coordinatorPaneId: "coordinator-explicit",
+			createdAt: "2030-01-02T01:00:00.000Z",
+		});
+		const newerActive = makeManifest({
+			runId: "run-outer-newer-active",
+			lifecycle: "running",
+			repoPath: canonicalRepo,
+			workspaceId: "workspace-newer",
+			coordinatorPaneId: "coordinator-newer",
+			createdAt: "2030-01-02T03:00:00.000Z",
+		});
+		store.manifests.set(requested.runId, requested);
+		store.manifests.set(newerActive.runId, newerActive);
+		store.states.set(
+			requested.runId,
+			makeState({
+				runId: requested.runId,
+				updatedAt: FIXED_NOW.toISOString(),
+			}),
+		);
+		const dependencies = controlDependencies(
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			{
+				env: {},
+			},
+		);
+
+		const result = await executeFleetAction(
+			"status",
+			{ runId: requested.runId },
+			dependencies,
+		);
+		expect(result.runId).toBe(requested.runId);
+		expect(store.readManifestIds).toEqual([requested.runId]);
+		expect(store.readStateIds).toEqual([requested.runId]);
+	});
+
+	test("in Herdr, implicit selection stays exact to repository, workspace, and coordinator", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const foreignActive = makeManifest({
+			runId: "run-foreign-active",
+			lifecycle: "running",
+			repoPath: canonicalRepo,
+			workspaceId: "workspace-other",
+			coordinatorPaneId: "coordinator-other",
+			createdAt: "2030-01-02T03:00:00.000Z",
+		});
+		store.manifests.set(foreignActive.runId, foreignActive);
+		store.states.set(
+			foreignActive.runId,
+			makeState({
+				runId: foreignActive.runId,
+				updatedAt: FIXED_NOW.toISOString(),
+			}),
+		);
+
+		await expect(
+			executeFleetAction(
+				"status",
+				{},
+				controlDependencies(repoPath, stateRoot, store, herdr),
+			),
+		).rejects.toThrow("No matching fleet run was found.");
+		expect(store.readManifestIds).toEqual([]);
+		expect(store.readStateIds).toEqual([]);
+
+		const outer = await executeFleetAction(
+			"status",
+			{},
+			controlDependencies(repoPath, stateRoot, store, herdr, { env: {} }),
+		);
+		expect(outer.runId).toBe(foreignActive.runId);
+	});
+
+	test("stop still requires Herdr and does not mutate from an outer session", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-outer-stop";
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				lifecycle: "running",
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-recorded",
+				coordinatorPaneId: "coordinator-recorded",
+			}),
+		);
+		const dependencies = controlDependencies(
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			{
+				env: {},
+			},
+		);
+
+		await expect(executeFleetAction("start", {}, dependencies)).rejects.toThrow(
+			"Fleet start requires an OMP coordinator running inside Herdr (HERDR_ENV=1); retry this action from that coordinator.",
+		);
+		await expect(
+			executeFleetAction("stop", { runId }, dependencies),
+		).rejects.toThrow(
+			"Fleet stop requires an OMP coordinator running inside Herdr (HERDR_ENV=1); retry this action from that coordinator.",
+		);
+		expect(store.manifests.get(runId)?.lifecycle).toBe("running");
+		expect(store.transitionManifestCalls).toEqual([]);
+		expect(herdr.assertAvailableCalls).toEqual([]);
+		expect(herdr.createSupervisorTabCalls).toEqual([]);
+		expect(herdr.closeTabCalls).toEqual([]);
+		expect(herdr.inspectPaneCalls).toEqual([]);
+		expect(herdr.runInPaneCalls).toEqual([]);
 	});
 
 	test("status renders the metadata-only worker dashboard and observation boundary", async () => {

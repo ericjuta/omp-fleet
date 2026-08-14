@@ -2,30 +2,43 @@
 
 `@ericjuta/omp-fleet` is an [Oh My Pi](https://github.com/can1357/oh-my-pi) extension for controlling a bounded, read-only Herdr supervisor. The OMP extension is the control plane; an independent Bun sidecar runs in its own Herdr tab/pane, polls owned workers, and records durable metadata and terminal reports outside the monitored repository.
 
+Shared auto-handoff is parent-session composition through Herdr tooling, not a Fleet feature. The parent (outer) session delegates coordinator A, captains, and the worker cohort with Herdr. Fleet begins only when coordinator A starts observation. Fleet does not create captains, spawn coordinators, or hand off work by itself.
+
 ## Requirements
+
+Shared for every caller:
 
 - Bun 1.3.0 or newer
 - OMP 17.2.12 or newer
-- the `herdr` CLI installed and available on `PATH`
-- an OMP session running in Herdr with `HERDR_ENV=1`, `HERDR_WORKSPACE_ID`, and `HERDR_PANE_ID`
 - an existing Git worktree as the current directory; its root must be an absolute path other than `/` or the user's home directory
 
-Fleet control fails closed before creating a supervisor pane when these requirements are not met.
+`start` and `stop` are Herdr-only. Those mutating actions also require:
+
+- the `herdr` CLI installed and available on `PATH`
+- an OMP session running in Herdr with `HERDR_ENV=1`, `HERDR_WORKSPACE_ID`, and `HERDR_PANE_ID`
+
+Read-only `status` and `reports` do not all require `HERDR_ENV`. With an explicit run ID they work from any OMP session. Without a run ID, an in-Herdr caller selects within the current repository, Herdr workspace, and coordinator; a non-Herdr caller selects repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active. Multiple active matches in the applicable scope require an explicit run ID. An in-Herdr no-match is only coordinator-scoped, not proof that no repository-wide run exists; use a known explicit ID or non-Herdr parent discovery when another coordinator owns coverage.
+
+Fleet control fails closed before creating a supervisor pane when the Herdr-only start requirements are not met.
 
 ## Recommended companion
 
 Fleet intentionally observes existing workers without creating or controlling
-them. Pair it with
+them. It does not create captains. Pair it with
 [`pi-herdr`](https://github.com/ogulcancelik/pi-extensions/tree/main/packages/pi-herdr)
-when the coordinator also needs structured tools for Herdr layouts, terminal
-panes, and coding agents. Use `pi-herdr` to create and control the worker cohort,
-then use Fleet for bounded observation and report harvesting.
+when a parent session or coordinator also needs structured tools for Herdr
+layouts, terminal panes, and coding agents. Use Herdr tooling to delegate
+coordinator A, captains, and the worker cohort, then start Fleet from inside
+coordinator A for bounded observation and report harvesting.
 
-Natural-language `fleet <task>` is coordinator composition, not Fleet executing
-the task. The coordinator may create and prompt an executor/reviewer cohort with
-Herdr/task tooling, assign it a unique prefix, ask Fleet to observe that exact
-prefix, and then independently verify the work. Fleet itself remains observation-
-only.
+Natural-language `fleet <task>` is parent/coordinator composition, not Fleet
+executing the task. The parent or coordinator A may create and prompt a captain
+plus executor/reviewer cohort with Herdr/task tooling, assign it a unique
+prefix, ask Fleet to observe that exact prefix from coordinator A, and then
+independently verify the work. Fleet itself remains observation-only and does
+not automatically delegate, start, or clean anything. A parent that is not an
+eligible Herdr coordinator hands `start`/`stop` to coordinator A through Herdr
+tooling; that automatic handoff is parent behavior, not Fleet behavior.
 
 `pi-herdr` provides structured tools but does not bundle Herdr's standalone
 agent skill. Install the optional
@@ -42,10 +55,10 @@ the plugin-native `omp-fleet-supervision` skill installed with Fleet below.
 
 ## Install the plugin and skill
 
-Install the immutable v0.1.6 Git tag directly over HTTPS:
+Install the immutable v0.2.0 Git tag directly over HTTPS:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.1.6'
+omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.2.0'
 ```
 
 This single command installs both the Fleet extension and its packaged
@@ -60,8 +73,10 @@ omp plugin disable @ericjuta/omp-fleet
 omp plugin enable @ericjuta/omp-fleet
 ```
 
-Before uninstalling, stop any active Fleet run you intend to stop; disabling
-the control plugin is not a worker-cleanup operation.
+Before uninstalling, stop any active Fleet run you intend to stop from
+coordinator A in Herdr; disabling the control plugin is not a worker-cleanup
+operation and does not remove captains or worker panes. A parent outside Herdr
+hands that `stop` to coordinator A through Herdr tooling.
 
 ```text
 /fleet stop
@@ -85,9 +100,9 @@ below.
 /fleet stop [run-id]
 ```
 
-- `start` validates the environment and repository, creates a durable run, records the exact owned sidecar command, opens a dedicated Herdr supervisor tab/pane labeled with the exact configured worker prefix plus the persisted bounded deadline, and dispatches the sidecar. It returns the run ID, an opaque supervisor handle, the deadline, and a pending lifecycle confirmation.
-- `status` is a durable persisted snapshot, not a live Herdr poll: lifecycle, `workerPrefix`, deadline, observation health, opaque coordinator/supervisor handles, last-updated time, and compact worker rows. It is read-only metadata; Fleet still observes only and does not control workers.
-- `reports` lists opaque worker handles, observed statuses, and relative report paths without inserting terminal payloads or report-body summaries into the OMP turn.
+- `start` is Herdr-only. It validates the Herdr environment and repository, creates a durable run, records the exact owned sidecar command, opens a dedicated Herdr supervisor tab/pane labeled with the exact configured worker prefix plus the persisted bounded deadline, and dispatches the sidecar. It returns the run ID, an opaque supervisor handle, the deadline, and a pending lifecycle confirmation. Start from coordinator A after the parent has already delegated that coordinator, captains, and the worker cohort through Herdr.
+- `status` is a durable persisted snapshot, not a live Herdr poll: lifecycle, `workerPrefix`, deadline, observation health, opaque coordinator/supervisor handles, last-updated time, and compact worker rows. It is read-only metadata; Fleet still observes only and does not control workers. Callers do not all need `HERDR_ENV`. With an explicit run ID, `status` works from any OMP session. Without a run ID, an in-Herdr caller selects within the current repository, Herdr workspace, and coordinator; a non-Herdr caller selects repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active.
+- `reports` lists opaque worker handles, observed statuses, and relative report paths without inserting terminal payloads or report-body summaries into the OMP turn. Like `status`, it is read-only, works cross-session with an explicit run ID, and without a run ID uses the same implicit-selection split: in-Herdr repository+workspace+coordinator, or non-Herdr repository-wide across coordinators, with sole-active then newest-terminal precedence. An in-Herdr no-match is not proof that no repository-wide run exists.
 - `stop` durably requests `stopping`. Positively empty foreground evidence may
   finalize `stopped`. Exact live ownership remains `stopping` for the sidecar to
   consume asynchronously; missing ownership, a command mismatch, or malformed
@@ -100,7 +115,7 @@ below.
   finalize it. Stop never sends Ctrl-C from an earlier command snapshot and
   never restarts, tears down, or cleans worker panes.
 
-Without `run-id`, `status`, `reports`, and `stop` select the sole active run matching the current Git repository, Herdr workspace, and coordinator pane. Multiple active runs require an explicit ID; when none is active, the newest matching terminal run is selected.
+Without `run-id`, `status` and `reports` use the implicit-selection split: an in-Herdr caller selects within the current repository, Herdr workspace, and coordinator; a non-Herdr caller selects repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active. Multiple active matches in the applicable scope require an explicit ID. An in-Herdr no-match is only coordinator-scoped, not proof that no repository-wide run exists; use a known explicit ID or non-Herdr parent discovery when another coordinator owns coverage. `stop` remains Herdr-only and, without `run-id`, still selects the sole active run matching the current Git repository, Herdr workspace, and coordinator pane, or the newest matching terminal run when none is active.
 
 ### Model tool
 
@@ -114,39 +129,49 @@ The extension also registers `fleet_supervisor`, backed by the same implementati
 | `hours` | integer | Optional bounded duration for `start`; raw omission defaults to 6 hours, while open-ended skill policy sends 24 explicitly |
 | `pollSeconds` | integer | Optional polling interval for `start` |
 
-The tool requires execution approval. Start-only fields are rejected for all other actions.
+The tool requires execution approval. Start-only fields are rejected for all other actions. `start` and `stop` remain Herdr-only. `status` and `reports` may use an explicit `runId` from any session. Without `runId`, an in-Herdr caller selects within the current repository, Herdr workspace, and coordinator; a non-Herdr caller selects repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active; they still need an explicit `runId` when more than one active run matches that scope, and should use a known ID when another coordinator owns coverage.
 
 ### Model skill (recommended)
 
-For routine coordinator use, the recommended interface is natural language plus
+For routine coordinator-A use, the recommended interface is natural language plus
 the packaged
 [`omp-fleet-supervision`](skills/omp-fleet-supervision/SKILL.md) skill.
 Supervision requests such as "keep tabs on the workers" authorize status-first
-ensure-coverage and may start a supervisor when no reliable matching coverage
-exists. Direct questions such as "show Fleet status" or "any blocked workers?"
-are informational and read-only. The skill routes through `fleet_supervisor`,
+ensure-coverage and may start a supervisor from coordinator A when no reliable
+matching coverage exists. A parent that is not that coordinator hands the
+mission to coordinator A through Herdr; Fleet does not perform the handoff.
+Direct questions such as "show Fleet status" or "any blocked workers?" are
+informational and read-only. Implicit selection still follows the in-Herdr
+repository+workspace+coordinator versus non-Herdr repository-wide split, with
+sole-active then newest-terminal precedence. The skill routes through `fleet_supervisor`,
 reuses only an exact persisted `workerPrefix` match with `current` observation
 health, applies bounded-run guidance below, and never invokes legacy shell
 supervisors.
 
 No skill slash command is required. Use `/skill:omp-fleet-supervision` when you
 specifically want to invoke the guidance, or use `/fleet` for direct human
-control. Fleet remains observation-only: it does not create, prompt, steer,
-stop, restart, or clean workers; monitor Git working-tree drift; persist cohort
-intent or verification; grade work or attach confidence; or summarize report
-bodies. For prompt-evaluation cohorts, see the
+control. Fleet remains observation-only: it does not create captains or workers;
+prompt, steer, stop, restart, or clean workers; monitor Git working-tree drift;
+persist cohort intent or verification; grade work or attach confidence; or
+summarize report bodies. For prompt-evaluation cohorts, see the
 [Prompt Engineering Evaluation Workflow](docs/prompt-engineering-workflow.md).
 
-## Single-master operating model
+## Auto-handoff operating model
 
-The recommended daily shape is **one OMP master/coordinator and one active Fleet
-supervisor per active repository**. This is a convention, not enforcement:
-Fleet permits additional coordinators and concurrent runs. The master owns
-planning, cohort creation and prompting via Herdr/task tooling, unique prefix
-assignment, integration, independent verification, and worker cleanup. Fleet
-only observes externally created Herdr workers whose names match the established
-prefix (default `worker-`); it never creates, prompts, steers, stops, restarts,
-or cleans those workers, grades their work, or deploys their output.
+The shared topology is **parent session → Herdr delegation → Fleet inside
+coordinator A**. The recommended daily shape is one coordinator A, one captain
+prefix cohort, and one active Fleet supervisor per active repository. This is a
+convention, not enforcement: Fleet permits additional coordinators and
+concurrent runs. The parent delegates coordinator A, captains, and workers
+through Herdr tooling. Coordinator A owns Fleet `start`/`stop`, captain
+selection, unique prefix assignment, integration, independent verification, and
+later worker cleanup through Herdr. Fleet only observes externally created
+Herdr workers whose names match the established prefix (default `worker-`); it
+never creates captains, prompts, steers, stops, restarts, or cleans those
+workers, grades their work, or deploys their output.
+
+Read-only `status` and `reports` accept an explicit run ID from any session. Without a run ID, an in-Herdr caller stays in repository+workspace+coordinator scope; only a non-Herdr parent may select the sole active same-repository run, or the newest terminal run when none is active, across coordinators. They do not transfer start/stop
+ownership. Fleet does not automatically begin when the parent delegates work.
 
 Speak naturally; no `/fleet` or `/skill` slash command is required. "Keep
 tabs," "monitor," and "watch" authorize status-first ensure-coverage; direct
@@ -157,15 +182,16 @@ status/report questions remain read-only:
   force-push without the required authorization.
 - "fleet it" is ambiguous; elicit or derive the concrete cohort task before
   composing. Do not blindly execute a prior task.
-- "cleanup Fleet" stops Fleet's supervisor only. Worker cleanup is separate
-  coordinator/Herdr work.
+- "cleanup Fleet" stops Fleet's supervisor only, from coordinator A in Herdr.
+  A parent outside Herdr hands that stop through Herdr tooling. Worker cleanup
+  is separate coordinator/Herdr work.
 
 - "Keep tabs on worker agents." is supervision intent. It authorizes
   status-first ensure-coverage and may start a supervisor when needed.
 - "How are my workers doing?" / "Show Fleet status." is read-only status intent
   and must never start or stop a run.
-- "Wrap up Fleet monitoring." requests an end-of-session stop of the Fleet
-  supervisor only—not worker cleanup.
+- "Wrap up Fleet monitoring." requests an end-of-session Herdr-only stop of
+  the Fleet supervisor—not worker or captain cleanup.
 
 A Fleet reconciliation notice alone is not authorization for a consequential
 start or stop. Natural-language intent does not bypass safety controls: `start`
@@ -174,8 +200,13 @@ intent is read-only and never mutates coverage.
 
 For authorized continued coverage:
 
-1. Check `status` for the scoped repository, Herdr workspace, and coordinator;
-   use a known explicit run ID when active selection is ambiguous.
+1. From coordinator A, check `status` for the scoped repository, Herdr
+   workspace, and coordinator. That coordinator-scoped no-match is not proof
+   that no repository-wide run exists; when context says another coordinator
+   owns coverage, use a known explicit run ID or non-Herdr parent discovery.
+   A non-Herdr caller may select the sole active same-repository run, or the
+   newest terminal run when none is active, across coordinators. Use a known
+   explicit run ID when active selection is ambiguous.
 2. Reuse `starting` or `running` only when persisted `workerPrefix` exactly
    matches the intended/established cohort prefix and observation health is
    `current`. An active mismatched run is not coverage: resolve whether it must
@@ -198,23 +229,27 @@ For authorized continued coverage:
    (`stopped`, `completed`, or `failed`) and current supervision intent remains.
    Bind the new explicit run ID for later `status`, `reports`, and `stop`.
 
-For open-ended, skill-orchestrated master-session monitoring, send the requested
+For open-ended, skill-orchestrated coordinator-A monitoring, send the requested
 duration (1–24 hours), otherwise 24 hours; poll every 30 seconds; reuse only an
 exact persisted `workerPrefix` match, and use `worker-` for a new run only when
 no other cohort prefix is established.
 
-Restarting OMP in the same coordinator pane and repository keeps the same run
+Restarting OMP in the same coordinator A pane and repository keeps the same run
 scope: reconciliation catches up with the independently running sidecar rather
-than launching another supervisor. Switching repository or coordinator creates
-a distinct run scope; stop the old supervisor when it is no longer needed.
-Status includes the persisted deadline. A run completes at that deadline, not
-when workers succeed, and Fleet never silently or autonomously renews it. If
-monitoring is still wanted after `completed`, current intent must authorize a
-new run. Stop Fleet when the master session no longer needs observation.
+than launching another supervisor. Switching repository creates a distinct run.
+Switching coordinator changes in-Herdr implicit `status`/`reports` selection to
+the new repository, Herdr workspace, and coordinator; it does not hide a run
+from non-Herdr repository-wide discovery or from an explicit run ID. `start` and `stop` stay Herdr-only and do not follow the
+parent automatically; stop the old supervisor from coordinator A when it is no
+longer needed. Status includes the persisted deadline. A run completes at that
+deadline, not when workers succeed, and Fleet never silently or autonomously
+renews it. If monitoring is still wanted after `completed`, current Herdr
+intent must authorize a new run from coordinator A. Stop Fleet from Herdr when
+observation is no longer needed.
 
 ## Configuration
 
-`start` derives its workspace and coordinator from `HERDR_WORKSPACE_ID` and `HERDR_PANE_ID`, and its repository from the current Git worktree.
+`start` and `stop` are Herdr-only. `start` derives its workspace and coordinator from `HERDR_WORKSPACE_ID` and `HERDR_PANE_ID`, and its repository from the current Git worktree.
 
 | Setting | Default | Allowed values |
 | --- | --- | --- |
@@ -228,8 +263,10 @@ Only agents in the selected workspace whose names begin with the prefix are obse
 
 ```mermaid
 flowchart LR
-    OMP[OMP session] -->|/fleet or fleet_supervisor| Control[OMP Fleet control plane]
-    Control -->|create dedicated tab/pane| Herdr[Herdr workspace]
+    Parent[Parent outer session] -->|Herdr tooling: delegate coordinator A, captains, and workers| Herdr[Herdr workspace]
+    CoordA[Coordinator A] -->|start or stop| Control[OMP Fleet control plane]
+    Other[Same-repo status or reports caller] -->|sole-active-else-newest-terminal| Control
+    Control -->|create dedicated tab/pane| Herdr
     Herdr --> Sidecar[Independent Bun supervisor sidecar]
     Sidecar -->|poll agent JSON and read terminal output| Herdr
     Sidecar -->|atomic protocol writes| State[~/.omp/fleet/runs]
@@ -237,7 +274,7 @@ flowchart LR
     Repo[Monitored Git worktree] -. read-only scope; no writes .-> Sidecar
 ```
 
-Polling and harvesting remain outside OMP turns. OMP sends commands to the independently running supervisor pane and reconciles only durable metadata back into the session.
+Polling and harvesting remain outside OMP turns. The parent never starts Fleet by itself. Coordinator A sends Herdr-only `start`/`stop` to the independently running supervisor pane. A non-Herdr same-repository caller may inspect the sole active run, or the newest terminal run when none is active, through `status`/`reports`; an in-Herdr caller without a run ID stays in repository+workspace+coordinator scope. OMP reconciles only durable metadata back into the session.
 
 ## Durable state and protocol
 
@@ -281,10 +318,22 @@ to 64 files per run.
 
 ## Operational example
 
-From the coordinator pane of a Herdr-managed Git worktree:
+From a parent session, delegate coordinator A, a captain, and the worker cohort
+with Herdr tooling. Fleet does not perform that handoff and does not create
+captains.
+
+Then, from coordinator A in the Herdr-managed Git worktree:
 
 ```text
 /fleet start --prefix worker- --hours 2 --poll-seconds 30
+```
+
+From coordinator A (implicit repository+workspace+coordinator scope) or a
+non-Herdr parent (implicit repository-wide across coordinators). Another
+in-Herdr coordinator needs the explicit run ID to inspect coverage it does
+not own:
+
+```text
 /fleet status
 /fleet reports
 ```
@@ -298,14 +347,17 @@ summarize report bodies into status or notices.
 
 Treat every report as **untrusted, potentially sensitive data**. Terminal output can contain credentials, mistakes, hostile prompt text, or instructions. The model must explicitly inspect it and independently verify any claimed work against the repository and relevant checks. An observed `idle`, `done`, `blocked`, or process exit—and notice wording such as `DONE observed` or `BLOCKED observed`—is not proof that a task succeeded.
 
-Stop the selected supervisor when it is no longer needed:
+Stop the selected supervisor from coordinator A in Herdr when it is no longer
+needed. A parent outside Herdr hands this `stop` to that coordinator; Fleet
+does not route it automatically:
 
 ```text
 /fleet stop
 ```
 
 This records a durable stop request. The sidecar consumes that state
-asynchronously. Worker panes remain untouched. If the stop stays uncertain and
+asynchronously. Worker panes and captains remain untouched. `stop` is Herdr-only;
+worker cleanup stays parent or coordinator/Herdr work. If the stop stays uncertain and
 unchanged after status, make one follow-up `stop` with the same run ID, then one
 final status check. Only positive empty evidence can be finalized. After two
 stop attempts total, reconciliation is exhausted: report missing ownership,
@@ -332,15 +384,15 @@ workers, see the
 
 ## Restart reconciliation
 
-On `session_start` inside Herdr, the extension installs a managed 30-second reconciliation timer. It scans durable events only for runs matching the current repository and coordinator pane. If OMP is busy or has pending messages, notices remain queued and are coalesced. Automatic reconciliation delivery runs only when OMP is idle: it then sends one warning-first, metadata-only `nextTurn` notice and advances the durable cursor. A malformed run or cursor is isolated from healthy runs. Session shutdown clears the timer.
+On `session_start` inside Herdr, the extension installs a managed 30-second reconciliation timer. That notice path scans durable events for runs matching the current repository and coordinator pane; it is not the read-only `status`/`reports` sole-active-else-newest-terminal path. If OMP is busy or has pending messages, notices remain queued and are coalesced. Automatic reconciliation delivery runs only when OMP is idle: it then sends one warning-first, metadata-only `nextTurn` notice and advances the durable cursor. A malformed run or cursor is isolated from healthy runs. Session shutdown clears the timer.
 
 Idle notices stay warning-first and observation-only. Lines retain opaque handles; agent events may include a task title when Herdr supplied one; report events label observed status explicitly without a task title field. Terminal worker transitions use `BLOCKED observed` / `DONE observed`. Notices never claim verified success, never embed report bodies, and never authorize start/stop by themselves.
 
 This lets a restarted OMP session catch up with an independently running sidecar without replaying raw names, revisions, absolute paths, or report contents, and without launching another supervisor. Reconciliation reports observations only and does not verify worker success.
 
-## v0.1 backend limitation
+## Polling backend limitation
 
-v0.1 polls Herdr agent JSON and terminal output at the configured interval. It does not consume native Herdr events. The supervisor boundary keeps a backend seam so polling can be replaced by a future Herdr event backend without changing the durable run protocol.
+The 0.2.0 supervisor still polls Herdr agent JSON and terminal output at the configured interval. It does not consume native Herdr events. The supervisor boundary keeps a backend seam so polling can be replaced by a future Herdr event backend without changing the durable run protocol.
 
 ## Development
 

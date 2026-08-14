@@ -1037,7 +1037,7 @@ describe("RunStore", () => {
 			const reportPath = join(storeRoot, runId, FIXED_REPORT.path);
 			const metadata = JSON.stringify({
 				schemaVersion: 1,
-				pluginVersion: "0.1.5",
+				pluginVersion: "0.2.1",
 				classification: "untrusted-output",
 				runId,
 				report: FIXED_REPORT,

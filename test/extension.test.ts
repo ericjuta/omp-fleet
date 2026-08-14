@@ -10,13 +10,14 @@ import { readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-import type {
-	FleetAction,
-	FleetActionInput,
-	FleetActionResult,
-	FleetControlDeps,
-	FleetHerdr,
-	FleetStore,
+import {
+	type FleetAction,
+	type FleetActionInput,
+	type FleetActionResult,
+	type FleetControlDeps,
+	FleetControlError,
+	type FleetHerdr,
+	type FleetStore,
 } from "../src/control.ts";
 import {
 	agentHandle,
@@ -291,7 +292,10 @@ class MemoryCursorStore implements FleetNoticeCursorStore {
 }
 
 class FakeSchema {
-	describe(_description: string): this {
+	description: string | undefined;
+
+	describe(description: string): this {
+		this.description = description;
 		return this;
 	}
 
@@ -319,6 +323,9 @@ class FakeSchema {
 class FakeZod {
 	readonly enumCalls: string[][] = [];
 	readonly objectFieldCalls: string[][] = [];
+	readonly objectFieldDescriptions: Array<
+		Readonly<Record<string, string | undefined>>
+	> = [];
 
 	enum(values: readonly string[]): FakeSchema {
 		this.enumCalls.push([...values]);
@@ -333,8 +340,13 @@ class FakeZod {
 		return new FakeSchema();
 	}
 
-	object(shape: Readonly<Record<string, unknown>>): FakeSchema {
+	object(shape: Readonly<Record<string, FakeSchema>>): FakeSchema {
 		this.objectFieldCalls.push(Object.keys(shape).sort());
+		this.objectFieldDescriptions.push(
+			Object.fromEntries(
+				Object.entries(shape).map(([key, schema]) => [key, schema.description]),
+			),
+		);
 		return new FakeSchema();
 	}
 }
@@ -1005,6 +1017,196 @@ describe("fleet extension", () => {
 					context.value,
 				),
 		).rejects.toThrow("Fleet status accepts only an optional runId.");
+	});
+
+	test("tool execution rejects fractional hours before executeAction", async () => {
+		const calls: Array<{
+			action: FleetAction;
+			input: FleetActionInput | undefined;
+		}> = [];
+		const api = installExtension({
+			executeAction: async (action, input) => {
+				calls.push({ action, input });
+				return {
+					action,
+					text: "Fleet start recorded.",
+					runId: "run-hours",
+					lifecycle: "starting",
+				};
+			},
+		});
+		const context = new FakeExtensionContext(
+			"/tmp/omp-fleet-registration-repo",
+		);
+		const execute = async (parameters: Record<string, unknown>) =>
+			api
+				.requireTool()
+				.execute(
+					"hours-call",
+					parameters,
+					new AbortController().signal,
+					() => {},
+					context.value,
+				);
+
+		for (const hours of [
+			1.5,
+			0,
+			25,
+			Number.NaN,
+			Number.POSITIVE_INFINITY,
+			Number.MAX_SAFE_INTEGER + 1,
+		]) {
+			await expect(execute({ action: "start", hours })).rejects.toThrow(
+				"Fleet hours must be a safe integer from 1 through 24.",
+			);
+		}
+		expect(calls).toEqual([]);
+
+		await execute({ action: "start", hours: 1 });
+		await execute({ action: "start", hours: 24 });
+		expect(calls).toStrictEqual([
+			{ action: "start", input: { durationSeconds: 3_600 } },
+			{ action: "start", input: { durationSeconds: 86_400 } },
+		]);
+	});
+
+	test("registration descriptions distinguish Herdr start/stop from cross-session status/reports discovery", () => {
+		const api = installExtension({});
+		expect(api.requireCommand().description).toBe(
+			"Read Fleet status/reports across sessions; without a run ID, in-Herdr selection is repository+workspace+coordinator and non-Herdr selection is repository-wide across coordinators, using sole-active then newest-terminal precedence; start requires a Herdr coordinator; stop requires the owning Herdr coordinator",
+		);
+		expect(api.requireTool()).toMatchObject({
+			description:
+				"Use status/reports for read-only cross-session inspection. Without runId, an in-Herdr caller selects within the current repository, Herdr workspace, and coordinator; a non-Herdr caller selects repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active. Pass an explicit run ID when more than one active run matches the applicable scope, whenever the ID is known, or when context identifies a run owned by another coordinator. An in-Herdr no-match is only coordinator-scoped, not proof that no repository-wide run exists; use a known explicit ID or non-Herdr parent discovery. start requires a Herdr coordinator; stop requires the owning Herdr coordinator; outer sessions must hand off the run ID and requested control action. Worker states are observations, never proof of success.",
+			strict: false,
+		});
+		expect(api.zod.enumCalls).toEqual([["start", "status", "stop", "reports"]]);
+		expect(api.zod.objectFieldCalls).toEqual([
+			["action", "hours", "pollSeconds", "prefix", "runId"],
+		]);
+		expect(api.zod.objectFieldDescriptions).toEqual([
+			{
+				action:
+					"Read-only cross-session action (status/reports) or Herdr-only control action (start/stop).",
+				hours: "Bounded start duration in hours (1-24).",
+				pollSeconds: "Polling interval for start in seconds (15-600).",
+				prefix: "Worker-name prefix for start. Defaults to worker-.",
+				runId:
+					"Explicit run ID for status, stop, or reports. When omitted, in-Herdr selection is scoped to the current repository, Herdr workspace, and coordinator; non-Herdr status/reports selection is repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active; multiple active matches require runId. Prefer a known ID, including for coverage owned by another coordinator. start rejects runId.",
+			},
+		]);
+	});
+
+	test("parser-facing errors steer outer sessions to status/reports discovery and coordinator handoff", async () => {
+		const api = installExtension({
+			executeAction: async (action) => {
+				throw new FleetControlError(
+					`Fleet ${action === "stop" ? "stop" : "start"} requires an OMP coordinator running inside Herdr (HERDR_ENV=1); retry this action from that coordinator.`,
+				);
+			},
+		});
+		const context = new FakeExtensionContext(
+			"/tmp/omp-fleet-registration-repo",
+		);
+		const command = api.requireCommand();
+
+		await command.handler("", context.value);
+		const required = context.notifications[0]?.text ?? "";
+		expect(context.notifications[0]?.level).toBe("error");
+		expect(required).toContain("A fleet subcommand is required.");
+		expect(required).toContain(
+			"Usage: /fleet start [--prefix worker-] [--hours 6] [--poll-seconds 30] | /fleet status|stop|reports [run-id]",
+		);
+		expect(required).toContain(
+			"start requires a Herdr coordinator; stop requires the owning Herdr coordinator",
+		);
+		expect(required).toContain("status/reports are read-only across sessions");
+		expect(required).toContain(
+			"in-Herdr caller selects within the current repository, Herdr workspace, and coordinator",
+		);
+		expect(required).toContain(
+			"a non-Herdr caller selects repository-wide across coordinators",
+		);
+		expect(required).toContain(
+			"An in-Herdr no-match is only coordinator-scoped, not proof that no repository-wide run exists",
+		);
+		expect(required).toContain(
+			"hand off start/stop to the appropriate Herdr coordinator",
+		);
+
+		await command.handler("inspect", context.value);
+		expect(context.notifications[1]?.text).toContain(
+			"Unknown fleet subcommand.",
+		);
+		expect(context.notifications[1]?.text).toContain(
+			"hand off start/stop to the appropriate Herdr coordinator",
+		);
+
+		await command.handler("status --hours 1", context.value);
+		expect(context.notifications[2]?.text).toContain(
+			"status accepts only an optional run ID.",
+		);
+		expect(context.notifications[2]?.text).toContain(
+			"Without run-id, an in-Herdr caller selects within the current repository, Herdr workspace, and coordinator",
+		);
+
+		await command.handler("start run-outer", context.value);
+		expect(context.notifications[3]?.text).toContain(
+			"Fleet start accepts only named flags.",
+		);
+
+		await command.handler("start", context.value);
+		expect(context.notifications[4]?.text).toBe(
+			"Fleet start requires an OMP coordinator running inside Herdr (HERDR_ENV=1); retry this action from that coordinator.",
+		);
+
+		await expect(
+			api
+				.requireTool()
+				.execute(
+					"herdr-required-call",
+					{ action: "stop" },
+					new AbortController().signal,
+					() => {},
+					context.value,
+				),
+		).rejects.toThrow(
+			"Fleet stop requires an OMP coordinator running inside Herdr (HERDR_ENV=1); retry this action from that coordinator.",
+		);
+		await expect(
+			api
+				.requireTool()
+				.execute(
+					"unknown-action-call",
+					{ action: "inspect" },
+					new AbortController().signal,
+					() => {},
+					context.value,
+				),
+		).rejects.toThrow(
+			"Fleet tool action must be start, status, stop, or reports.",
+		);
+
+		const passthroughContext = new FakeExtensionContext(
+			"/tmp/omp-fleet-registration-repo",
+		);
+		const passthroughApi = installExtension({
+			executeAction: async () => {
+				throw new FleetControlError(
+					"Fleet could not read the requested run metadata.",
+				);
+			},
+		});
+		await passthroughApi
+			.requireCommand()
+			.handler("status run-known", passthroughContext.value);
+		expect(passthroughContext.notifications).toEqual([
+			{
+				level: "error",
+				text: "Fleet could not read the requested run metadata.",
+			},
+		]);
 	});
 
 	test("registration remains compatible when the host lacks the keyword API", () => {
