@@ -11,6 +11,8 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 import type {
+	FleetAction,
+	FleetActionInput,
 	FleetActionResult,
 	FleetControlDeps,
 	FleetHerdr,
@@ -932,7 +934,7 @@ describe("fleet extension", () => {
 		]);
 		expect(api.requireTool()).toMatchObject({
 			approval: "exec",
-			strict: true,
+			strict: false,
 			loadMode: "essential",
 		});
 		expect([...api.handlers.keys()].sort()).toEqual([
@@ -948,6 +950,61 @@ describe("fleet extension", () => {
 		expect(herdr.inspectPaneCalls).toEqual([]);
 		expect(herdr.runInPaneCalls).toEqual([]);
 		expect(api.sentNotices).toEqual([]);
+	});
+
+	test("tool execution accepts action-only payloads and rejects invalid optional fields", async () => {
+		const calls: Array<{
+			action: FleetAction;
+			input: FleetActionInput | undefined;
+		}> = [];
+		const api = installExtension({
+			executeAction: async (action, input) => {
+				calls.push({ action, input });
+				return {
+					action,
+					text: "Fleet status recorded.",
+					runId: "run-action-only",
+					lifecycle: "running",
+				};
+			},
+		});
+		const context = new FakeExtensionContext(
+			"/tmp/omp-fleet-registration-repo",
+		);
+
+		await api
+			.requireTool()
+			.execute(
+				"action-only-call",
+				{ action: "status" },
+				new AbortController().signal,
+				() => {},
+				context.value,
+			);
+		expect(calls).toStrictEqual([{ action: "status", input: {} }]);
+
+		await expect(
+			api
+				.requireTool()
+				.execute(
+					"null-placeholder-call",
+					{ action: "status", runId: null },
+					new AbortController().signal,
+					() => {},
+					context.value,
+				),
+		).rejects.toThrow("Fleet runId must be a string.");
+		await expect(
+			api
+				.requireTool()
+				.execute(
+					"incompatible-field-call",
+					{ action: "status", prefix: "worker-" },
+					new AbortController().signal,
+					() => {},
+					context.value,
+				),
+		).rejects.toThrow("Fleet status accepts only an optional runId.");
 	});
 
 	test("registration remains compatible when the host lacks the keyword API", () => {

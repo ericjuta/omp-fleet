@@ -1351,7 +1351,10 @@ export function createFleetExtension(
 				})
 				.strict(),
 			approval: "exec",
-			strict: true,
+			// Provider strict mode turns Fleet's optional action-specific fields
+			// into required null placeholders; explicit false preserves omission.
+			// Distinct from the Zod object's .strict() unknown-key rejection.
+			strict: false,
 			loadMode: "essential",
 			async execute(_toolCallId, parameters, _signal, _onUpdate, context) {
 				try {
