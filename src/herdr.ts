@@ -62,9 +62,17 @@ export interface CreatedSupervisorTab {
 	readonly tabId: string;
 	readonly paneId: string;
 }
-export interface PaneProcessInfo {
-	readonly command: string | undefined;
-}
+export const PANE_PROCESS_KINDS = ["empty", "command", "ambiguous"] as const;
+export type PaneProcessKind = (typeof PANE_PROCESS_KINDS)[number];
+
+/** Tri-state pane inspection: empty list, exact command, or untrusted data. */
+export type PaneProcessInfo =
+	| { readonly kind: "empty" }
+	| { readonly kind: "command"; readonly command: string }
+	| { readonly kind: "ambiguous" };
+
+const EMPTY_PANE_PROCESS: PaneProcessInfo = { kind: "empty" };
+const AMBIGUOUS_PANE_PROCESS: PaneProcessInfo = { kind: "ambiguous" };
 
 export interface CreateSupervisorTabInput {
 	readonly workspaceId: string;
@@ -304,6 +312,7 @@ export function buildPaneCommand(
 	}
 	return [shellQuoteArg(executable), ...args.map(shellQuoteArg)].join(" ");
 }
+
 function normalizedPaneCommand(
 	value: unknown,
 	expectedPaneId: string,
@@ -315,30 +324,36 @@ function normalizedPaneCommand(
 	}
 
 	const processes = value["foreground_processes"];
-	if (!Array.isArray(processes) || processes.length !== 1) {
-		return { command: undefined };
+	if (!Array.isArray(processes)) {
+		return AMBIGUOUS_PANE_PROCESS;
+	}
+	if (processes.length === 0) {
+		return EMPTY_PANE_PROCESS;
+	}
+	if (processes.length !== 1) {
+		return AMBIGUOUS_PANE_PROCESS;
 	}
 	const process = processes[0];
-	if (!isUnknownRecord(process)) return { command: undefined };
+	if (!isUnknownRecord(process)) return AMBIGUOUS_PANE_PROCESS;
 	if (
 		!Number.isSafeInteger(process["pid"]) ||
 		(process["pid"] as number) < 1 ||
 		typeof process["name"] !== "string" ||
 		process["name"].length === 0
 	) {
-		return { command: undefined };
+		return AMBIGUOUS_PANE_PROCESS;
 	}
 
 	const argv = process["argv"];
 	if (!Array.isArray(argv) || argv.length === 0) {
-		return { command: undefined };
+		return AMBIGUOUS_PANE_PROCESS;
 	}
 	let rawLength = 0;
 	for (const argument of argv) {
-		if (typeof argument !== "string") return { command: undefined };
+		if (typeof argument !== "string") return AMBIGUOUS_PANE_PROCESS;
 		rawLength += argument.length;
 		if (rawLength > MAX_PANE_COMMAND_LENGTH) {
-			return { command: undefined };
+			return AMBIGUOUS_PANE_PROCESS;
 		}
 	}
 
@@ -348,11 +363,16 @@ function normalizedPaneCommand(
 			argv.slice(1) as string[],
 		);
 		return command.length <= MAX_PANE_COMMAND_LENGTH
-			? { command }
-			: { command: undefined };
+			? { kind: "command", command }
+			: AMBIGUOUS_PANE_PROCESS;
 	} catch {
-		return { command: undefined };
+		return AMBIGUOUS_PANE_PROCESS;
 	}
+}
+
+/** True only for a positively empty foreground process list. */
+export function paneProcessIsEmpty(processInfo: PaneProcessInfo): boolean {
+	return processInfo.kind === "empty";
 }
 
 /** Require a complete, canonical process argv and an exact command match. */
@@ -361,6 +381,7 @@ export function paneProcessOwnsCommand(
 	expectedCommand: string,
 ): boolean {
 	return (
+		processInfo.kind === "command" &&
 		expectedCommand.length > 0 &&
 		expectedCommand.length <= MAX_PANE_COMMAND_LENGTH &&
 		!containsControlCharacter(expectedCommand) &&
@@ -1000,11 +1021,5 @@ export class HerdrClient {
 			await this.#json(["pane", "process-info", "--pane", paneId], workspaceId),
 		);
 		return normalizedPaneCommand(result["process_info"], paneId);
-	}
-
-	async interruptPane(paneId: string, workspaceId?: string): Promise<void> {
-		assertOpaqueId(paneId, "Pane ID");
-		if (workspaceId !== undefined) assertOpaqueId(workspaceId, "Workspace ID");
-		await this.#execute(["pane", "send-keys", paneId, "C-c"], workspaceId);
 	}
 }

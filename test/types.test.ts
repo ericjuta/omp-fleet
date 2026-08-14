@@ -8,12 +8,14 @@ import {
 	assertRunManifest,
 	assertSafeRepoPath,
 	assertStartOptions,
+	assertWorkerPrefix,
 	generateRunId,
 	PLUGIN_VERSION,
 	ProtocolValidationError,
 	parseAgentSnapshot,
 	parseRunEvent,
 	parseRunState,
+	REPORT_LIMIT,
 	reportKey,
 	reportRelativePath,
 	SCHEMA_VERSION,
@@ -201,7 +203,7 @@ describe("start option validation", () => {
 describe("protocol identity invariants", () => {
 	test("pins protocol versions and canonical report identity to literals", () => {
 		expect(SCHEMA_VERSION).toBe(1);
-		expect(PLUGIN_VERSION).toBe("0.1.0");
+		expect(PLUGIN_VERSION).toBe("0.1.5");
 		expect(reportKey("pane-worker-17", "refs/heads/main", "done")).toBe(
 			"report-782f14e292a98a330a1f8340d6ea1f7417528ae896a24e2a8b9c9c86f111f6ba",
 		);
@@ -321,6 +323,57 @@ describe("protocol identity invariants", () => {
 			expect(() => assertRunId(traversal)).toThrow(ProtocolValidationError);
 		}
 	});
+	test("shares report cap and protocol-safe worker-prefix invariants", () => {
+		expect(REPORT_LIMIT).toBe(64);
+		for (const prefix of ["worker-", "A", "x".repeat(128)]) {
+			expect(() => assertWorkerPrefix(prefix)).not.toThrow();
+		}
+		for (const prefix of [
+			"",
+			"-worker",
+			"worker/",
+			"worker prefix",
+			"x".repeat(129),
+		]) {
+			expect(() => assertWorkerPrefix(prefix)).toThrow(ProtocolValidationError);
+		}
+		const options = makeStartOptions("/tmp/omp-fleet-prefix-repo");
+		expect(() =>
+			assertStartOptions({ ...options, workerPrefix: "-worker" }),
+		).toThrow(ProtocolValidationError);
+		expect(() =>
+			assertRunManifest(
+				makeManifest({ ...options, workerPrefix: "worker-safe" }),
+			),
+		).not.toThrow();
+	});
+	test("rejects schema-1 state beyond the shared report cap", () => {
+		const reports = Array.from({ length: REPORT_LIMIT + 1 }, (_, index) => {
+			const paneId = `state-cap-pane-${index}`;
+			const workerName = `state-cap-worker-${index}`;
+			const revision = `state-cap-revision-${index}`;
+			const status = "done" as const;
+			return {
+				key: reportKey(paneId, revision, status),
+				paneId,
+				workerName,
+				status,
+				revision,
+				path: reportRelativePath(paneId, workerName, revision, status),
+				observedAt: "2026-08-11T12:34:56.789Z",
+			};
+		});
+
+		expect(() =>
+			parseRunState({
+				schemaVersion: SCHEMA_VERSION,
+				runId: "state-report-cap",
+				updatedAt: "2026-08-11T12:34:56.789Z",
+				agents: [],
+				reports,
+			}),
+		).toThrow(/at most 64 records/);
+	});
 });
 
 describe("agent snapshot protocol", () => {
@@ -329,7 +382,7 @@ describe("agent snapshot protocol", () => {
 		paneId: "pane-worker-17",
 		workspaceId: "workspace-alpha",
 		name: "worker-alpha",
-		status: "working",
+		status: "working" as const,
 		revision: "refs/heads/main",
 		observedAt,
 	});

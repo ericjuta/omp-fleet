@@ -21,6 +21,12 @@ when the coordinator also needs structured tools for Herdr layouts, terminal
 panes, and coding agents. Use `pi-herdr` to create and control the worker cohort,
 then use Fleet for bounded observation and report harvesting.
 
+Natural-language `fleet <task>` is coordinator composition, not Fleet executing
+the task. The coordinator may create and prompt an executor/reviewer cohort with
+Herdr/task tooling, assign it a unique prefix, ask Fleet to observe that exact
+prefix, and then independently verify the work. Fleet itself remains observation-
+only.
+
 `pi-herdr` provides structured tools but does not bundle Herdr's standalone
 agent skill. Install the optional
 [`herdr`](https://herdr.dev/docs/agent-skill/) skill globally when the
@@ -36,10 +42,10 @@ the plugin-native `omp-fleet-supervision` skill installed with Fleet below.
 
 ## Install the plugin and skill
 
-Install the immutable v0.1.4 Git tag directly over HTTPS:
+Install the immutable v0.1.5 Git tag directly over HTTPS:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.1.4'
+omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.1.5'
 ```
 
 This single command installs both the Fleet extension and its packaged
@@ -80,11 +86,21 @@ below.
 ```
 
 - `start` validates the environment and repository, creates a durable run, records the exact owned sidecar command, opens a dedicated Herdr supervisor tab/pane labeled with the exact configured worker prefix plus the persisted bounded deadline, and dispatches the sidecar. It returns the run ID, an opaque supervisor handle, the deadline, and a pending lifecycle confirmation.
-- `status` is a live snapshot dashboard for the selected run: lifecycle and deadline, opaque coordinator/supervisor handles, last-updated time, and up to 40 compact per-worker rows plus an omitted count (observed state, bounded task title when present, last activity, and stale observations when a working/unknown worker shows no recent change). It is read-only metadata; Fleet still observes only and does not control workers.
+- `status` is a durable persisted snapshot, not a live Herdr poll: lifecycle, `workerPrefix`, deadline, observation health, opaque coordinator/supervisor handles, last-updated time, and compact worker rows. It is read-only metadata; Fleet still observes only and does not control workers.
 - `reports` lists opaque worker handles, observed statuses, and relative report paths without inserting terminal payloads or report-body summaries into the OMP turn.
-- `stop` durably requests `stopping`, proves the recorded pane still runs the exact stored sidecar command, and only then signals that supervisor pane. The sidecar persists `stopped`; a mismatch is refused, and an uncertain stop remains retryable. Stop never restarts, tears down, or cleans up worker panes.
+- `stop` durably requests `stopping`. Positively empty foreground evidence may
+  finalize `stopped`. Exact live ownership remains `stopping` for the sidecar to
+  consume asynchronously; missing ownership, a command mismatch, or malformed
+  or ambiguous inspection stays unresolved. After the initial stop and status,
+  an uncertain unchanged run permits one follow-up `stop` with the same explicit
+  run ID and one final status check—two attempts in that current-turn sequence.
+  For skill-driven reconciliation, the follow-up exhausts the allowance: a
+  later or status-first `stopping` snapshot with unknown history is reported
+  unresolved with no live coverage, without another stop. Status alone cannot
+  finalize it. Stop never sends Ctrl-C from an earlier command snapshot and
+  never restarts, tears down, or cleans worker panes.
 
-Without `run-id`, `status`, `reports`, and `stop` select the latest run matching the current Git repository and coordinator pane.
+Without `run-id`, `status`, `reports`, and `stop` select the sole active run matching the current Git repository, Herdr workspace, and coordinator pane. Multiple active runs require an explicit ID; when none is active, the newest matching terminal run is selected.
 
 ### Model tool
 
@@ -95,7 +111,7 @@ The extension also registers `fleet_supervisor`, backed by the same implementati
 | `action` | `"start" | "status" | "stop" | "reports"` | Required action |
 | `runId` | string | Optional for `status`, `stop`, and `reports`; rejected for `start` |
 | `prefix` | string | Optional worker-name prefix for `start` |
-| `hours` | integer | Optional bounded duration for `start` |
+| `hours` | integer | Optional bounded duration for `start`; raw omission defaults to 6 hours, while open-ended skill policy sends 24 explicitly |
 | `pollSeconds` | integer | Optional polling interval for `start` |
 
 The tool requires execution approval. Start-only fields are rejected for all other actions.
@@ -105,18 +121,20 @@ The tool requires execution approval. Start-only fields are rejected for all oth
 For routine coordinator use, the recommended interface is natural language plus
 the packaged
 [`omp-fleet-supervision`](skills/omp-fleet-supervision/SKILL.md) skill.
-Speak status-first and read-only when you only need eyes on the cohort—for
-example "keep tabs on the workers," "show Fleet status," or "any blocked
-workers?"—and let OMP select the skill. It routes through `fleet_supervisor`,
-prefers `status` before any start/reuse decision, applies bounded-run guidance
-below, and never invokes legacy shell supervisors.
+Supervision requests such as "keep tabs on the workers" authorize status-first
+ensure-coverage and may start a supervisor when no reliable matching coverage
+exists. Direct questions such as "show Fleet status" or "any blocked workers?"
+are informational and read-only. The skill routes through `fleet_supervisor`,
+reuses only an exact persisted `workerPrefix` match with `current` observation
+health, applies bounded-run guidance below, and never invokes legacy shell
+supervisors.
 
 No skill slash command is required. Use `/skill:omp-fleet-supervision` when you
 specifically want to invoke the guidance, or use `/fleet` for direct human
-control. Fleet remains observation-only: it does not clean up, restart, or tear
-down workers; monitor Git working-tree drift; persist cohort intent or
-verification; grade work or attach confidence; or summarize report bodies. For
-prompt-evaluation cohorts, see the
+control. Fleet remains observation-only: it does not create, prompt, steer,
+stop, restart, or clean workers; monitor Git working-tree drift; persist cohort
+intent or verification; grade work or attach confidence; or summarize report
+bodies. For prompt-evaluation cohorts, see the
 [Prompt Engineering Evaluation Workflow](docs/prompt-engineering-workflow.md).
 
 ## Single-master operating model
@@ -124,14 +142,23 @@ prompt-evaluation cohorts, see the
 The recommended daily shape is **one OMP master/coordinator and one active Fleet
 supervisor per active repository**. This is a convention, not enforcement:
 Fleet permits additional coordinators and concurrent runs. The master owns
-planning, worker launch and delegation, integration, and verification. Fleet
+planning, cohort creation and prompting via Herdr/task tooling, unique prefix
+assignment, integration, independent verification, and worker cleanup. Fleet
 only observes externally created Herdr workers whose names match the established
-prefix (default `worker-`); it never launches, stops, or cleans up those workers,
-grades their work, or deploys their output.
+prefix (default `worker-`); it never creates, prompts, steers, stops, restarts,
+or cleans those workers, grades their work, or deploys their output.
 
-Speak naturally; no `/fleet` or `/skill` slash command is required. Prefer
-status-first, read-only phrasing unless you explicitly want coverage started or
-stopped:
+Speak naturally; no `/fleet` or `/skill` slash command is required. "Keep
+tabs," "monitor," and "watch" authorize status-first ensure-coverage; direct
+status/report questions remain read-only:
+
+- "fleet rebase and push force" names a coordinator-owned cohort task; create
+  and prompt the cohort, then observe its unique prefix. Do not rebase, push, or
+  force-push without the required authorization.
+- "fleet it" is ambiguous; elicit or derive the concrete cohort task before
+  composing. Do not blindly execute a prior task.
+- "cleanup Fleet" stops Fleet's supervisor only. Worker cleanup is separate
+  coordinator/Herdr work.
 
 - "Keep tabs on worker agents." is supervision intent. It authorizes
   status-first ensure-coverage and may start a supervisor when needed.
@@ -141,22 +168,40 @@ stopped:
   supervisor only—not worker cleanup.
 
 A Fleet reconciliation notice alone is not authorization for a consequential
-start. Natural-language intent does not bypass safety controls: `start` and
-`stop` may still present an execution-approval prompt.
+start or stop. Natural-language intent does not bypass safety controls: `start`
+and `stop` may still present an execution-approval prompt. Status/report-only
+intent is read-only and never mutates coverage.
 
 For authorized continued coverage:
 
-1. Check `status` for the latest run matching the current Git repository and
-   coordinator pane.
-2. Reuse `starting` or `running`; do not replace `stopping`. Start only when
-   there is no match, or the match is terminal (`stopped`, `completed`, or
-   `failed`), and current user intent still wants supervision.
-3. After resolving coverage, use the explicit run ID for later `status`,
-   `reports`, and `stop` actions.
+1. Check `status` for the scoped repository, Herdr workspace, and coordinator;
+   use a known explicit run ID when active selection is ambiguous.
+2. Reuse `starting` or `running` only when persisted `workerPrefix` exactly
+   matches the intended/established cohort prefix and observation health is
+   `current`. An active mismatched run is not coverage: resolve whether it must
+   be stopped or kept; never silently reuse it or start ambiguously. A terminal
+   mismatch does not block an authorized start for the intended prefix.
+3. Treat `stale` or `overdue` active observation as unreliable coverage. Under
+   supervision intent, explicitly `stop` that run ID and re-`status` the same ID.
+   Informational intent reports the snapshot and stops without mutation.
+4. For a newly initiated stop, re-`status` the same run ID and, if it remains
+   `stopping` or uncertain, make one follow-up `stop` before a final status
+   check—at most two stop attempts total in that current-turn sequence. That
+   follow-up exhausts reconciliation for the run. If a later turn first finds
+   the run already `stopping`, or its prior attempt count is unknown, call no
+   further `stop`; report the run unresolved with no live coverage. Only
+   positively empty foreground-process evidence may finalize `stopped`. At the
+   applicable bound, report missing ownership, mismatch, ambiguity, or any
+   still-nonterminal run as unresolved; stop instead of resetting the allowance,
+   looping, or starting an overlapping replacement.
+5. Start the correctly prefixed replacement only after the prior run is terminal
+   (`stopped`, `completed`, or `failed`) and current supervision intent remains.
+   Bind the new explicit run ID for later `status`, `reports`, and `stop`.
 
-For open-ended, skill-orchestrated master-session monitoring, use the requested
-duration (1–24 hours), otherwise 24 hours; poll every 30 seconds; and reuse the
-established worker prefix or `worker-`.
+For open-ended, skill-orchestrated master-session monitoring, send the requested
+duration (1–24 hours), otherwise 24 hours; poll every 30 seconds; reuse only an
+exact persisted `workerPrefix` match, and use `worker-` for a new run only when
+no other cohort prefix is established.
 
 Restarting OMP in the same coordinator pane and repository keeps the same run
 scope: reconciliation catches up with the independently running sidecar rather
@@ -174,7 +219,7 @@ new run. Stop Fleet when the master session no longer needs observation.
 | Setting | Default | Allowed values |
 | --- | --- | --- |
 | `--prefix` / `prefix` | `worker-` | 1–128 letters, digits, dots, underscores, or hyphens; first character must be alphanumeric |
-| `--hours` / `hours` | `6` | integer from 1 through 24 |
+| `--hours` / `hours` | `6` when omitted by raw command/tool | integer from 1 through 24; open-ended skill policy sends `24` explicitly |
 | `--poll-seconds` / `pollSeconds` | `30` | integer from 15 through 600 |
 
 Only agents in the selected workspace whose names begin with the prefix are observed. The coordinator and supervisor panes are always excluded.
@@ -196,16 +241,21 @@ Polling and harvesting remain outside OMP turns. OMP sends commands to the indep
 
 ## Durable state and protocol
 
-The default state root is `~/.omp/fleet/runs`, outside the monitored repository. Each run gets an unpredictable timestamp/random run ID:
+The default state root is `~/.omp/fleet/runs`, outside the monitored repository.
+Each run gets an unpredictable timestamp/random run ID. Per-run SQLite lock
+files live in a private root container, not in protocol run directories:
 
 ```text
-~/.omp/fleet/runs/<run-id>/
-├── manifest.json
-├── state.json
-├── events.jsonl
-├── notice-cursor.json
-└── reports/
-    └── agent-<pane-hash>-report-<identity-hash>.txt
+~/.omp/fleet/runs/
+├── .manifest-lock.sqlite/
+│   └── <run-id>.sqlite
+└── <run-id>/
+    ├── manifest.json
+    ├── state.json
+    ├── events.jsonl
+    ├── notice-cursor.json
+    └── reports/
+        └── agent-<pane-hash>-report-<identity-hash>.txt
 ```
 
 - `manifest.json` stores schema/plugin versions, run lifecycle, workspace/repository and pane IDs, the exact owned supervisor command, worker prefix, timing bounds, timestamps, and a concise last error when present.
@@ -214,7 +264,20 @@ The default state root is `~/.omp/fleet/runs`, outside the monitored repository.
 - `notice-cursor.json` records which metadata events OMP has reconciled.
 - `reports/*.txt` starts with a visible untrusted-data warning and canonical metadata, followed by control-sanitized plain terminal text.
 
-JSON state writes and report publication are atomic. Manifest lifecycle transitions use a bounded per-run lock and compare-and-set semantics, so a concurrent stop cannot be overwritten by a stale terminal transition. Unknown future schema versions fail closed while valid writer-plugin versions remain provenance only. Fleet does not copy the process environment. Reports can contain sensitive terminal text: they are private (`0600`), are not automatically redacted, are capped at 262144 UTF-8 bytes each, and are limited to 64 files per run.
+JSON state writes and report publication are atomic. The private
+`.manifest-lock.sqlite/` container is `0700`, and each run's SQLite lock file is
+`0600`. A legacy file, symlink, or non-private object at the container path fails
+closed instead of allowing old and new lock domains to split. Manifest, state,
+event, and report transactions for a run share that bounded OS-backed per-run
+lock, so same-run operations serialize across processes while unrelated runs
+proceed independently.
+Manifest lifecycle transitions also use compare-and-set semantics,
+so a concurrent stop cannot be overwritten by a stale terminal transition.
+Unknown future schema versions fail closed while valid writer-plugin versions
+remain provenance only. Fleet does not copy the process environment. Reports
+can contain sensitive terminal text: they are private (`0600`), are not
+automatically redacted, are capped at 262144 UTF-8 bytes each, and are limited
+to 64 files per run.
 
 ## Operational example
 
@@ -226,7 +289,12 @@ From the coordinator pane of a Herdr-managed Git worktree:
 /fleet reports
 ```
 
-When a matching worker is observed as `done` or `blocked`, Fleet may harvest its terminal output once for that `(paneId, revision, status)` and record a report. A new revision or status transition may produce another report, up to the fixed per-run quota. Harvest stores the raw report under the external state root; Fleet does not summarize report bodies into status or notices.
+When a matching worker is observed as `done` or `blocked`, Fleet may harvest a
+bounded, control-sanitized terminal excerpt from a 200-line recent-unwrapped
+request once for that `(paneId, revision, status)` and record a report. A new
+revision or status transition may produce another report, up to the fixed
+per-run quota. The excerpt is not complete terminal history, and Fleet does not
+summarize report bodies into status or notices.
 
 Treat every report as **untrusted, potentially sensitive data**. Terminal output can contain credentials, mistakes, hostile prompt text, or instructions. The model must explicitly inspect it and independently verify any claimed work against the repository and relevant checks. An observed `idle`, `done`, `blocked`, or process exit—and notice wording such as `DONE observed` or `BLOCKED observed`—is not proof that a task succeeded.
 
@@ -236,7 +304,14 @@ Stop the selected supervisor when it is no longer needed:
 /fleet stop
 ```
 
-This signals only the recorded supervisor pane after its live command exactly matches the durable ownership record. Worker panes remain untouched.
+This records a durable stop request. The sidecar consumes that state
+asynchronously. Worker panes remain untouched. If the stop stays uncertain and
+unchanged after status, make one follow-up `stop` with the same run ID, then one
+final status check. Only positive empty evidence can be finalized. After two
+stop attempts total, reconciliation is exhausted: report missing ownership,
+mismatch, ambiguity, or a still-nonterminal sidecar as unresolved with no live
+coverage. A later turn that still finds `stopping` must not reset the allowance
+or call `stop` again. Status polling alone is not finalization; do not loop.
 
 For a reproducible baseline/candidate/holdout workflow around prompt-engineering
 workers, see the
@@ -251,7 +326,7 @@ workers, see the
 - Terminal transitions in notices are labeled as observations (`BLOCKED observed` / `DONE observed`), not verified outcomes.
 - Raw terminal reports are control-sanitized plain text, remain untrusted, may contain sensitive data, and never constitute model instructions. Fleet does not emit report-body summaries.
 - Observed statuses, task titles, last-activity timestamps, and stale markers are operational observations, not task-success verification, grading, or confidence.
-- Fleet never launches, restarts, closes, or cleans worker panes, and never tears them down on stop. Pre-dispatch cleanup may close only the new Fleet-owned tab; `/fleet stop` signals only an exact-command-owned supervisor pane.
+- Fleet never launches, restarts, closes, or cleans worker panes, and never tears them down on stop. Pre-dispatch cleanup may close only the new Fleet-owned tab; `/fleet stop` records durable stopping for the owned supervisor and does not signal a pane from a stale command snapshot.
 - Fleet does not monitor Git working-tree diffs, and it does not persist cohort intent, verification results, grades, or confidence scores.
 - The sidecar consumes durable stop requests after OMP restarts, ends at its bounded deadline or on a stop signal, and caps each Herdr operation to the remaining deadline.
 

@@ -21,11 +21,12 @@ import type {
 	SupervisorDependencies,
 	SupervisorSleep,
 } from "../src/supervisor.ts";
-import type {
-	ReportRecord,
-	RunEvent,
-	RunManifest,
-	RunState,
+import {
+	PLUGIN_VERSION,
+	type ReportRecord,
+	type RunEvent,
+	type RunManifest,
+	type RunState,
 } from "../src/types.ts";
 import {
 	makeManifest,
@@ -479,6 +480,54 @@ describe("sidecar main", () => {
 		expect(errors).toEqual(["omp-fleet sidecar: failed"]);
 	});
 
+	test("refuses repositories inside canonical state roots, including aliases", async () => {
+		const cases = [
+			{
+				repository: join(SIDECAR_STATE_ROOT, "run-repository-shaped"),
+				canonicalPaths: {} as Record<string, string>,
+			},
+			{
+				repository: "/alias/repository",
+				canonicalPaths: {
+					"/alias/repository": "/real/state-root/run-repository-shaped",
+					[SIDECAR_STATE_ROOT]: "/real/state-root",
+					[join(SIDECAR_STATE_ROOT, SIDECAR_RUN_ID)]:
+						"/real/state-root/sidecar-run",
+				},
+			},
+		];
+		for (const { repository, canonicalPaths } of cases) {
+			const store = new FakeSidecarStore(
+				makeSidecarManifest({ repoPath: repository }),
+			);
+			let runCalls = 0;
+			const errors: string[] = [];
+
+			const exitCode = await main(
+				["--run-id", SIDECAR_RUN_ID, "--state-root", SIDECAR_STATE_ROOT],
+				{
+					env: { HERDR_ENV: "1" },
+					store,
+					herdr: {
+						listAgents: () => Promise.resolve([]),
+						readPane: () => Promise.resolve(""),
+					},
+					canonicalizePath: (path) =>
+						Promise.resolve(canonicalPaths[path] ?? path),
+					run: (options) => {
+						runCalls += 1;
+						return Promise.resolve(options.manifest);
+					},
+					writeError: (message) => errors.push(message),
+				},
+			);
+
+			expect(exitCode).toBe(1);
+			expect(runCalls).toBe(0);
+			expect(errors).toEqual(["omp-fleet sidecar: failed"]);
+		}
+	});
+
 	test("injects dependencies, translates signals to abort, and removes listeners", async () => {
 		const manifest = makeSidecarManifest();
 		const store = new FakeSidecarStore(manifest);
@@ -492,8 +541,8 @@ describe("sidecar main", () => {
 		const sleep: SupervisorSleep = () => Promise.resolve();
 		const received: {
 			dependencies?: SupervisorDependencies;
-			signal?: AbortSignal;
-		} = {};
+			signal: AbortSignal | undefined;
+		} = { signal: undefined };
 		let createStoreCalls = 0;
 		let createHerdrCalls = 0;
 
@@ -673,10 +722,6 @@ describe("sidecar main", () => {
 			let selectedCommand: string | undefined;
 			let selectedPaneId: string | undefined;
 			let selectedWorkspaceId: string | undefined;
-			const interruptCalls: Array<{
-				paneId: string;
-				workspaceId: string | undefined;
-			}> = [];
 			const ownershipCalls: string[] = [];
 			const controlHerdr: NonNullable<FleetControlDeps["herdr"]> = {
 				assertAvailable: () => Promise.resolve(),
@@ -695,19 +740,16 @@ describe("sidecar main", () => {
 					ownershipCalls.push(
 						`inspect:${paneId}:${requestedWorkspaceId ?? ""}`,
 					);
-					return Promise.resolve({ command: selectedCommand });
+					return Promise.resolve(
+						selectedCommand === undefined
+							? { kind: "empty" as const }
+							: { kind: "command" as const, command: selectedCommand },
+					);
 				},
 				runInPane: (paneId, command, requestedWorkspaceId) => {
 					selectedPaneId = paneId;
 					selectedCommand = command;
 					selectedWorkspaceId = requestedWorkspaceId;
-					return Promise.resolve();
-				},
-				interruptPane: (paneId, requestedWorkspaceId) => {
-					interruptCalls.push({
-						paneId,
-						workspaceId: requestedWorkspaceId,
-					});
 					return Promise.resolve();
 				},
 			};
@@ -744,12 +786,10 @@ describe("sidecar main", () => {
 			expect({
 				paneId: selectedPaneId,
 				workspaceId: selectedWorkspaceId,
-				interruptCalls,
 				ownershipCalls,
 			}).toEqual({
 				paneId: supervisorPaneId,
 				workspaceId,
-				interruptCalls: [],
 				ownershipCalls: [],
 			});
 			if (selectedCommand === undefined) {
@@ -895,7 +935,7 @@ describe("sidecar main", () => {
 			);
 			const expectedEnvelope = {
 				schemaVersion: 1,
-				pluginVersion: "0.1.0",
+				pluginVersion: PLUGIN_VERSION,
 				classification: "untrusted-output",
 				runId,
 				report: expectedReport,

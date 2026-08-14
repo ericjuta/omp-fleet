@@ -1,9 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import {
+	appendFileSync,
+	chmodSync,
+	existsSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 import type {
+	FleetActionResult,
 	FleetControlDeps,
 	FleetHerdr,
 	FleetStore,
@@ -17,6 +25,7 @@ import {
 import type {
 	CreatedSupervisorTab,
 	CreateSupervisorTabInput,
+	PaneProcessInfo,
 } from "../src/herdr.ts";
 import { RunStore } from "../src/store.ts";
 import {
@@ -25,7 +34,6 @@ import {
 	type RunEvent,
 	type RunLifecycle,
 	type RunManifest,
-	type RunSelector,
 	type RunState,
 	reportKey,
 	reportRelativePath,
@@ -75,9 +83,7 @@ class MemoryFleetStore implements FleetStore {
 	readonly writeManifestCalls: RunManifest[] = [];
 	readonly readStateIds: string[] = [];
 	readonly appendEventCalls: Array<{ runId: string; event: RunEvent }> = [];
-	readonly findLatestSelectors: RunSelector[] = [];
 	readonly readEventIds: string[] = [];
-	latestManifest: RunManifest | undefined;
 
 	async createRun(
 		manifest: RunManifest,
@@ -101,6 +107,13 @@ class MemoryFleetStore implements FleetStore {
 		return manifest;
 	}
 
+	async withControlLock<T>(
+		runId: string,
+		action: (manifest: RunManifest) => Promise<T>,
+	): Promise<T> {
+		return await action(await this.readManifest(runId));
+	}
+
 	async writeManifest(manifest: RunManifest): Promise<void> {
 		this.runtimeCalls.push(`store.writeManifest:${manifest.lifecycle}`);
 		this.writeManifestCalls.push(manifest);
@@ -118,6 +131,44 @@ class MemoryFleetStore implements FleetStore {
 		if (!allowedFrom.includes(current.lifecycle)) return current;
 		this.manifests.set(runId, next);
 		return next;
+	}
+	async ensureLifecycle(
+		runId: string,
+		transition?: {
+			allowedFrom: readonly RunLifecycle[];
+			next: RunManifest;
+		},
+	): Promise<RunManifest> {
+		let current = this.manifests.get(runId);
+		if (current === undefined) throw new Error("missing manifest");
+		this.runtimeCalls.push(
+			`store.ensureLifecycle:${transition?.next.lifecycle ?? current.lifecycle}`,
+		);
+		if (transition?.allowedFrom.includes(current.lifecycle)) {
+			current = transition.next;
+			this.manifests.set(runId, current);
+		}
+		const expected: RunEvent = {
+			schemaVersion: 1,
+			runId,
+			timestamp: current.updatedAt,
+			type: "lifecycle",
+			lifecycle: current.lifecycle,
+			...(current.lastError === undefined
+				? {}
+				: { lastError: current.lastError }),
+		};
+		const tail = this.events.get(runId)?.at(-1);
+		if (
+			tail?.type !== "lifecycle" ||
+			tail.runId !== expected.runId ||
+			tail.timestamp !== expected.timestamp ||
+			tail.lifecycle !== expected.lifecycle ||
+			tail.lastError !== expected.lastError
+		) {
+			await this.appendEvent(runId, expected);
+		}
+		return current;
 	}
 
 	async readState(runId: string): Promise<RunState> {
@@ -147,18 +198,14 @@ class MemoryFleetStore implements FleetStore {
 		return [...this.manifests.values()];
 	}
 
-	async findLatest(
-		selector: RunSelector = {},
-	): Promise<RunManifest | undefined> {
-		this.runtimeCalls.push("store.findLatest");
-		this.findLatestSelectors.push(selector);
-		return this.latestManifest;
-	}
-
 	async readEvents(runId: string): Promise<RunEvent[]> {
 		this.runtimeCalls.push(`store.readEvents:${runId}`);
 		this.readEventIds.push(runId);
 		return this.events.get(runId) ?? [];
+	}
+
+	async listStoredReports(runId: string): Promise<ReportRecord[]> {
+		return [...(this.states.get(runId)?.reports ?? [])];
 	}
 }
 
@@ -173,10 +220,6 @@ class FakeHerdr implements FleetHerdr {
 	readonly runInPaneCalls: Array<{
 		paneId: string;
 		command: string;
-		workspaceId: string | undefined;
-	}> = [];
-	readonly interruptPaneCalls: Array<{
-		paneId: string;
 		workspaceId: string | undefined;
 	}> = [];
 	createdTab: CreatedSupervisorTab = {
@@ -203,9 +246,11 @@ class FakeHerdr implements FleetHerdr {
 	async inspectPane(
 		paneId: string,
 		workspaceId?: string,
-	): Promise<{ command: string | undefined }> {
+	): Promise<PaneProcessInfo> {
 		this.inspectPaneCalls.push({ paneId, workspaceId });
-		return { command: this.paneCommand };
+		return this.paneCommand === undefined
+			? { kind: "empty" }
+			: { kind: "command", command: this.paneCommand };
 	}
 
 	async runInPane(
@@ -215,16 +260,13 @@ class FakeHerdr implements FleetHerdr {
 	): Promise<void> {
 		this.runInPaneCalls.push({ paneId, command, workspaceId });
 	}
-
-	async interruptPane(paneId: string, workspaceId?: string): Promise<void> {
-		this.interruptPaneCalls.push({ paneId, workspaceId });
-	}
 }
 
 class MemoryCursorStore implements FleetNoticeCursorStore {
 	readonly values = new Map<string, number>();
 	readonly readIds: string[] = [];
 	readonly writes: Array<{ runId: string; cursor: number }> = [];
+	readonly writeFailures = new Set<string>();
 
 	constructor(initial: Readonly<Record<string, number>> = {}) {
 		for (const [runId, cursor] of Object.entries(initial)) {
@@ -238,6 +280,9 @@ class MemoryCursorStore implements FleetNoticeCursorStore {
 	}
 
 	async write(runId: string, cursor: number): Promise<void> {
+		if (this.writeFailures.has(runId)) {
+			throw new Error(`cursor write failed:${runId}`);
+		}
 		this.writes.push({ runId, cursor });
 		this.values.set(runId, cursor);
 	}
@@ -324,11 +369,16 @@ interface ToolRegistration {
 	): Promise<TestToolResult>;
 }
 
+interface NoticeMessageDetails {
+	deliveryId: string;
+}
+
 interface NoticeMessage {
 	customType: string;
 	content: string;
 	display: boolean;
 	attribution: string;
+	details?: NoticeMessageDetails;
 }
 
 interface NoticeDelivery {
@@ -341,16 +391,95 @@ interface SentNotice {
 	delivery: NoticeDelivery;
 }
 
+interface BeforeAgentStartEvent {
+	type: "before_agent_start";
+	prompt: string;
+	systemPrompt: string[];
+}
+
+interface BeforeAgentStartResult {
+	message?: NoticeMessage;
+}
+
+interface CustomNoticeMessage extends NoticeMessage {
+	role: "custom";
+}
+
+interface MessageEndEvent {
+	type: "message_end";
+	message: CustomNoticeMessage;
+}
+
+interface AgentEndEvent {
+	type: "agent_end";
+	messages: Array<{ role: string; [key: string]: unknown }>;
+	willContinue?: boolean;
+}
+
 type SessionStartHandler = (
 	event: unknown,
 	context: unknown,
 ) => void | Promise<void>;
 type SessionShutdownHandler = () => void | Promise<void>;
+type BeforeAgentStartHandler = (
+	event: BeforeAgentStartEvent,
+	context: unknown,
+) =>
+	| BeforeAgentStartResult
+	| undefined
+	| Promise<BeforeAgentStartResult | undefined>;
+type MessageEndHandler = (
+	event: MessageEndEvent,
+	context: unknown,
+) => void | Promise<void>;
+type AgentEndHandler = (
+	event: AgentEndEvent,
+	context: unknown,
+) => void | Promise<void>;
+
+function opaqueDeliveryId(): string {
+	return expect.any(String) as unknown as string;
+}
+
+function requireNoticeMessage(
+	notice: SentNotice | NoticeMessage | undefined,
+): NoticeMessage & { details: NoticeMessageDetails } {
+	const message =
+		notice !== undefined && "delivery" in notice ? notice.message : notice;
+	if (message === undefined) throw new Error("expected a fleet notice");
+	const deliveryId = message.details?.deliveryId;
+	if (typeof deliveryId !== "string" || deliveryId.length === 0) {
+		throw new Error("expected an opaque notice deliveryId");
+	}
+	return message as NoticeMessage & { details: NoticeMessageDetails };
+}
+
+function assistantAgentEndEvent(message?: NoticeMessage): AgentEndEvent {
+	return {
+		type: "agent_end",
+		messages:
+			message === undefined
+				? [{ role: "assistant" }]
+				: [{ role: "custom", ...message }, { role: "assistant" }],
+	};
+}
+
+function emptyAgentEndEvent(): AgentEndEvent {
+	return { type: "agent_end", messages: [] };
+}
+
+function exactNoticeMessageEndEvent(message: NoticeMessage): MessageEndEvent {
+	return {
+		type: "message_end",
+		message: { role: "custom", ...message },
+	};
+}
 
 class FakeExtensionApi {
 	readonly zod = new FakeZod();
 	readonly handlers = new Map<string, unknown>();
 	readonly sentNotices: SentNotice[] = [];
+	readonly messageEndInvocations: MessageEndEvent[] = [];
 	readonly loggerWarnings: string[] = [];
 	readonly logger = {
 		warn: (message: string): void => {
@@ -410,6 +539,67 @@ class FakeExtensionApi {
 			throw new Error("session_shutdown not registered");
 		return handler as SessionShutdownHandler;
 	}
+
+	requireBeforeAgentStart(): BeforeAgentStartHandler {
+		const handler = this.handlers.get("before_agent_start");
+		if (typeof handler !== "function")
+			throw new Error("before_agent_start not registered");
+		return handler as BeforeAgentStartHandler;
+	}
+
+	requireMessageEnd(): MessageEndHandler {
+		const handler = this.handlers.get("message_end");
+		if (typeof handler !== "function")
+			throw new Error("message_end not registered");
+		return handler as MessageEndHandler;
+	}
+
+	requireAgentEnd(): AgentEndHandler {
+		const handler = this.handlers.get("agent_end");
+		if (typeof handler !== "function")
+			throw new Error("agent_end not registered");
+		return handler as AgentEndHandler;
+	}
+
+	async invokeBeforeAgentStart(
+		context: FakeExtensionContext,
+		event: BeforeAgentStartEvent = {
+			type: "before_agent_start",
+			prompt: "",
+			systemPrompt: [],
+		},
+	): Promise<NoticeMessage | undefined> {
+		const result = await this.requireBeforeAgentStart()(event, context.value);
+		return result?.message;
+	}
+
+	async invokeMessageEnd(
+		message: NoticeMessage,
+		context: FakeExtensionContext,
+	): Promise<void> {
+		const event = exactNoticeMessageEndEvent(message);
+		this.messageEndInvocations.push(event);
+		const handler = this.handlers.get("message_end");
+		if (typeof handler === "function") {
+			await (handler as MessageEndHandler)(event, context.value);
+		}
+	}
+
+	async invokeAgentEnd(
+		context: FakeExtensionContext,
+		event: AgentEndEvent,
+	): Promise<void> {
+		await this.requireAgentEnd()(event, context.value);
+	}
+
+	async acknowledgeNotice(
+		message: NoticeMessage,
+		context: FakeExtensionContext,
+	): Promise<void> {
+		await this.invokeMessageEnd(message, context);
+		context.persistNotice(message);
+		await this.invokeAgentEnd(context, assistantAgentEndEvent(message));
+	}
 }
 
 interface IntervalRegistration {
@@ -418,20 +608,40 @@ interface IntervalRegistration {
 	handle: object;
 }
 
+interface SessionCustomMessageEntry {
+	type: "custom_message";
+	customType: string;
+	content: string;
+	display: boolean;
+	attribution?: string;
+	details?: NoticeMessageDetails;
+}
+
 class FakeExtensionContext {
 	readonly notifications: TestNotification[] = [];
 	readonly intervals: IntervalRegistration[] = [];
 	readonly clearedTimers: unknown[] = [];
+	readonly entries: SessionCustomMessageEntry[] = [];
+	readonly sessionFile: string;
 	idle = true;
 	pendingMessages = false;
+	journalError: Error | undefined;
 	readonly value: Readonly<Record<string, unknown>>;
 
 	constructor(readonly cwd: string) {
+		this.sessionFile = join(cwd, "omp-fleet-test-session.jsonl");
 		this.value = {
 			cwd,
 			ui: {
 				notify: (text: string, level: string): void => {
 					this.notifications.push({ text, level });
+				},
+			},
+			sessionManager: {
+				getEntries: (): SessionCustomMessageEntry[] => [...this.entries],
+				getSessionFile: (): string => {
+					if (this.journalError !== undefined) throw this.journalError;
+					return this.sessionFile;
 				},
 			},
 			isIdle: (): boolean => this.idle,
@@ -448,6 +658,33 @@ class FakeExtensionContext {
 				this.clearedTimers.push(handle);
 			},
 		};
+	}
+
+	noticeEntry(message: NoticeMessage): SessionCustomMessageEntry {
+		return {
+			type: "custom_message",
+			customType: message.customType,
+			content: message.content,
+			display: message.display,
+			attribution: message.attribution,
+			...(message.details === undefined ? {} : { details: message.details }),
+		};
+	}
+
+	stageEntry(message: NoticeMessage): SessionCustomMessageEntry {
+		const entry = this.noticeEntry(message);
+		this.entries.push(entry);
+		return entry;
+	}
+
+	writeEmptyJournal(): void {
+		writeFileSync(this.sessionFile, "", "utf8");
+	}
+
+	persistNotice(message: NoticeMessage): SessionCustomMessageEntry {
+		const entry = this.stageEntry(message);
+		appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`, "utf8");
+		return entry;
 	}
 
 	async runInterval(index = 0): Promise<void> {
@@ -699,6 +936,8 @@ describe("fleet extension", () => {
 			loadMode: "essential",
 		});
 		expect([...api.handlers.keys()].sort()).toEqual([
+			"agent_end",
+			"before_agent_start",
 			"session_shutdown",
 			"session_start",
 		]);
@@ -708,7 +947,6 @@ describe("fleet extension", () => {
 		expect(herdr.createSupervisorTabCalls).toEqual([]);
 		expect(herdr.inspectPaneCalls).toEqual([]);
 		expect(herdr.runInPaneCalls).toEqual([]);
-		expect(herdr.interruptPaneCalls).toEqual([]);
 		expect(api.sentNotices).toEqual([]);
 	});
 
@@ -764,14 +1002,18 @@ describe("fleet extension", () => {
 				expectedText: [
 					METADATA_WARNING,
 					`Fleet run ${SURFACE_RUN_ID}: running`,
+					"Observation health: overdue",
+					"Failure category: none",
 					`Coordinator: ${agentHandle("coordinator-main")}`,
 					`Supervisor: ${agentHandle("surface-existing-pane")}`,
 					"Worker prefix: worker-",
 					"Updated: 2026-08-11T00:00:00.000Z",
 					"Observations updated: 2026-08-11T00:00:00.000Z",
 					"Deadline: 2026-08-11T06:00:00.000Z",
-					"Fleet observes only; workers may still be running.",
 					"Workers: none observed.",
+					"Report budget: 1/64.",
+					"Fleet observes only; workers may still be running.",
+					"Fleet does not observe repository diffs or verify worker claims.",
 					FALSE_SUCCESS_WARNING,
 				].join("\n"),
 			},
@@ -783,6 +1025,7 @@ describe("fleet extension", () => {
 				expectedText: [
 					METADATA_WARNING,
 					`Fleet run ${SURFACE_RUN_ID} reports: 1`,
+					"Report budget: 1/64.",
 					`- ${agentHandle(SURFACE_PANE_ID)} | done | ${SURFACE_REPORT_PATH}`,
 					FALSE_SUCCESS_WARNING,
 				].join("\n"),
@@ -794,7 +1037,7 @@ describe("fleet extension", () => {
 				expectedLifecycle: "stopping",
 				expectedText: [
 					METADATA_WARNING,
-					`Fleet run ${SURFACE_RUN_ID} stop requested; supervisor ${agentHandle("surface-existing-pane")} was signalled and remains stopping pending sidecar confirmation.`,
+					`Fleet run ${SURFACE_RUN_ID} stop requested; supervisor ${agentHandle("surface-existing-pane")} remains stopping pending sidecar confirmation.`,
 					FALSE_SUCCESS_WARNING,
 				].join("\n"),
 			},
@@ -891,15 +1134,6 @@ describe("fleet extension", () => {
 					expect(tool.herdr.inspectPaneCalls).toEqual(
 						command.herdr.inspectPaneCalls,
 					);
-					expect(command.herdr.interruptPaneCalls).toEqual([
-						{
-							paneId: "surface-existing-pane",
-							workspaceId: "workspace-main",
-						},
-					]);
-					expect(tool.herdr.interruptPaneCalls).toEqual(
-						command.herdr.interruptPaneCalls,
-					);
 					break;
 			}
 		}
@@ -992,7 +1226,7 @@ describe("fleet extension", () => {
 		expect(context.clearedTimers).toEqual([timerHandle]);
 	});
 
-	test("reconciliation filters by repository and coordinator and sends a metadata-only nextTurn notice", async () => {
+	test("reconciliation filters by repository, workspace, and coordinator", async () => {
 		const { repoPath, stateRoot } = await fixturePaths();
 		const canonicalRepo = await realpath(repoPath);
 		const store = new MemoryFleetStore();
@@ -1009,16 +1243,25 @@ describe("fleet extension", () => {
 			makeManifest({
 				runId: "run-match",
 				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+			makeManifest({
+				runId: "run-wrong-workspace",
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-other",
 				coordinatorPaneId: "coordinator-main",
 			}),
 			makeManifest({
 				runId: "run-wrong-repository",
 				repoPath: join(canonicalRepo, "other-repository"),
+				workspaceId: "workspace-main",
 				coordinatorPaneId: "coordinator-main",
 			}),
 			makeManifest({
 				runId: "run-wrong-coordinator",
 				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
 				coordinatorPaneId: "another-coordinator",
 			}),
 		];
@@ -1027,6 +1270,14 @@ describe("fleet extension", () => {
 		}
 		store.events.set("run-match", [
 			reportEvent("run-match", "worker-match", matchingPath),
+		]);
+		store.events.set("run-wrong-workspace", [
+			agentEvent(
+				"run-wrong-workspace",
+				"worker-wrong-workspace",
+				"blocked",
+				"2030-01-02T04:00:30.000Z",
+			),
 		]);
 		store.events.set("run-wrong-repository", [
 			agentEvent(
@@ -1057,8 +1308,8 @@ describe("fleet extension", () => {
 		await api.requireSessionStart()({}, context.value);
 
 		expect(store.readEventIds).toEqual(["run-match"]);
-		expect(cursorStore.readIds).toEqual(["run-match", "run-match"]);
-		expect(cursorStore.writes).toEqual([{ runId: "run-match", cursor: 1 }]);
+		expect(cursorStore.readIds).toEqual(["run-match"]);
+		expect(cursorStore.writes).toEqual([]);
 		expect(api.sentNotices).toEqual([
 			{
 				message: {
@@ -1066,20 +1317,87 @@ describe("fleet extension", () => {
 					content: [
 						METADATA_WARNING,
 						"Fleet supervisor metadata update (1 new event):",
-						`- run run-match: ${agentHandle(matchingPaneId)} DONE observed; report ${matchingPath}`,
+						`- run run-match: 1 event across 1 category — ${agentHandle(matchingPaneId)} DONE observed; report ${matchingPath}`,
 						FALSE_SUCCESS_WARNING,
 					].join("\n"),
 					display: true,
 					attribution: "agent",
+					details: { deliveryId: opaqueDeliveryId() },
 				},
 				delivery: { deliverAs: "nextTurn", triggerTurn: true },
 			},
 		]);
+		const sentNotice = requireNoticeMessage(api.sentNotices[0]);
 		const noticeJson = JSON.stringify(api.sentNotices);
 		expect(noticeJson).not.toContain(RAW_REPORT_SENTINEL);
 		expect(noticeJson).not.toContain(RAW_REPORT_CONTENT);
 		expect(noticeJson).not.toContain("worker-wrong-repository");
 		expect(noticeJson).not.toContain("worker-wrong-coordinator");
+		expect(noticeJson).not.toContain("worker-wrong-workspace");
+
+		expect(existsSync(context.sessionFile)).toBe(false);
+		await api.invokeAgentEnd(context, assistantAgentEndEvent());
+		expect(cursorStore.writes).toEqual([]);
+		expect(context.entries).toEqual([]);
+
+		context.stageEntry(sentNotice);
+		expect(existsSync(context.sessionFile)).toBe(false);
+		await api.invokeAgentEnd(context, assistantAgentEndEvent());
+		expect(cursorStore.writes).toEqual([]);
+
+		context.writeEmptyJournal();
+		expect(readFileSync(context.sessionFile, "utf8")).toBe("");
+		await api.invokeAgentEnd(context, assistantAgentEndEvent());
+		expect(cursorStore.writes).toEqual([]);
+
+		context.persistNotice({
+			...sentNotice,
+			details: { deliveryId: "not-the-sent-delivery" },
+		});
+		await api.invokeAgentEnd(context, assistantAgentEndEvent());
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.invokeMessageEnd(sentNotice, context);
+		expect(api.messageEndInvocations).toEqual([
+			exactNoticeMessageEndEvent(sentNotice),
+		]);
+		expect(context.entries.at(-1)?.details?.deliveryId).toBe(
+			"not-the-sent-delivery",
+		);
+		expect(cursorStore.writes).toEqual([]);
+
+		const persisted = context.persistNotice(sentNotice);
+		expect(persisted).toEqual({
+			type: "custom_message",
+			customType: "omp-fleet-notice",
+			content: sentNotice.content,
+			display: true,
+			attribution: "agent",
+			details: { deliveryId: sentNotice.details?.deliveryId },
+		});
+		expect(readFileSync(context.sessionFile, "utf8")).toContain(
+			sentNotice.details?.deliveryId ?? "",
+		);
+		await api.invokeAgentEnd(context, {
+			type: "agent_end",
+			messages: [{ role: "assistant" }, { role: "custom", ...sentNotice }],
+		});
+		expect(cursorStore.writes).toEqual([]);
+		await api.invokeAgentEnd(context, {
+			...assistantAgentEndEvent(sentNotice),
+			willContinue: true,
+		});
+		expect(cursorStore.writes).toEqual([]);
+		await api.invokeAgentEnd(context, emptyAgentEndEvent());
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.acknowledgeNotice(sentNotice, context);
+		expect(api.messageEndInvocations.at(-1)).toEqual(
+			exactNoticeMessageEndEvent(sentNotice),
+		);
+		expect(cursorStore.readIds).toEqual(["run-match", "run-match"]);
+		expect(cursorStore.writes).toEqual([{ runId: "run-match", cursor: 1 }]);
 	});
 
 	test("reconciliation durably coalesces unseen metadata and triggers only after OMP becomes idle", async () => {
@@ -1097,6 +1415,7 @@ describe("fleet extension", () => {
 		const manifest = makeManifest({
 			runId,
 			repoPath: canonicalRepo,
+			workspaceId: "workspace-main",
 			coordinatorPaneId: "coordinator-main",
 		});
 		store.manifests.set(runId, manifest);
@@ -1152,26 +1471,30 @@ describe("fleet extension", () => {
 		expect(firstNotice).toContain(
 			"Fleet supervisor metadata update (2 new events):",
 		);
-		expect(firstNotice?.split("\n")).toContain(
-			`- run ${runId}: ${agentHandle("worker-durable-blocked-pane")} BLOCKED observed; taskTitle="Investigate \\u002ftmp durable blocked transition"`,
+		expect(firstNotice).toContain(
+			`${agentHandle("worker-durable-blocked-pane")} BLOCKED observed; taskTitle="Investigate \\u002ftmp durable blocked transition"`,
 		);
 		expect(firstNotice).not.toContain("worker-durable-blocked");
 		expect(firstNotice).not.toContain("revision-blocked");
-		expect(api.sentNotices[0]?.message.content).toContain(
-			"1 additional metadata events were coalesced.",
-		);
+		expect(firstNotice).toContain(`/fleet status ${runId}`);
+		expect(firstNotice).toContain(`/fleet reports ${runId}`);
 		expect(api.sentNotices[0]?.delivery).toEqual({
 			deliverAs: "nextTurn",
 			triggerTurn: true,
 		});
-		expect(cursorStore.writes).toEqual([{ runId, cursor: 3 }]);
-		expect(cursorStore.values.get(runId)).toBe(3);
+		expect(api.sentNotices[0]?.message.details).toEqual({
+			deliveryId: opaqueDeliveryId(),
+		});
+		const firstSent = requireNoticeMessage(api.sentNotices[0]);
+		expect(cursorStore.writes).toEqual([]);
+		expect(cursorStore.values.get(runId)).toBe(1);
 		expect(JSON.stringify(api.sentNotices)).not.toContain(RAW_REPORT_SENTINEL);
 		expect(firstNotice?.split("\n").at(-1)).toBe(FALSE_SUCCESS_WARNING);
 		expect(firstNotice).not.toMatch(/verified success/i);
 
 		await context.runInterval();
 		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
 
 		const events = store.events.get(runId);
 		if (events === undefined) throw new Error("run events disappeared");
@@ -1186,14 +1509,25 @@ describe("fleet extension", () => {
 		context.idle = false;
 		await context.runInterval();
 		expect(api.sentNotices).toHaveLength(1);
-		expect(cursorStore.values.get(runId)).toBe(3);
+		expect(cursorStore.values.get(runId)).toBe(1);
 
 		context.idle = true;
 		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.acknowledgeNotice(firstSent, context);
+		expect(api.messageEndInvocations.at(-1)).toEqual(
+			exactNoticeMessageEndEvent(firstSent),
+		);
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 3 }]);
+		expect(cursorStore.values.get(runId)).toBe(3);
+
+		await context.runInterval();
 		expect(api.sentNotices).toHaveLength(2);
 		const secondNotice = api.sentNotices[1]?.message.content;
-		expect(secondNotice?.split("\n")).toContain(
-			`- run ${runId}: ${agentHandle("worker-durable-done-pane")} DONE observed`,
+		expect(secondNotice).toContain(
+			`${agentHandle("worker-durable-done-pane")} DONE observed`,
 		);
 		expect(secondNotice).not.toContain("worker-durable-done");
 		expect(secondNotice?.split("\n").at(-1)).toBe(FALSE_SUCCESS_WARNING);
@@ -1205,6 +1539,15 @@ describe("fleet extension", () => {
 			deliverAs: "nextTurn",
 			triggerTurn: true,
 		});
+		expect(api.sentNotices[1]?.message.details).toEqual({
+			deliveryId: opaqueDeliveryId(),
+		});
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 3 }]);
+
+		await api.acknowledgeNotice(
+			requireNoticeMessage(api.sentNotices[1]),
+			context,
+		);
 		expect(cursorStore.writes).toEqual([
 			{ runId, cursor: 3 },
 			{ runId, cursor: 4 },
@@ -1247,6 +1590,7 @@ describe("fleet extension", () => {
 				makeManifest({
 					runId: candidateRunId,
 					repoPath: canonicalRepo,
+					workspaceId: "workspace-main",
 					coordinatorPaneId: "coordinator-main",
 				}),
 			);
@@ -1307,9 +1651,7 @@ describe("fleet extension", () => {
 			[
 				METADATA_WARNING,
 				"Fleet supervisor metadata update (3 new events):",
-				`- run ${runId}: lifecycle stopping`,
-				`- run ${runId}: ${agentHandle(paneId)} BLOCKED observed`,
-				`- run ${runId}: ${agentHandle(paneId)} DONE observed; report ${path}`,
+				`- run ${runId}: 3 events across 3 categories — lifecycle stopping; ${agentHandle(paneId)} BLOCKED observed; ${agentHandle(paneId)} DONE observed; report ${path}; recovery: /fleet status ${runId}; /fleet reports ${runId}`,
 				FALSE_SUCCESS_WARNING,
 			].join("\n"),
 		);
@@ -1320,10 +1662,19 @@ describe("fleet extension", () => {
 		expect(content).not.toContain(malformedPath);
 		expect(content).not.toContain(RAW_REPORT_SENTINEL);
 		expect(content?.split("\n").at(-1)).toBe(FALSE_SUCCESS_WARNING);
-		expect(cursorStore.writes).toEqual([{ runId, cursor: 3 }]);
+		expect(api.sentNotices[0]?.message.details).toEqual({
+			deliveryId: opaqueDeliveryId(),
+		});
+		expect(cursorStore.writes).toEqual([]);
 		expect(content).not.toMatch(
 			/system|ignore|previous|execute|terminal|secret/i,
 		);
+
+		await api.acknowledgeNotice(
+			requireNoticeMessage(api.sentNotices[0]),
+			context,
+		);
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 3 }]);
 	});
 
 	test("a real report and file cursor coalesce across fresh extension instances without surfacing output", async () => {
@@ -1348,6 +1699,7 @@ describe("fleet extension", () => {
 			makeManifest({
 				runId,
 				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
 				coordinatorPaneId: "coordinator-main",
 			}),
 			makeState({ runId }),
@@ -1360,12 +1712,14 @@ describe("fleet extension", () => {
 				reports: [report],
 			}),
 		);
-		await firstStore.appendEvent(runId, {
-			schemaVersion: 1,
-			runId,
-			timestamp: "2030-01-02T03:59:00.000Z",
-			type: "lifecycle",
-			lifecycle: "running",
+		const initialManifest = await firstStore.readManifest(runId);
+		await firstStore.ensureLifecycle(runId, {
+			allowedFrom: ["starting"],
+			next: {
+				...initialManifest,
+				lifecycle: "running",
+				updatedAt: "2030-01-02T03:59:00.000Z",
+			},
 		});
 		await firstStore.appendEvent(
 			runId,
@@ -1389,8 +1743,7 @@ describe("fleet extension", () => {
 			[
 				METADATA_WARNING,
 				"Fleet supervisor metadata update (2 new events):",
-				`- run ${runId}: lifecycle running`,
-				`- run ${runId}: ${agentHandle(paneId)} DONE observed; report ${report.path}`,
+				`- run ${runId}: 2 events across 2 categories — lifecycle running; ${agentHandle(paneId)} DONE observed; report ${report.path}; recovery: /fleet status ${runId}; /fleet reports ${runId}`,
 				FALSE_SUCCESS_WARNING,
 			].join("\n"),
 		);
@@ -1404,6 +1757,38 @@ describe("fleet extension", () => {
 		expect(
 			await readFile(join(stateRoot, runId, report.path), "utf8"),
 		).toContain(RAW_REPORT_SENTINEL);
+		expect(firstApi.sentNotices[0]?.message.details).toEqual({
+			deliveryId: opaqueDeliveryId(),
+		});
+		expect(existsSync(join(stateRoot, runId, "notice-cursor.json"))).toBe(
+			false,
+		);
+		await firstApi.requireSessionShutdown()();
+
+		const redeliveredApi = installExtension({
+			control: controlDependencies(
+				repoPath,
+				stateRoot,
+				new RunStore(stateRoot),
+				new FakeHerdr(),
+			),
+		});
+		const redeliveredContext = new FakeExtensionContext(repoPath);
+		await redeliveredApi.requireSessionStart()({}, redeliveredContext.value);
+		expect(redeliveredApi.sentNotices).toHaveLength(1);
+		expect(redeliveredApi.sentNotices[0]?.message.content).toBe(firstContent);
+		expect(redeliveredApi.sentNotices[0]?.delivery).toEqual({
+			deliverAs: "nextTurn",
+			triggerTurn: true,
+		});
+		expect(existsSync(join(stateRoot, runId, "notice-cursor.json"))).toBe(
+			false,
+		);
+
+		await redeliveredApi.acknowledgeNotice(
+			requireNoticeMessage(redeliveredApi.sentNotices[0]),
+			redeliveredContext,
+		);
 		expect(
 			JSON.parse(
 				await readFile(join(stateRoot, runId, "notice-cursor.json"), "utf8"),
@@ -1413,7 +1798,7 @@ describe("fleet extension", () => {
 			runId: "run-file-backed-cursor",
 			cursor: 2,
 		});
-		await firstApi.requireSessionShutdown()();
+		await redeliveredApi.requireSessionShutdown()();
 
 		const restartedApi = installExtension({
 			control: controlDependencies(
@@ -1426,6 +1811,9 @@ describe("fleet extension", () => {
 		const restartedContext = new FakeExtensionContext(repoPath);
 		await restartedApi.requireSessionStart()({}, restartedContext.value);
 		expect(restartedApi.sentNotices).toEqual([]);
+		expect(
+			await restartedApi.invokeBeforeAgentStart(restartedContext),
+		).toBeUndefined();
 		await restartedApi.requireSessionShutdown()();
 	});
 
@@ -1440,16 +1828,19 @@ describe("fleet extension", () => {
 				makeManifest({
 					runId,
 					repoPath: canonicalRepo,
+					workspaceId: "workspace-main",
 					coordinatorPaneId: "coordinator-main",
 				}),
 				makeState({ runId }),
 			);
-			await store.appendEvent(runId, {
-				schemaVersion: 1,
-				runId,
-				timestamp: "2030-01-02T04:00:00.000Z",
-				type: "lifecycle",
-				lifecycle: "running",
+			const initialManifest = await store.readManifest(runId);
+			await store.ensureLifecycle(runId, {
+				allowedFrom: ["starting"],
+				next: {
+					...initialManifest,
+					lifecycle: "running",
+					updatedAt: "2030-01-02T04:00:00.000Z",
+				},
 			});
 		}
 		await writeFile(
@@ -1468,16 +1859,50 @@ describe("fleet extension", () => {
 
 		await api.requireSessionStart()({}, context.value);
 
-		expect(api.sentNotices).toHaveLength(1);
-		expect(api.sentNotices[0]?.message.content).toBe(
-			[
-				METADATA_WARNING,
-				"Fleet supervisor metadata update (1 new event):",
-				`- run ${healthyRunId}: lifecycle running`,
-				FALSE_SUCCESS_WARNING,
-			].join("\n"),
+		expect(api.sentNotices).toEqual([]);
+		const healthyContent = [
+			METADATA_WARNING,
+			"Fleet supervisor metadata update (1 new event):",
+			`- run ${healthyRunId}: 1 event across 1 category — lifecycle running`,
+			FALSE_SUCCESS_WARNING,
+		].join("\n");
+		const injected = requireNoticeMessage(
+			await api.invokeBeforeAgentStart(context),
 		);
-		expect(api.sentNotices[0]?.message.content).not.toContain(corruptRunId);
+		expect(injected).toEqual({
+			customType: "omp-fleet-notice",
+			content: healthyContent,
+			display: true,
+			attribution: "agent",
+			details: { deliveryId: opaqueDeliveryId() },
+		});
+		expect(injected.content).not.toContain(corruptRunId);
+		expect(
+			existsSync(join(stateRoot, healthyRunId, "notice-cursor.json")),
+		).toBe(false);
+		await api.requireSessionShutdown()();
+
+		const redeliveredApi = installExtension({
+			control: controlDependencies(
+				repoPath,
+				stateRoot,
+				new RunStore(stateRoot),
+				new FakeHerdr(),
+			),
+		});
+		const redeliveredContext = new FakeExtensionContext(repoPath);
+		await redeliveredApi.requireSessionStart()({}, redeliveredContext.value);
+		expect(redeliveredApi.sentNotices).toEqual([]);
+		const redelivered = requireNoticeMessage(
+			await redeliveredApi.invokeBeforeAgentStart(redeliveredContext),
+		);
+		expect(redelivered.content).toBe(healthyContent);
+		expect(redelivered.content).not.toContain(corruptRunId);
+		expect(
+			existsSync(join(stateRoot, healthyRunId, "notice-cursor.json")),
+		).toBe(false);
+
+		await redeliveredApi.acknowledgeNotice(redelivered, redeliveredContext);
 		expect(
 			JSON.parse(
 				await readFile(
@@ -1486,7 +1911,7 @@ describe("fleet extension", () => {
 				),
 			),
 		).toEqual({ schemaVersion: 1, runId: healthyRunId, cursor: 1 });
-		await api.requireSessionShutdown()();
+		await redeliveredApi.requireSessionShutdown()();
 
 		const restartedApi = installExtension({
 			control: controlDependencies(
@@ -1499,6 +1924,1505 @@ describe("fleet extension", () => {
 		const restartedContext = new FakeExtensionContext(repoPath);
 		await restartedApi.requireSessionStart()({}, restartedContext.value);
 		expect(restartedApi.sentNotices).toEqual([]);
+		expect(
+			await restartedApi.invokeBeforeAgentStart(restartedContext),
+		).toBeUndefined();
 		await restartedApi.requireSessionShutdown()();
+	});
+	test("tool details include every defined structured result field and reject malformed values", async () => {
+		const valid: FleetActionResult = {
+			action: "reports",
+			text: "Fleet reports are available.",
+			runId: "run-structured-details",
+			lifecycle: "completed",
+			workerPrefix: "worker-",
+			deadlineAt: "2030-01-02T05:00:00.000Z",
+			observationHealth: "terminal",
+			workerCount: 3,
+			reportCount: 2,
+		};
+		const api = installExtension({ executeAction: async () => valid });
+		const context = new FakeExtensionContext("/tmp/omp-fleet-structured");
+		const result = await api
+			.requireTool()
+			.execute(
+				"structured-call",
+				{ action: "reports", runId: valid.runId },
+				new AbortController().signal,
+				() => {},
+				context.value,
+			);
+		expect(result.details).toEqual({
+			action: "reports",
+			runId: valid.runId,
+			lifecycle: "completed",
+			workerPrefix: "worker-",
+			deadlineAt: "2030-01-02T05:00:00.000Z",
+			observationHealth: "terminal",
+			workerCount: 3,
+			reportCount: 2,
+		});
+
+		const invalidResults: FleetActionResult[] = [
+			{ ...valid, workerPrefix: "unsafe prefix" },
+			{ ...valid, deadlineAt: "not-a-timestamp" },
+			{ ...valid, observationHealth: "healthy" as never },
+			{ ...valid, workerCount: -1 },
+			{ ...valid, workerCount: Number.MAX_SAFE_INTEGER + 1 },
+			{ ...valid, reportCount: 65 },
+		];
+		for (const invalid of invalidResults) {
+			const invalidApi = installExtension({
+				executeAction: async () => invalid,
+			});
+			await expect(
+				invalidApi
+					.requireTool()
+					.execute(
+						"invalid-structured-call",
+						{ action: "reports", runId: invalid.runId },
+						new AbortController().signal,
+						() => {},
+						context.value,
+					),
+			).rejects.toThrow(/Fleet action/);
+		}
+	});
+
+	test("passive lifecycle and activity batches do not trigger turns but blocked updates do", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-passive-signal";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			{
+				schemaVersion: 1,
+				runId,
+				timestamp: "2030-01-02T04:00:00.000Z",
+				type: "lifecycle",
+				lifecycle: "running",
+			},
+			{
+				schemaVersion: 1,
+				runId,
+				timestamp: "2030-01-02T04:01:00.000Z",
+				type: "agent",
+				outcome: "observed",
+				agent: {
+					paneId: "working-pane",
+					workspaceId: "workspace-main",
+					name: "hostile working name",
+					status: "working",
+					revision: "working-revision",
+					observedAt: "2030-01-02T04:01:00.000Z",
+					lastActivityAt: "2030-01-02T04:01:00.000Z",
+				},
+			},
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+		expect(api.sentNotices).toEqual([]);
+		expect(cursorStore.writes).toEqual([]);
+		const passiveNotice = requireNoticeMessage(
+			await api.invokeBeforeAgentStart(context),
+		);
+		expect(passiveNotice.customType).toBe("omp-fleet-notice");
+		expect(passiveNotice.display).toBe(true);
+		expect(passiveNotice.attribution).toBe("agent");
+		expect(passiveNotice.details).toEqual({ deliveryId: opaqueDeliveryId() });
+		expect(passiveNotice.content).toContain("lifecycle running");
+		expect(passiveNotice.content).toContain("observed working");
+		expect(api.sentNotices).toEqual([]);
+		const replayedPassive = requireNoticeMessage(
+			await api.invokeBeforeAgentStart(context),
+		);
+		expect(replayedPassive.details?.deliveryId).toBe(
+			passiveNotice.details?.deliveryId,
+		);
+		await context.runInterval();
+		expect(api.sentNotices).toEqual([]);
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.acknowledgeNotice(passiveNotice, context);
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 2 }]);
+
+		store.events
+			.get(runId)
+			?.push(
+				agentEvent(
+					runId,
+					"blocked hostile name",
+					"blocked",
+					"2030-01-02T04:02:00.000Z",
+					"blocked-pane",
+				),
+			);
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(api.sentNotices[0]?.delivery).toEqual({
+			deliverAs: "nextTurn",
+			triggerTurn: true,
+		});
+		expect(api.sentNotices[0]?.message.content).toContain("BLOCKED observed");
+		expect(api.sentNotices[0]?.message.details).toEqual({
+			deliveryId: opaqueDeliveryId(),
+		});
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 2 }]);
+
+		await api.acknowledgeNotice(
+			requireNoticeMessage(api.sentNotices[0]),
+			context,
+		);
+		expect(cursorStore.writes).toEqual([
+			{ runId, cursor: 2 },
+			{ runId, cursor: 3 },
+		]);
+	});
+
+	test("a later actionable event carries an older deferred event before cursor advance", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-deferred-then-actionable";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			{
+				schemaVersion: 1,
+				runId,
+				timestamp: "2030-01-02T04:00:00.000Z",
+				type: "lifecycle",
+				lifecycle: "running",
+			},
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+		expect(api.sentNotices).toEqual([]);
+
+		store.events
+			.get(runId)
+			?.push(
+				agentEvent(
+					runId,
+					"blocked-after-passive",
+					"blocked",
+					"2030-01-02T04:01:00.000Z",
+				),
+			);
+		await context.runInterval();
+
+		expect(api.sentNotices).toHaveLength(1);
+		const sent = requireNoticeMessage(api.sentNotices[0]);
+		expect(sent.content).toContain("2 new events");
+		expect(sent.content).toContain("lifecycle running");
+		expect(sent.content).toContain("BLOCKED observed");
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+		await api.acknowledgeNotice(sent, context);
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 2 }]);
+		await api.requireSessionShutdown()();
+
+		const restartedApi = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const restartedContext = new FakeExtensionContext(repoPath);
+		await restartedApi.requireSessionStart()({}, restartedContext.value);
+		expect(restartedApi.sentNotices).toEqual([]);
+		expect(
+			await restartedApi.invokeBeforeAgentStart(restartedContext),
+		).toBeUndefined();
+	});
+
+	test("a later line-limited actionable run does not strand an older passive cursor", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const passiveRunId = "run-passive-before-actionable";
+		const actionableRunId = "run-actionable-after-passive";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			passiveRunId,
+			makeManifest({
+				runId: passiveRunId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(passiveRunId, [
+			{
+				schemaVersion: 1,
+				runId: passiveRunId,
+				timestamp: "2030-01-02T04:00:00.000Z",
+				type: "lifecycle",
+				lifecycle: "stopping",
+			},
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+			noticeLineLimit: 1,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+		expect(api.sentNotices).toEqual([]);
+
+		store.manifests.set(
+			actionableRunId,
+			makeManifest({
+				runId: actionableRunId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(actionableRunId, [
+			{
+				schemaVersion: 1,
+				runId: actionableRunId,
+				timestamp: "2030-01-02T04:01:00.000Z",
+				type: "lifecycle",
+				lifecycle: "completed",
+			},
+		]);
+		await context.runInterval();
+
+		const actionableNotice = requireNoticeMessage(api.sentNotices[0]);
+		expect(actionableNotice.content).toContain(`run ${actionableRunId}`);
+		expect(actionableNotice.content).not.toContain(`run ${passiveRunId}`);
+		await api.acknowledgeNotice(actionableNotice, context);
+		expect(cursorStore.writes).toEqual([{ runId: actionableRunId, cursor: 1 }]);
+
+		await context.runInterval();
+		const passiveNotice = requireNoticeMessage(
+			await api.invokeBeforeAgentStart(context),
+		);
+		expect(passiveNotice.content).toContain(`run ${passiveRunId}`);
+		expect(passiveNotice.content).not.toContain(`run ${actionableRunId}`);
+		await api.acknowledgeNotice(passiveNotice, context);
+		expect(cursorStore.writes).toEqual([
+			{ runId: actionableRunId, cursor: 1 },
+			{ runId: passiveRunId, cursor: 1 },
+		]);
+	});
+
+	test("stale proof of an observed passive delivery cannot acknowledge later cross-run actionable content", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const passiveRunId = "run-observed-passive";
+		const actionableRunId = "run-later-cross-run";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			passiveRunId,
+			makeManifest({
+				runId: passiveRunId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(passiveRunId, [
+			{
+				schemaVersion: 1,
+				runId: passiveRunId,
+				timestamp: "2030-01-02T04:00:00.000Z",
+				type: "lifecycle",
+				lifecycle: "running",
+			},
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+		expect(api.sentNotices).toEqual([]);
+
+		const passiveNotice = requireNoticeMessage(
+			await api.invokeBeforeAgentStart(context),
+		);
+		expect(passiveNotice.content).toContain(`run ${passiveRunId}`);
+		expect(passiveNotice.content).toContain("lifecycle running");
+		expect(existsSync(context.sessionFile)).toBe(false);
+		expect(cursorStore.writes).toEqual([]);
+
+		store.manifests.set(
+			actionableRunId,
+			makeManifest({
+				runId: actionableRunId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(actionableRunId, [
+			{
+				schemaVersion: 1,
+				runId: actionableRunId,
+				timestamp: "2030-01-02T04:01:00.000Z",
+				type: "lifecycle",
+				lifecycle: "completed",
+			},
+		]);
+		await context.runInterval();
+
+		expect(api.sentNotices).toHaveLength(1);
+		const actionableNotice = requireNoticeMessage(api.sentNotices[0]);
+		expect(actionableNotice.details.deliveryId).not.toBe(
+			passiveNotice.details.deliveryId,
+		);
+		expect(actionableNotice.content).toContain(`run ${actionableRunId}`);
+		expect(actionableNotice.content).toContain("lifecycle completed");
+		expect(actionableNotice.content).not.toContain(`run ${passiveRunId}`);
+		expect(api.sentNotices[0]?.delivery).toEqual({
+			deliverAs: "nextTurn",
+			triggerTurn: true,
+		});
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.acknowledgeNotice(passiveNotice, context);
+		expect(cursorStore.writes).toEqual([{ runId: passiveRunId, cursor: 1 }]);
+		expect(cursorStore.values.get(actionableRunId) ?? 0).toBe(0);
+		expect(api.sentNotices).toHaveLength(1);
+
+		await api.acknowledgeNotice(actionableNotice, context);
+		expect(cursorStore.writes).toEqual([
+			{ runId: passiveRunId, cursor: 1 },
+			{ runId: actionableRunId, cursor: 1 },
+		]);
+	});
+
+	test("line-limited mixed runs advance only the represented actionable run first", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		for (const runId of ["run-passive-mixed", "run-terminal-mixed"]) {
+			store.manifests.set(
+				runId,
+				makeManifest({
+					runId,
+					repoPath: canonicalRepo,
+					workspaceId: "workspace-main",
+					coordinatorPaneId: "coordinator-main",
+				}),
+			);
+		}
+		store.events.set("run-passive-mixed", [
+			{
+				schemaVersion: 1,
+				runId: "run-passive-mixed",
+				timestamp: "2030-01-02T04:00:00.000Z",
+				type: "lifecycle",
+				lifecycle: "stopping",
+			},
+		]);
+		store.events.set("run-terminal-mixed", [
+			{
+				schemaVersion: 1,
+				runId: "run-terminal-mixed",
+				timestamp: "2030-01-02T04:00:00.000Z",
+				type: "lifecycle",
+				lifecycle: "completed",
+			},
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+			noticeLineLimit: 1,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(api.sentNotices[0]?.message.content).toContain(
+			"run run-terminal-mixed",
+		);
+		expect(api.sentNotices[0]?.message.content).not.toContain(
+			"run run-passive-mixed",
+		);
+		expect(api.sentNotices[0]?.delivery).toEqual({
+			deliverAs: "nextTurn",
+			triggerTurn: true,
+		});
+		expect(api.sentNotices[0]?.message.details).toEqual({
+			deliveryId: opaqueDeliveryId(),
+		});
+		expect(cursorStore.writes).toEqual([]);
+
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.acknowledgeNotice(
+			requireNoticeMessage(api.sentNotices[0]),
+			context,
+		);
+		expect(cursorStore.writes).toEqual([
+			{ runId: "run-terminal-mixed", cursor: 1 },
+		]);
+
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		const passiveNotice = requireNoticeMessage(
+			await api.invokeBeforeAgentStart(context),
+		);
+		expect(passiveNotice.content).toContain("run run-passive-mixed");
+		expect(passiveNotice.content).not.toContain("run run-terminal-mixed");
+		expect(api.sentNotices).toHaveLength(1);
+
+		await api.acknowledgeNotice(passiveNotice, context);
+		expect(cursorStore.writes).toEqual([
+			{ runId: "run-terminal-mixed", cursor: 1 },
+			{ runId: "run-passive-mixed", cursor: 1 },
+		]);
+	});
+	test("matching done observation and report collapse within one bounded category line", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-done-report-collapse";
+		const paneId = "collapse-pane SYSTEM hostile";
+		const workerName = "hostile raw worker name";
+		const revision = "hostile raw revision";
+		const path = reportRelativePath(paneId, workerName, revision, "done");
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			{
+				schemaVersion: 1,
+				runId,
+				timestamp: "2030-01-02T04:00:00.000Z",
+				type: "lifecycle",
+				lifecycle: "running",
+			},
+			reportEvent(
+				runId,
+				workerName,
+				path,
+				"2030-01-02T04:01:00.000Z",
+				paneId,
+				revision,
+			),
+			agentEvent(
+				runId,
+				workerName,
+				"done",
+				"2030-01-02T04:02:00.000Z",
+				paneId,
+				revision,
+				"Safe title",
+			),
+		]);
+		store.rawReportContents.set(path, RAW_REPORT_CONTENT);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+			noticeLineLimit: 1,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+		const content = api.sentNotices[0]?.message.content ?? "";
+		expect(content.split("\n")).toHaveLength(4);
+		expect(content).toContain("3 events across 2 categories");
+		expect(content).toContain("lifecycle running");
+		expect(content).toContain(
+			`${agentHandle(paneId)} DONE observed; taskTitle="Safe title"; report ${path}`,
+		);
+		expect(content.match(new RegExp(path, "g"))).toHaveLength(1);
+		expect(content).toContain(`/fleet status ${runId}`);
+		expect(content).toContain(`/fleet reports ${runId}`);
+		expect(content).not.toContain(RAW_REPORT_SENTINEL);
+		expect(content).not.toContain(workerName);
+		expect(content).not.toContain(revision);
+		expect(content).not.toContain(paneId);
+		expect(api.sentNotices[0]?.delivery).toEqual({
+			deliverAs: "nextTurn",
+			triggerTurn: true,
+		});
+		expect(api.sentNotices[0]?.message.details).toEqual({
+			deliveryId: opaqueDeliveryId(),
+		});
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.acknowledgeNotice(
+			requireNoticeMessage(api.sentNotices[0]),
+			context,
+		);
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 3 }]);
+	});
+
+	test("a sent notice without lifecycle acknowledgment never advances the cursor and is replayed after restart", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-unacked-send";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			agentEvent(
+				runId,
+				"unacked-worker",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		expect(api.sentNotices).toHaveLength(1);
+		expect(api.sentNotices[0]?.delivery).toEqual({
+			deliverAs: "nextTurn",
+			triggerTurn: true,
+		});
+		const sent = requireNoticeMessage(api.sentNotices[0]);
+		expect(sent.content).toContain("BLOCKED observed");
+		expect(cursorStore.writes).toEqual([]);
+		expect(cursorStore.values.get(runId) ?? 0).toBe(0);
+
+		expect(existsSync(context.sessionFile)).toBe(false);
+		await api.invokeMessageEnd(sent, context);
+		expect(api.messageEndInvocations).toEqual([
+			exactNoticeMessageEndEvent(sent),
+		]);
+		expect(context.entries).toEqual([]);
+		expect(existsSync(context.sessionFile)).toBe(false);
+		expect(cursorStore.writes).toEqual([]);
+		expect(cursorStore.values.get(runId) ?? 0).toBe(0);
+
+		await api.invokeAgentEnd(context, emptyAgentEndEvent());
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([]);
+		expect(cursorStore.values.get(runId) ?? 0).toBe(0);
+		await api.requireSessionShutdown()();
+
+		const restartedApi = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const restartedContext = new FakeExtensionContext(repoPath);
+		await restartedApi.requireSessionStart()({}, restartedContext.value);
+		expect(restartedApi.sentNotices).toHaveLength(1);
+		expect(restartedApi.sentNotices[0]?.message.content).toBe(sent.content);
+		expect(restartedApi.sentNotices[0]?.delivery).toEqual({
+			deliverAs: "nextTurn",
+			triggerTurn: true,
+		});
+		expect(requireNoticeMessage(restartedApi.sentNotices[0]).details).toEqual({
+			deliveryId: opaqueDeliveryId(),
+		});
+		expect(cursorStore.writes).toEqual([]);
+		expect(cursorStore.values.get(runId) ?? 0).toBe(0);
+		await restartedApi.requireSessionShutdown()();
+	});
+
+	test("an indeterminate send without a journal entry is recovered once without a second send", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-indeterminate-send";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			agentEvent(
+				runId,
+				"indeterminate-worker",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		expect(api.sentNotices).toHaveLength(1);
+		const sent = requireNoticeMessage(api.sentNotices[0]);
+		expect(sent.content).toContain("BLOCKED observed");
+		expect(context.entries).toEqual([]);
+		expect(existsSync(context.sessionFile)).toBe(false);
+		expect(cursorStore.writes).toEqual([]);
+
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+
+		await api.invokeAgentEnd(context, {
+			...emptyAgentEndEvent(),
+			willContinue: true,
+		});
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.invokeAgentEnd(context, emptyAgentEndEvent());
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+
+		const recovered = requireNoticeMessage(
+			await api.invokeBeforeAgentStart(context),
+		);
+		expect(recovered.details.deliveryId).toBe(sent.details.deliveryId);
+		expect(recovered.content).toBe(sent.content);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toEqual(recovered);
+		expect(cursorStore.values.get(runId) ?? 0).toBe(0);
+
+		await api.acknowledgeNotice(recovered, context);
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 1 }]);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+	});
+
+	test("agent_end before a no-journal timer releases the send lock without reinjecting a consumed notice", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-agent-end-before-timer";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			agentEvent(
+				runId,
+				"agent-end-first-worker",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		expect(api.sentNotices).toHaveLength(1);
+		const sent = requireNoticeMessage(api.sentNotices[0]);
+		expect(context.entries).toEqual([]);
+		expect(existsSync(context.sessionFile)).toBe(false);
+
+		await api.invokeAgentEnd(context, assistantAgentEndEvent(sent));
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+		expect(context.entries).toEqual([]);
+		expect(existsSync(context.sessionFile)).toBe(false);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+		expect(cursorStore.values.get(runId) ?? 0).toBe(0);
+
+		context.persistNotice(sent);
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 1 }]);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+	});
+
+	test("a recovered live unjournaled notice releases the send gate after exhaustion without reinjection", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-live-unjournaled";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			agentEvent(
+				runId,
+				"live-unjournaled-worker",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		expect(api.sentNotices).toHaveLength(1);
+		const sent = requireNoticeMessage(api.sentNotices[0]);
+		expect(existsSync(context.sessionFile)).toBe(false);
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.invokeAgentEnd(context, emptyAgentEndEvent());
+		const recovered = requireNoticeMessage(
+			await api.invokeBeforeAgentStart(context),
+		);
+		expect(recovered.details.deliveryId).toBe(sent.details.deliveryId);
+		context.stageEntry(recovered);
+		await api.invokeAgentEnd(context, assistantAgentEndEvent(recovered));
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+
+		store.events.set(runId, [
+			...(store.events.get(runId) ?? []),
+			agentEvent(
+				runId,
+				"live-unjournaled-second",
+				"blocked",
+				"2030-01-02T05:00:00.000Z",
+			),
+		]);
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(2);
+		const next = requireNoticeMessage(api.sentNotices[1]);
+		expect(next.details.deliveryId).not.toBe(sent.details.deliveryId);
+		expect(api.sentNotices[1]?.delivery).toEqual({
+			deliverAs: "nextTurn",
+			triggerTurn: true,
+		});
+		expect(next.content).toContain("BLOCKED observed");
+		expect(next.content).not.toBe(sent.content);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+		expect(cursorStore.values.get(runId) ?? 0).toBe(0);
+
+		context.persistNotice(sent);
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 1 }]);
+		expect(api.sentNotices).toHaveLength(2);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+	});
+
+	test("a later same-run delivery cannot skip an unjournaled predecessor cursor", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-predecessor-order";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			agentEvent(
+				runId,
+				"predecessor-worker",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		expect(api.sentNotices).toHaveLength(1);
+		const predecessor = requireNoticeMessage(api.sentNotices[0]);
+		expect(existsSync(context.sessionFile)).toBe(false);
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.invokeAgentEnd(context, emptyAgentEndEvent());
+		const recovered = requireNoticeMessage(
+			await api.invokeBeforeAgentStart(context),
+		);
+		expect(recovered.details.deliveryId).toBe(predecessor.details.deliveryId);
+		context.stageEntry(recovered);
+		await api.invokeAgentEnd(context, assistantAgentEndEvent(recovered));
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+
+		store.events.set(runId, [
+			...(store.events.get(runId) ?? []),
+			agentEvent(
+				runId,
+				"successor-worker",
+				"blocked",
+				"2030-01-02T05:00:00.000Z",
+			),
+		]);
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(2);
+		const successor = requireNoticeMessage(api.sentNotices[1]);
+		expect(successor.details.deliveryId).not.toBe(
+			predecessor.details.deliveryId,
+		);
+		expect(successor.content).toContain("BLOCKED observed");
+		expect(successor.content).not.toBe(predecessor.content);
+		expect(cursorStore.values.get(runId) ?? 0).toBe(0);
+
+		await api.acknowledgeNotice(successor, context);
+		expect(cursorStore.writes).toEqual([]);
+		expect(cursorStore.values.get(runId) ?? 0).toBe(0);
+		expect(api.sentNotices).toHaveLength(2);
+
+		await api.acknowledgeNotice(predecessor, context);
+		expect(cursorStore.writes).toEqual([
+			{ runId, cursor: 1 },
+			{ runId, cursor: 2 },
+		]);
+		expect(cursorStore.values.get(runId)).toBe(2);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+	});
+
+	test("a settled mixed-run delivery acknowledges independent cursors without skipping a same-run predecessor", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const predecessorRunId = "run-mixed-pred";
+		const independentRunId = "run-mixed-indep";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			predecessorRunId,
+			makeManifest({
+				runId: predecessorRunId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(predecessorRunId, [
+			agentEvent(
+				predecessorRunId,
+				"predecessor-worker",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		expect(api.sentNotices).toHaveLength(1);
+		const predecessor = requireNoticeMessage(api.sentNotices[0]);
+		expect(predecessor.content).toContain(`run ${predecessorRunId}`);
+		expect(predecessor.content).not.toContain(`run ${independentRunId}`);
+		expect(existsSync(context.sessionFile)).toBe(false);
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.invokeAgentEnd(context, emptyAgentEndEvent());
+		const recovered = requireNoticeMessage(
+			await api.invokeBeforeAgentStart(context),
+		);
+		expect(recovered.details.deliveryId).toBe(predecessor.details.deliveryId);
+		context.stageEntry(recovered);
+		await api.invokeAgentEnd(context, assistantAgentEndEvent(recovered));
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.writes).toEqual([]);
+
+		store.manifests.set(
+			independentRunId,
+			makeManifest({
+				runId: independentRunId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(predecessorRunId, [
+			...(store.events.get(predecessorRunId) ?? []),
+			agentEvent(
+				predecessorRunId,
+				"successor-worker",
+				"blocked",
+				"2030-01-02T05:00:00.000Z",
+			),
+		]);
+		store.events.set(independentRunId, [
+			agentEvent(
+				independentRunId,
+				"independent-worker",
+				"blocked",
+				"2030-01-02T05:00:00.000Z",
+			),
+		]);
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(2);
+		const mixed = requireNoticeMessage(api.sentNotices[1]);
+		expect(mixed.details.deliveryId).not.toBe(predecessor.details.deliveryId);
+		expect(mixed.content).toContain(`run ${predecessorRunId}`);
+		expect(mixed.content).toContain(`run ${independentRunId}`);
+		expect(cursorStore.values.get(predecessorRunId) ?? 0).toBe(0);
+		expect(cursorStore.values.get(independentRunId) ?? 0).toBe(0);
+
+		await api.acknowledgeNotice(mixed, context);
+		expect(cursorStore.writes).toEqual([
+			{ runId: independentRunId, cursor: 1 },
+		]);
+		expect(cursorStore.values.get(predecessorRunId) ?? 0).toBe(0);
+		expect(cursorStore.values.get(independentRunId)).toBe(1);
+		expect(api.sentNotices).toHaveLength(2);
+
+		store.events.set(independentRunId, [
+			...(store.events.get(independentRunId) ?? []),
+			agentEvent(
+				independentRunId,
+				"independent-successor",
+				"blocked",
+				"2030-01-02T06:00:00.000Z",
+			),
+		]);
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(3);
+		const laterIndependent = requireNoticeMessage(api.sentNotices[2]);
+		expect(laterIndependent.details.deliveryId).not.toBe(
+			mixed.details.deliveryId,
+		);
+		expect(laterIndependent.content).toContain(`run ${independentRunId}`);
+		expect(laterIndependent.content).not.toContain(`run ${predecessorRunId}`);
+
+		await api.acknowledgeNotice(laterIndependent, context);
+		expect(cursorStore.writes).toEqual([
+			{ runId: independentRunId, cursor: 1 },
+			{ runId: independentRunId, cursor: 2 },
+		]);
+		expect(cursorStore.values.get(predecessorRunId) ?? 0).toBe(0);
+		expect(cursorStore.values.get(independentRunId)).toBe(2);
+
+		await api.acknowledgeNotice(predecessor, context);
+		expect(cursorStore.writes).toEqual([
+			{ runId: independentRunId, cursor: 1 },
+			{ runId: independentRunId, cursor: 2 },
+			{ runId: predecessorRunId, cursor: 1 },
+			{ runId: predecessorRunId, cursor: 2 },
+		]);
+		expect(cursorStore.values.get(predecessorRunId)).toBe(2);
+		expect(cursorStore.values.get(independentRunId)).toBe(2);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+	});
+
+	test("a later mixed delivery records an unblocked B cursor when sibling unblocked C write fails", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const predecessorRunId = "run-unblocked-a";
+		const successRunId = "run-unblocked-b";
+		const failedRunId = "run-unblocked-c";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			predecessorRunId,
+			makeManifest({
+				runId: predecessorRunId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(predecessorRunId, [
+			agentEvent(
+				predecessorRunId,
+				"acked-worker",
+				"blocked",
+				"2030-01-02T03:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		expect(api.sentNotices).toHaveLength(1);
+		const first = requireNoticeMessage(api.sentNotices[0]);
+		expect(first.content).toContain(`run ${predecessorRunId}`);
+		await api.acknowledgeNotice(first, context);
+		expect(cursorStore.writes).toEqual([
+			{ runId: predecessorRunId, cursor: 1 },
+		]);
+
+		for (const runId of [successRunId, failedRunId]) {
+			store.manifests.set(
+				runId,
+				makeManifest({
+					runId,
+					repoPath: canonicalRepo,
+					workspaceId: "workspace-main",
+					coordinatorPaneId: "coordinator-main",
+				}),
+			);
+			store.events.set(runId, [
+				agentEvent(
+					runId,
+					`${runId}-worker`,
+					"blocked",
+					"2030-01-02T04:00:00.000Z",
+				),
+			]);
+		}
+		cursorStore.writeFailures.add(failedRunId);
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(2);
+		const mixed = requireNoticeMessage(api.sentNotices[1]);
+		expect(mixed.details.deliveryId).not.toBe(first.details.deliveryId);
+		expect(mixed.content).toContain(`run ${successRunId}`);
+		expect(mixed.content).toContain(`run ${failedRunId}`);
+		expect(mixed.content).not.toContain(`run ${predecessorRunId}`);
+
+		await api.acknowledgeNotice(mixed, context);
+		expect(cursorStore.writes).toEqual([
+			{ runId: predecessorRunId, cursor: 1 },
+			{ runId: successRunId, cursor: 1 },
+		]);
+		expect(cursorStore.values.get(successRunId)).toBe(1);
+		expect(cursorStore.values.get(failedRunId) ?? 0).toBe(0);
+		expect(api.loggerWarnings).toContain(
+			"omp-fleet notice acknowledgment failed",
+		);
+
+		store.events.set(successRunId, [
+			...(store.events.get(successRunId) ?? []),
+			agentEvent(
+				successRunId,
+				"b-successor",
+				"blocked",
+				"2030-01-02T05:00:00.000Z",
+			),
+		]);
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(3);
+		const laterB = requireNoticeMessage(api.sentNotices[2]);
+		expect(laterB.details.deliveryId).not.toBe(mixed.details.deliveryId);
+		expect(laterB.content).toContain(`run ${successRunId}`);
+		expect(laterB.content).not.toContain(`run ${failedRunId}`);
+
+		await api.acknowledgeNotice(laterB, context);
+		expect(cursorStore.writes).toEqual([
+			{ runId: predecessorRunId, cursor: 1 },
+			{ runId: successRunId, cursor: 1 },
+			{ runId: successRunId, cursor: 2 },
+		]);
+		expect(cursorStore.values.get(successRunId)).toBe(2);
+		expect(cursorStore.values.get(failedRunId) ?? 0).toBe(0);
+
+		cursorStore.writeFailures.delete(failedRunId);
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([
+			{ runId: predecessorRunId, cursor: 1 },
+			{ runId: successRunId, cursor: 1 },
+			{ runId: successRunId, cursor: 2 },
+			{ runId: failedRunId, cursor: 1 },
+		]);
+		expect(cursorStore.values.get(failedRunId)).toBe(1);
+		expect(cursorStore.values.get(successRunId)).toBe(2);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+	});
+
+	test("timer reconciliation proves a notice after a transient journal read failure", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-transient-journal";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			agentEvent(
+				runId,
+				"journal-fail-worker",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		expect(api.sentNotices).toHaveLength(1);
+		const sent = requireNoticeMessage(api.sentNotices[0]);
+		context.persistNotice(sent);
+		chmodSync(context.cwd, 0o000);
+		try {
+			await api.invokeAgentEnd(context, assistantAgentEndEvent(sent));
+			expect(cursorStore.writes).toEqual([]);
+			expect(api.sentNotices).toHaveLength(1);
+
+			await context.runInterval();
+			expect(cursorStore.writes).toEqual([]);
+			expect(api.sentNotices).toHaveLength(1);
+		} finally {
+			chmodSync(context.cwd, 0o700);
+		}
+
+		chmodSync(context.sessionFile, 0o000);
+		try {
+			await context.runInterval();
+			expect(cursorStore.writes).toEqual([]);
+			expect(api.sentNotices).toHaveLength(1);
+		} finally {
+			chmodSync(context.sessionFile, 0o644);
+		}
+
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 1 }]);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+	});
+
+	test("an invisible hide-queued send is not demoted or injected before its lifecycle", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-hidden-queue";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			agentEvent(
+				runId,
+				"hidden-queue-worker",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		expect(api.sentNotices).toHaveLength(1);
+		const sent = requireNoticeMessage(api.sentNotices[0]);
+		expect(context.entries).toEqual([]);
+		expect(context.pendingMessages).toBe(false);
+		expect(existsSync(context.sessionFile)).toBe(false);
+
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+		expect(cursorStore.writes).toEqual([]);
+		expect(context.entries).toEqual([]);
+
+		await api.invokeAgentEnd(context, {
+			...assistantAgentEndEvent(sent),
+			willContinue: true,
+		});
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+		expect(cursorStore.writes).toEqual([]);
+		expect(context.entries).toEqual([]);
+		expect(existsSync(context.sessionFile)).toBe(false);
+
+		await api.invokeAgentEnd(context, emptyAgentEndEvent());
+		expect(context.entries).toEqual([]);
+		expect(existsSync(context.sessionFile)).toBe(false);
+		await context.runInterval();
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+		expect(cursorStore.writes).toEqual([]);
+
+		context.persistNotice(sent);
+		await api.invokeAgentEnd(context, assistantAgentEndEvent(sent));
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 1 }]);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+	});
+
+	test("recovery does not advance a cursor without the exact notice and a later assistant", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-recovery-ordering";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			agentEvent(
+				runId,
+				"ordering-worker",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		const sent = requireNoticeMessage(api.sentNotices[0]);
+		await context.runInterval();
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+		await api.invokeAgentEnd(context, emptyAgentEndEvent());
+		const recovered = requireNoticeMessage(
+			await api.invokeBeforeAgentStart(context),
+		);
+		expect(recovered.details.deliveryId).toBe(sent.details.deliveryId);
+		expect(api.sentNotices).toHaveLength(1);
+
+		context.persistNotice({
+			...recovered,
+			details: { deliveryId: "not-the-recovered-delivery" },
+		});
+		await api.invokeAgentEnd(context, assistantAgentEndEvent());
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([]);
+
+		context.persistNotice(recovered);
+		await api.invokeAgentEnd(context, assistantAgentEndEvent());
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.invokeAgentEnd(context, {
+			type: "agent_end",
+			messages: [{ role: "assistant" }, { role: "custom", ...recovered }],
+		});
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.invokeAgentEnd(context, {
+			...assistantAgentEndEvent(recovered),
+			willContinue: true,
+		});
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.invokeAgentEnd(context, assistantAgentEndEvent());
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 1 }]);
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 1 }]);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(cursorStore.values.get(runId)).toBe(1);
+	});
+
+	test("a continued notice is settled by a later final assistant without repeating the notice", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-continued-notice";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			agentEvent(
+				runId,
+				"continued-notice-worker",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		expect(api.sentNotices).toHaveLength(1);
+		const sent = requireNoticeMessage(api.sentNotices[0]);
+		context.persistNotice(sent);
+		await api.invokeAgentEnd(context, {
+			type: "agent_end",
+			messages: [{ role: "custom", ...sent }],
+			willContinue: true,
+		});
+		expect(cursorStore.writes).toEqual([]);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+
+		await api.invokeAgentEnd(context, assistantAgentEndEvent());
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 1 }]);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+		await context.runInterval();
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 1 }]);
+	});
+
+	test("a cumulative assistant-before-notice snapshot does not settle without a later assistant", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const runId = "run-cumulative-assistant-before-notice";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath: canonicalRepo,
+				workspaceId: "workspace-main",
+				coordinatorPaneId: "coordinator-main",
+			}),
+		);
+		store.events.set(runId, [
+			agentEvent(
+				runId,
+				"cumulative-order-worker",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const cursorStore = new MemoryCursorStore();
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			cursorStore,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		expect(api.sentNotices).toHaveLength(1);
+		const sent = requireNoticeMessage(api.sentNotices[0]);
+		context.persistNotice(sent);
+		const priorAssistant = { role: "assistant" };
+		const noticeInTranscript = { role: "custom", ...sent };
+		const cumulative = [priorAssistant, noticeInTranscript];
+
+		await api.invokeAgentEnd(context, {
+			type: "agent_end",
+			messages: cumulative,
+		});
+		expect(cursorStore.writes).toEqual([]);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
+
+		await api.invokeAgentEnd(context, {
+			type: "agent_end",
+			messages: cumulative,
+		});
+		expect(cursorStore.writes).toEqual([]);
+		expect(api.sentNotices).toHaveLength(1);
+
+		await api.invokeAgentEnd(context, emptyAgentEndEvent());
+		expect(cursorStore.writes).toEqual([]);
+
+		await api.invokeAgentEnd(context, {
+			type: "agent_end",
+			messages: [...cumulative, { role: "assistant" }],
+		});
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 1 }]);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
 	});
 });

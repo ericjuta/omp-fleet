@@ -1,12 +1,13 @@
 import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { randomBytes } from "node:crypto";
-import { lstatSync, realpathSync, type Stats } from "node:fs";
+import { type Dirent, lstatSync, realpathSync, type Stats } from "node:fs";
 import {
 	appendFile,
 	link,
 	lstat,
 	mkdir,
 	open,
+	opendir,
 	readdir,
 	readFile,
 	realpath,
@@ -31,24 +32,25 @@ import type {
 	RunEvent,
 	RunLifecycle,
 	RunManifest,
-	RunSelector,
 	RunState,
 } from "./types.ts";
 import {
 	assertPluginVersion,
 	assertReportRecord,
+	assertReportRelativePath,
 	assertRunEvent,
 	assertRunId,
 	assertRunLifecycle,
 	assertRunManifest,
-	assertRunSelector,
 	assertRunState,
+	isTerminalLifecycle,
 	isUnknownRecord,
 	PLUGIN_VERSION,
 	ProtocolValidationError,
 	parseRunEvent,
 	parseRunManifest,
 	parseRunState,
+	REPORT_LIMIT,
 	SCHEMA_VERSION,
 } from "./types.ts";
 
@@ -59,11 +61,16 @@ export const UNTRUSTED_OUTPUT_HEADER =
 const REPORT_METADATA_PREFIX = "OMP-FLEET-METADATA ";
 const REPORT_HEADER_READ_LIMIT = 64 * 1024;
 const REPORT_BODY_BYTE_LIMIT = 262_144;
-const REPORT_FILE_LIMIT = 64;
 const REPORT_TRUNCATION_MARKER =
 	"\n[OMP-FLEET OUTPUT TRUNCATED TO 262144 UTF-8 BYTES]\n";
-const MANIFEST_MUTEX_FILE = ".manifest-lock.sqlite";
+const MANIFEST_MUTEX_DIRECTORY = ".manifest-lock.sqlite";
 const MANIFEST_MUTEX_BUSY_TIMEOUT_MS = 2_000;
+const CONTROL_MUTEX_ATTEMPT_TIMEOUT_MS = 0;
+const CONTROL_MUTEX_RETRY_DELAY_MS = 25;
+const CONTROL_MUTEX_QUEUE_TIMEOUT_MS = 60_000;
+const LEGACY_REPORT_TEMP_NAME =
+	/^\.agent-[a-f0-9]{12}-report-[a-f0-9]{64}\.txt\.[a-f0-9]{32}\.tmp$/;
+const REPORT_DIRECTORY_ENTRY_SCAN_LIMIT = REPORT_LIMIT * 2;
 
 export class ProtocolStoreError extends Error {
 	override readonly name = "ProtocolStoreError";
@@ -75,6 +82,11 @@ interface StoredReportEnvelope {
 	classification: "untrusted-output";
 	runId: string;
 	report: ReportRecord;
+}
+
+export interface LifecycleTransition {
+	allowedFrom: readonly RunLifecycle[];
+	next: RunManifest;
 }
 
 function isForbiddenReportCodePoint(codePoint: number): boolean {
@@ -238,12 +250,14 @@ async function atomicWriteChunks(
 
 async function publishExclusiveChunks(
 	targetPath: string,
+	runDirectory: string,
 	chunks: readonly string[],
 ): Promise<boolean> {
 	const temporaryPath = join(
-		dirname(targetPath),
+		runDirectory,
 		`.${basename(targetPath)}.${randomBytes(16).toString("hex")}.tmp`,
 	);
+	assertContained(runDirectory, temporaryPath, "report staging path");
 	try {
 		const handle = await open(temporaryPath, "wx", 0o600);
 		try {
@@ -274,9 +288,42 @@ async function publishExclusiveChunks(
 
 const processManifestMutexTails = new Map<string, Promise<void>>();
 
+interface ProcessMutexDeadline {
+	deadline: number;
+	timeoutMessage: string;
+}
+
+async function waitForProcessMutex(
+	previous: Promise<void>,
+	wait: ProcessMutexDeadline | undefined,
+): Promise<void> {
+	if (wait === undefined) {
+		await previous;
+		return;
+	}
+	const remaining = wait.deadline - performance.now();
+	if (remaining <= 0) throw new ProtocolStoreError(wait.timeoutMessage);
+	await new Promise<void>((resolveWait, rejectWait) => {
+		const timer = setTimeout(() => {
+			rejectWait(new ProtocolStoreError(wait.timeoutMessage));
+		}, remaining);
+		void previous.then(
+			() => {
+				clearTimeout(timer);
+				resolveWait();
+			},
+			(error: unknown) => {
+				clearTimeout(timer);
+				rejectWait(error);
+			},
+		);
+	});
+}
+
 async function withProcessManifestMutex<T>(
 	path: string,
 	action: () => Promise<T>,
+	wait?: ProcessMutexDeadline,
 ): Promise<T> {
 	const previous = processManifestMutexTails.get(path) ?? Promise.resolve();
 	let releaseCurrent: (() => void) | undefined;
@@ -288,15 +335,72 @@ async function withProcessManifestMutex<T>(
 		() => current,
 	);
 	processManifestMutexTails.set(path, tail);
-	await previous;
+	let predecessorReady = false;
 	try {
+		await waitForProcessMutex(previous, wait);
+		predecessorReady = true;
 		return await action();
 	} finally {
 		releaseCurrent?.();
 		if (processManifestMutexTails.get(path) === tail) {
-			processManifestMutexTails.delete(path);
+			if (predecessorReady) {
+				processManifestMutexTails.delete(path);
+			} else {
+				const cleanup = (): void => {
+					if (processManifestMutexTails.get(path) === tail) {
+						processManifestMutexTails.delete(path);
+					}
+				};
+				void tail.then(cleanup, cleanup);
+			}
 		}
 	}
+}
+
+async function ensurePrivateMutexDirectory(
+	path: string,
+	containmentRoot: string,
+	label: string,
+): Promise<string> {
+	assertContained(containmentRoot, path, `${label} directory`);
+	if ((await lstatIfPresent(path)) === undefined) {
+		try {
+			await mkdir(path, { mode: 0o700 });
+		} catch (error: unknown) {
+			if (!hasErrorCode(error, "EEXIST")) throw error;
+		}
+	}
+
+	const entry = await lstatIfPresent(path);
+	if (entry === undefined || !entry.isDirectory() || entry.isSymbolicLink()) {
+		throw new ProtocolStoreError(`${label} is not a regular directory`);
+	}
+	const currentUserId =
+		typeof process.getuid === "function" ? process.getuid() : undefined;
+	if (currentUserId !== undefined && entry.uid !== currentUserId) {
+		throw new ProtocolStoreError(`${label} is not owned by the current user`);
+	}
+	if ((entry.mode & 0o777) !== 0o700) {
+		throw new ProtocolStoreError(`${label} is not private`);
+	}
+	return path;
+}
+
+async function ensureManifestMutexDirectory(root: string): Promise<string> {
+	return await ensurePrivateMutexDirectory(
+		resolve(root, MANIFEST_MUTEX_DIRECTORY),
+		root,
+		"manifest mutex container",
+	);
+}
+
+async function ensureControlMutexDirectory(root: string): Promise<string> {
+	const manifestMutexDirectory = await ensureManifestMutexDirectory(root);
+	return await ensurePrivateMutexDirectory(
+		resolve(manifestMutexDirectory, "control"),
+		manifestMutexDirectory,
+		"control mutex container",
+	);
 }
 
 async function openManifestMutexDatabase(path: string): Promise<Database> {
@@ -337,13 +441,16 @@ async function openManifestMutexDatabase(path: string): Promise<Database> {
 	);
 }
 
-async function withSqliteManifestMutex<T>(
+class SqliteMutexBusyError extends Error {}
+
+async function withSqliteMutex<T>(
 	path: string,
+	busyTimeoutMs: number,
 	action: () => Promise<T>,
 ): Promise<T> {
 	const database = await openManifestMutexDatabase(path);
 	try {
-		database.run(`PRAGMA busy_timeout = ${MANIFEST_MUTEX_BUSY_TIMEOUT_MS}`);
+		database.run(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
 		try {
 			database.run("BEGIN IMMEDIATE");
 		} catch (error: unknown) {
@@ -353,9 +460,7 @@ async function withSqliteManifestMutex<T>(
 					typeof error["errno"] === "number" &&
 					(error["errno"] & 0xff) === 5)
 			) {
-				throw new ProtocolStoreError(
-					"timed out acquiring the manifest transition mutex",
-				);
+				throw new SqliteMutexBusyError();
 			}
 			throw error;
 		}
@@ -374,6 +479,57 @@ async function withSqliteManifestMutex<T>(
 		throw error;
 	} finally {
 		database.close(false);
+	}
+}
+
+async function withSqliteManifestMutex<T>(
+	path: string,
+	action: () => Promise<T>,
+): Promise<T> {
+	try {
+		return await withSqliteMutex(path, MANIFEST_MUTEX_BUSY_TIMEOUT_MS, action);
+	} catch (error) {
+		if (error instanceof SqliteMutexBusyError) {
+			throw new ProtocolStoreError(
+				"timed out acquiring the manifest transition mutex",
+			);
+		}
+		throw error;
+	}
+}
+
+function assertControlMutexDeadline(deadline: number): void {
+	if (performance.now() >= deadline) {
+		throw new ProtocolStoreError(
+			"timed out acquiring the launch/stop control mutex",
+		);
+	}
+}
+
+async function withQueuedSqliteControlMutex<T>(
+	path: string,
+	deadline: number,
+	action: () => Promise<T>,
+): Promise<T> {
+	while (true) {
+		assertControlMutexDeadline(deadline);
+		try {
+			return await withSqliteMutex(
+				path,
+				CONTROL_MUTEX_ATTEMPT_TIMEOUT_MS,
+				async () => {
+					assertControlMutexDeadline(deadline);
+					return await action();
+				},
+			);
+		} catch (error) {
+			if (!(error instanceof SqliteMutexBusyError)) throw error;
+			const remaining = deadline - performance.now();
+			if (remaining <= 0) {
+				assertControlMutexDeadline(deadline);
+			}
+			await Bun.sleep(Math.min(CONTROL_MUTEX_RETRY_DELAY_MS, remaining));
+		}
 	}
 }
 
@@ -431,16 +587,119 @@ function assertStoredReportEnvelope(
 	assertReportRecord(value["report"]);
 }
 
-function sameReport(left: ReportRecord, right: ReportRecord): boolean {
+function sameReportIdentity(left: ReportRecord, right: ReportRecord): boolean {
 	return (
 		left.key === right.key &&
 		left.paneId === right.paneId &&
 		left.workerName === right.workerName &&
 		left.status === right.status &&
 		left.revision === right.revision &&
-		left.path === right.path &&
-		left.observedAt === right.observedAt
+		left.path === right.path
 	);
+}
+
+function sameReport(left: ReportRecord, right: ReportRecord): boolean {
+	return (
+		sameReportIdentity(left, right) && left.observedAt === right.observedAt
+	);
+}
+
+function lifecycleEvent(manifest: RunManifest): RunEvent {
+	const base = {
+		schemaVersion: SCHEMA_VERSION,
+		runId: manifest.runId,
+		timestamp: manifest.updatedAt,
+		type: "lifecycle" as const,
+		lifecycle: manifest.lifecycle,
+	};
+	return manifest.lastError === undefined
+		? base
+		: { ...base, lastError: manifest.lastError };
+}
+
+function sameLifecycleEvent(left: RunEvent, right: RunEvent): boolean {
+	return (
+		left.type === "lifecycle" &&
+		right.type === "lifecycle" &&
+		left.schemaVersion === right.schemaVersion &&
+		left.runId === right.runId &&
+		left.timestamp === right.timestamp &&
+		left.lifecycle === right.lifecycle &&
+		left.lastError === right.lastError
+	);
+}
+
+interface ReportIndex {
+	byKey: Map<string, ReportRecord>;
+	byPath: Map<string, ReportRecord>;
+}
+
+function indexReports(
+	reports: readonly ReportRecord[],
+	label: string,
+): ReportIndex {
+	const byKey = new Map<string, ReportRecord>();
+	const byPath = new Map<string, ReportRecord>();
+	for (const report of reports) {
+		const keyed = byKey.get(report.key);
+		if (keyed !== undefined && !sameReport(keyed, report)) {
+			throw new ProtocolValidationError(
+				`${label} contains conflicting report keys`,
+			);
+		}
+		const pathed = byPath.get(report.path);
+		if (pathed !== undefined && !sameReport(pathed, report)) {
+			throw new ProtocolValidationError(
+				`${label} contains conflicting report paths`,
+			);
+		}
+		byKey.set(report.key, report);
+		byPath.set(report.path, report);
+	}
+	return { byKey, byPath };
+}
+
+function assertReportsAgreeWithStored(
+	reports: readonly ReportRecord[],
+	stored: ReportIndex,
+	label: string,
+): void {
+	for (const report of reports) {
+		const keyed = stored.byKey.get(report.key);
+		const pathed = stored.byPath.get(report.path);
+		if (
+			keyed === undefined ||
+			pathed === undefined ||
+			!sameReport(keyed, report) ||
+			!sameReport(pathed, report)
+		) {
+			throw new ProtocolValidationError(
+				`${label} report metadata does not match a stored report envelope`,
+			);
+		}
+	}
+}
+
+function mergeReports(
+	current: readonly ReportRecord[],
+	next: readonly ReportRecord[],
+	storedReports: readonly ReportRecord[],
+): ReportRecord[] {
+	indexReports(current, "durable state");
+	indexReports(next, "next state");
+	const stored = indexReports(storedReports, "stored reports");
+	indexReports([...current, ...next], "merged state");
+	assertReportsAgreeWithStored(current, stored, "durable state");
+	assertReportsAgreeWithStored(next, stored, "next state");
+	const merged: ReportRecord[] = [];
+	const seen = new Set<string>();
+	for (const report of [...current, ...next, ...storedReports]) {
+		if (!seen.has(report.key)) {
+			seen.add(report.key);
+			merged.push(report);
+		}
+	}
+	return merged;
 }
 
 async function readStoredReportEnvelope(
@@ -667,14 +926,37 @@ export class RunStore {
 		runId: string,
 		action: (runDirectory: string) => Promise<T>,
 	): Promise<T> {
-		const mutexPath = resolve(this.root, MANIFEST_MUTEX_FILE);
+		const runDirectory = await this.existingRunDirectory(runId);
+		const mutexDirectory = await ensureManifestMutexDirectory(this.root);
+		const mutexPath = resolve(mutexDirectory, `${runId}.sqlite`);
 		assertContained(this.root, mutexPath, "manifest mutex path");
+		assertContained(mutexDirectory, mutexPath, "manifest mutex path");
 		return await withProcessManifestMutex(mutexPath, async () => {
-			const runDirectory = await this.existingRunDirectory(runId);
-			return await withSqliteManifestMutex(mutexPath, async () => {
-				return await action(runDirectory);
-			});
+			return await withSqliteManifestMutex(mutexPath, () =>
+				action(runDirectory),
+			);
 		});
+	}
+
+	private async withControlMutex<T>(
+		runId: string,
+		action: () => Promise<T>,
+	): Promise<T> {
+		const deadline = performance.now() + CONTROL_MUTEX_QUEUE_TIMEOUT_MS;
+		await this.existingRunDirectory(runId);
+		const mutexDirectory = await ensureControlMutexDirectory(this.root);
+		const mutexPath = resolve(mutexDirectory, `${runId}.sqlite`);
+		assertContained(this.root, mutexPath, "control mutex path");
+		assertContained(mutexDirectory, mutexPath, "control mutex path");
+		return await withProcessManifestMutex(
+			mutexPath,
+			async () =>
+				await withQueuedSqliteControlMutex(mutexPath, deadline, action),
+			{
+				deadline,
+				timeoutMessage: "timed out acquiring the launch/stop control mutex",
+			},
+		);
 	}
 
 	private async readProtocolFile(
@@ -719,6 +1001,7 @@ export class RunStore {
 		}
 
 		await this.ensureRoot();
+		await ensureManifestMutexDirectory(this.root);
 		const finalDirectory = this.runDirectory(manifest.runId);
 		if ((await lstatIfPresent(finalDirectory)) !== undefined) {
 			throw new ProtocolStoreError(`run ${manifest.runId} already exists`);
@@ -756,6 +1039,15 @@ export class RunStore {
 			);
 		}
 		return manifest;
+	}
+	async withControlLock<T>(
+		runId: string,
+		action: (manifest: RunManifest) => Promise<T>,
+	): Promise<T> {
+		assertRunId(runId);
+		return await this.withControlMutex(runId, async () => {
+			return await action(await this.readManifest(runId));
+		});
 	}
 
 	async writeManifest(manifest: RunManifest): Promise<void> {
@@ -810,6 +1102,55 @@ export class RunStore {
 		});
 	}
 
+	async ensureLifecycle(
+		runId: string,
+		transition?: LifecycleTransition,
+	): Promise<RunManifest> {
+		assertRunId(runId);
+		let allowedFrom: readonly RunLifecycle[] | undefined;
+		let next: RunManifest | undefined;
+		if (transition !== undefined) {
+			if (!Array.isArray(transition.allowedFrom)) {
+				throw new ProtocolValidationError(
+					"allowed manifest lifecycles must be an array",
+				);
+			}
+			allowedFrom = [...transition.allowedFrom];
+			for (const lifecycle of allowedFrom) assertRunLifecycle(lifecycle);
+			next = transition.next;
+			assertRunManifest(next);
+			if (next.runId !== runId) {
+				throw new ProtocolValidationError(
+					"manifest transition runId values do not match",
+				);
+			}
+		}
+
+		return await this.withManifestMutex(runId, async (runDirectory) => {
+			let current = await this.readManifest(runId);
+			if (
+				allowedFrom !== undefined &&
+				next !== undefined &&
+				allowedFrom.includes(current.lifecycle)
+			) {
+				assertRunManifest(next);
+				if (next.runId !== runId) {
+					throw new ProtocolValidationError(
+						"manifest transition runId changed while waiting for its lock",
+					);
+				}
+				await atomicWriteJson(join(runDirectory, "manifest.json"), next);
+				current = next;
+			}
+			const expected = lifecycleEvent(current);
+			const tail = (await this.readEvents(runId)).at(-1);
+			if (tail === undefined || !sameLifecycleEvent(tail, expected)) {
+				await this.appendEventLocked(runDirectory, expected);
+			}
+			return current;
+		});
+	}
+
 	async readState(runId: string): Promise<RunState> {
 		assertRunId(runId);
 		const text = await this.readProtocolFile(runId, "state.json");
@@ -824,19 +1165,73 @@ export class RunStore {
 
 	async writeState(state: RunState): Promise<void> {
 		assertRunState(state);
-		const runDirectory = await this.existingRunDirectory(state.runId);
-		await atomicWriteJson(join(runDirectory, "state.json"), state);
+		const runId = state.runId;
+		await this.withManifestMutex(runId, async (runDirectory) => {
+			assertRunState(state);
+			if (state.runId !== runId) {
+				throw new ProtocolValidationError(
+					"state runId changed while waiting for its write lock",
+				);
+			}
+			const current = await this.readState(runId);
+			const stored = await this.listStoredReports(runId);
+			const union = indexReports(
+				[...current.reports, ...state.reports, ...stored],
+				"report union",
+			);
+			if (union.byKey.size > REPORT_LIMIT) {
+				throw new ProtocolStoreError(
+					`report file quota of ${REPORT_LIMIT} has been reached`,
+				);
+			}
+			const reports = mergeReports(current.reports, state.reports, stored);
+			const events = await this.readEvents(runId);
+			for (const event of events) {
+				if (event.type !== "report") {
+					continue;
+				}
+				const match = reports.find(
+					(report) =>
+						report.key === event.report.key ||
+						report.path === event.report.path,
+				);
+				if (
+					match === undefined ||
+					event.timestamp !== event.report.observedAt ||
+					!sameReport(match, event.report)
+				) {
+					throw new ProtocolValidationError(
+						"state report conflicts with report event",
+					);
+				}
+			}
+			let noticeCursor = state.noticeCursor;
+			if (
+				current.noticeCursor !== undefined &&
+				(noticeCursor === undefined || current.noticeCursor > noticeCursor)
+			) {
+				noticeCursor = current.noticeCursor;
+			}
+			const merged = {
+				schemaVersion: state.schemaVersion,
+				runId: state.runId,
+				updatedAt:
+					Date.parse(current.updatedAt) > Date.parse(state.updatedAt)
+						? current.updatedAt
+						: state.updatedAt,
+				agents: state.agents,
+				reports,
+				...(noticeCursor === undefined ? {} : { noticeCursor }),
+			};
+			assertRunState(merged);
+			await atomicWriteJson(join(runDirectory, "state.json"), merged);
+		});
 	}
 
-	async appendEvent(runId: string, event: RunEvent): Promise<void> {
-		assertRunId(runId);
-		assertRunEvent(event);
-		if (event.runId !== runId) {
-			throw new ProtocolValidationError(
-				"event runId does not match its directory",
-			);
-		}
-		const runDirectory = await this.existingRunDirectory(runId);
+	private async appendEventLocked(
+		runDirectory: string,
+		event: RunEvent,
+	): Promise<void> {
 		const eventsPath = join(runDirectory, "events.jsonl");
 		const entry = await lstatIfPresent(eventsPath);
 		if (entry === undefined || !entry.isFile() || entry.isSymbolicLink()) {
@@ -848,6 +1243,74 @@ export class RunStore {
 			encoding: "utf8",
 			flag: "a",
 			mode: 0o600,
+		});
+	}
+
+	async appendEvent(runId: string, event: RunEvent): Promise<void> {
+		assertRunId(runId);
+		assertRunEvent(event);
+		if (event.runId !== runId) {
+			throw new ProtocolValidationError(
+				"event runId does not match its directory",
+			);
+		}
+		await this.withManifestMutex(runId, async (runDirectory) => {
+			assertRunEvent(event);
+			if (event.runId !== runId) {
+				throw new ProtocolValidationError(
+					"event runId changed while waiting for its lock",
+				);
+			}
+			if (event.type === "lifecycle") {
+				const expected = lifecycleEvent(await this.readManifest(runId));
+				if (!sameLifecycleEvent(event, expected)) {
+					throw new ProtocolValidationError(
+						"lifecycle event does not match the durable manifest",
+					);
+				}
+			}
+			if (event.type === "report") {
+				const state = await this.readState(runId);
+				const storedReports = await this.listStoredReports(runId);
+				const stored = indexReports(storedReports, "stored reports");
+				assertReportsAgreeWithStored(state.reports, stored, "durable state");
+				const stateReport = state.reports.find(
+					(report) =>
+						report.key === event.report.key ||
+						report.path === event.report.path,
+				);
+				const storedReport = stored.byKey.get(event.report.key);
+				if (
+					event.timestamp !== event.report.observedAt ||
+					stateReport === undefined ||
+					!sameReport(stateReport, event.report) ||
+					storedReport === undefined ||
+					!sameReport(storedReport, event.report)
+				) {
+					throw new ProtocolValidationError(
+						"report event does not match a stored report envelope",
+					);
+				}
+				for (const existing of await this.readEvents(runId)) {
+					if (
+						existing.type !== "report" ||
+						(existing.report.key !== event.report.key &&
+							existing.report.path !== event.report.path)
+					) {
+						continue;
+					}
+					if (
+						existing.timestamp !== existing.report.observedAt ||
+						!sameReport(existing.report, event.report)
+					) {
+						throw new ProtocolValidationError(
+							"report event conflicts with existing event metadata",
+						);
+					}
+					return;
+				}
+			}
+			await this.appendEventLocked(runDirectory, event);
 		});
 	}
 
@@ -885,6 +1348,76 @@ export class RunStore {
 		return events;
 	}
 
+	async listStoredReports(runId: string): Promise<ReportRecord[]> {
+		assertRunId(runId);
+		const runDirectory = await this.existingRunDirectory(runId);
+		const reportsDirectory = join(runDirectory, "reports");
+		const reportsEntry = await lstatIfPresent(reportsDirectory);
+		if (
+			reportsEntry === undefined ||
+			!reportsEntry.isDirectory() ||
+			reportsEntry.isSymbolicLink()
+		) {
+			throw new ProtocolStoreError("reports path is not a regular directory");
+		}
+		const entries: Dirent[] = [];
+		let scanned = 0;
+		const directory = await opendir(reportsDirectory);
+		for await (const entry of directory) {
+			scanned += 1;
+			if (scanned > REPORT_DIRECTORY_ENTRY_SCAN_LIMIT) {
+				throw new ProtocolStoreError(
+					`report directory entry scan limit of ${REPORT_DIRECTORY_ENTRY_SCAN_LIMIT} has been exceeded`,
+				);
+			}
+			if (
+				LEGACY_REPORT_TEMP_NAME.test(entry.name) &&
+				entry.isFile() &&
+				!entry.isSymbolicLink()
+			) {
+				continue;
+			}
+			if (LEGACY_REPORT_TEMP_NAME.test(entry.name)) {
+				throw new ProtocolStoreError("report artifact is not a regular file");
+			}
+			if (entries.length >= REPORT_LIMIT) {
+				throw new ProtocolStoreError(
+					`report file quota of ${REPORT_LIMIT} has been exceeded`,
+				);
+			}
+			entries.push(entry);
+		}
+
+		const reports: ReportRecord[] = [];
+		const keys = new Set<string>();
+		const paths = new Set<string>();
+		for (const entry of entries) {
+			const relativePath = `reports/${entry.name}`;
+			assertReportRelativePath(relativePath);
+			if (!entry.isFile() || entry.isSymbolicLink()) {
+				throw new ProtocolStoreError("report artifact is not a regular file");
+			}
+			const reportPath = resolve(reportsDirectory, entry.name);
+			assertContained(reportsDirectory, reportPath, "report path");
+			const envelope = await readStoredReportEnvelope(reportPath);
+			if (envelope.runId !== runId || envelope.report.path !== relativePath) {
+				throw new ProtocolValidationError(
+					"stored report metadata does not match its run or path",
+				);
+			}
+			if (keys.has(envelope.report.key) || paths.has(envelope.report.path)) {
+				throw new ProtocolValidationError(
+					"stored reports contain duplicate identities",
+				);
+			}
+			keys.add(envelope.report.key);
+			paths.add(envelope.report.path);
+			reports.push(envelope.report);
+		}
+		reports.sort((left, right) => left.path.localeCompare(right.path));
+		return reports;
+	}
+
 	async writeReport(
 		runId: string,
 		record: ReportRecord,
@@ -896,82 +1429,125 @@ export class RunStore {
 			throw new ProtocolValidationError("report output must be a string");
 		}
 
-		const state = await this.readState(runId);
-		const runDirectory = await this.existingRunDirectory(runId);
-		const reportsDirectory = join(runDirectory, "reports");
-		const reportsEntry = await lstatIfPresent(reportsDirectory);
-		if (
-			reportsEntry === undefined ||
-			!reportsEntry.isDirectory() ||
-			reportsEntry.isSymbolicLink()
-		) {
-			throw new ProtocolStoreError("reports path is not a regular directory");
-		}
-
-		const existingByKey = state.reports.find(
-			(candidate) => candidate.key === record.key,
-		);
-		if (existingByKey !== undefined) {
-			const existingPath = resolve(runDirectory, existingByKey.path);
-			assertContained(reportsDirectory, existingPath, "report path");
-			const envelope = await readStoredReportEnvelope(existingPath);
-			if (
-				envelope.runId !== runId ||
-				!sameReport(envelope.report, existingByKey)
-			) {
+		return await this.withManifestMutex(runId, async (runDirectory) => {
+			const state = await this.readState(runId);
+			const stored = await this.listStoredReports(runId);
+			const reportsDirectory = join(runDirectory, "reports");
+			const storedByKey = new Map<string, ReportRecord>();
+			const storedByPath = new Map<string, ReportRecord>();
+			for (const report of stored) {
+				storedByKey.set(report.key, report);
+				storedByPath.set(report.path, report);
+			}
+			for (const persisted of state.reports) {
+				const storedBySameKey = storedByKey.get(persisted.key);
+				if (
+					storedBySameKey !== undefined &&
+					!sameReport(persisted, storedBySameKey)
+				) {
+					throw new ProtocolValidationError(
+						"existing report metadata disagrees with the persisted state record",
+					);
+				}
+				const storedBySamePath = storedByPath.get(persisted.path);
+				if (
+					storedBySamePath !== undefined &&
+					storedBySamePath.key !== persisted.key
+				) {
+					throw new ProtocolValidationError(
+						"report path is already assigned to another key",
+					);
+				}
+			}
+			const publishedByKey = storedByKey.get(record.key);
+			if (publishedByKey !== undefined) {
+				if (!sameReportIdentity(publishedByKey, record)) {
+					throw new ProtocolValidationError(
+						"report key is already assigned to different metadata",
+					);
+				}
+				const publishedPath = resolve(runDirectory, publishedByKey.path);
+				assertContained(reportsDirectory, publishedPath, "report path");
+				return await readMatchingStoredReport(publishedPath, runId, record);
+			}
+			const publishedByPath = storedByPath.get(record.path);
+			if (publishedByPath !== undefined) {
 				throw new ProtocolValidationError(
-					"existing report metadata disagrees with the persisted state record",
+					"report path is already assigned to another key",
 				);
 			}
-			return envelope.report;
-		}
-		if (state.reports.some((candidate) => candidate.path === record.path)) {
-			throw new ProtocolValidationError(
-				"report path is already assigned to another key",
+
+			const existingByKey = state.reports.find(
+				(candidate) => candidate.key === record.key,
 			);
-		}
-
-		const targetPath = resolve(runDirectory, record.path);
-		assertContained(reportsDirectory, targetPath, "report path");
-		const targetEntry = await lstatIfPresent(targetPath);
-
-		if (targetEntry !== undefined) {
-			return await readMatchingStoredReport(targetPath, runId, record);
-		}
-
-		const reportEntries = await readdir(reportsDirectory, {
-			withFileTypes: true,
-		});
-		let reportFileCount = 0;
-		for (const entry of reportEntries) {
-			if (entry.isFile()) {
-				reportFileCount += 1;
+			if (existingByKey !== undefined) {
+				const existingPath = resolve(runDirectory, existingByKey.path);
+				assertContained(reportsDirectory, existingPath, "report path");
+				const envelope = await readStoredReportEnvelope(existingPath);
+				if (
+					envelope.runId !== runId ||
+					!sameReport(envelope.report, existingByKey)
+				) {
+					throw new ProtocolValidationError(
+						"existing report metadata disagrees with the persisted state record",
+					);
+				}
+				return envelope.report;
 			}
-		}
-		if (reportFileCount >= REPORT_FILE_LIMIT) {
-			throw new ProtocolStoreError(
-				`report file quota of ${REPORT_FILE_LIMIT} has been reached`,
-			);
-		}
+			if (state.reports.some((candidate) => candidate.path === record.path)) {
+				throw new ProtocolValidationError(
+					"report path is already assigned to another key",
+				);
+			}
 
-		const envelope: StoredReportEnvelope = {
-			schemaVersion: SCHEMA_VERSION,
-			pluginVersion: PLUGIN_VERSION,
-			classification: "untrusted-output",
-			runId,
-			report: record,
-		};
-		const metadataHeader = `${REPORT_METADATA_PREFIX}${canonicalReportMetadata(envelope)}`;
-		const published = await publishExclusiveChunks(targetPath, [
-			`${UNTRUSTED_OUTPUT_HEADER}\n${metadataHeader}\n\n`,
-			sanitizeReportBody(output),
-		]);
-		return published
-			? record
-			: await readMatchingStoredReport(targetPath, runId, record);
+			const targetPath = resolve(runDirectory, record.path);
+			assertContained(reportsDirectory, targetPath, "report path");
+			const targetEntry = await lstatIfPresent(targetPath);
+
+			if (targetEntry !== undefined) {
+				return await readMatchingStoredReport(targetPath, runId, record);
+			}
+
+			const manifest = await this.readManifest(runId);
+			if (isTerminalLifecycle(manifest.lifecycle)) {
+				throw new ProtocolStoreError(
+					"cannot publish a new report after the run is terminal",
+				);
+			}
+			const unionKeys = new Set<string>();
+			for (const persisted of state.reports) {
+				unionKeys.add(persisted.key);
+			}
+			for (const published of stored) {
+				unionKeys.add(published.key);
+			}
+			if (!unionKeys.has(record.key) && unionKeys.size >= REPORT_LIMIT) {
+				throw new ProtocolStoreError(
+					`report file quota of ${REPORT_LIMIT} has been reached`,
+				);
+			}
+
+			const envelope: StoredReportEnvelope = {
+				schemaVersion: SCHEMA_VERSION,
+				pluginVersion: PLUGIN_VERSION,
+				classification: "untrusted-output",
+				runId,
+				report: record,
+			};
+			const metadataHeader = `${REPORT_METADATA_PREFIX}${canonicalReportMetadata(envelope)}`;
+			const published = await publishExclusiveChunks(targetPath, runDirectory, [
+				`${UNTRUSTED_OUTPUT_HEADER}\n${metadataHeader}\n\n`,
+				sanitizeReportBody(output),
+			]);
+			return published
+				? record
+				: await readMatchingStoredReport(targetPath, runId, record);
+		});
 	}
 
-	async listRuns(): Promise<RunManifest[]> {
+	async listRuns(
+		options: { failOnInvalid?: boolean } = {},
+	): Promise<RunManifest[]> {
 		if (!(await this.hasExistingRoot())) {
 			return [];
 		}
@@ -990,8 +1566,11 @@ export class RunStore {
 			}
 			try {
 				assertRunId(entry.name);
+			} catch {
+				continue;
+			}
+			try {
 				const manifest = await this.readManifest(entry.name);
-				await this.readState(entry.name);
 				manifests.push(manifest);
 			} catch (error: unknown) {
 				if (
@@ -1000,6 +1579,11 @@ export class RunStore {
 					hasErrorCode(error, "ENOENT") ||
 					hasErrorCode(error, "ENOTDIR")
 				) {
+					if (options.failOnInvalid === true) {
+						throw new ProtocolStoreError(
+							"run inventory contains invalid manifest metadata",
+						);
+					}
 					continue;
 				}
 				throw error;
@@ -1013,19 +1597,5 @@ export class RunStore {
 				: right.runId.localeCompare(left.runId);
 		});
 		return manifests;
-	}
-
-	async findLatest(
-		selector: RunSelector = {},
-	): Promise<RunManifest | undefined> {
-		assertRunSelector(selector);
-		const manifests = await this.listRuns();
-		return manifests.find(
-			(manifest) =>
-				(selector.repoPath === undefined ||
-					manifest.repoPath === selector.repoPath) &&
-				(selector.coordinatorPaneId === undefined ||
-					manifest.coordinatorPaneId === selector.coordinatorPaneId),
-		);
 	}
 }

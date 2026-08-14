@@ -3,8 +3,9 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { HerdrAgent } from "../src/herdr.ts";
-import { RunStore } from "../src/store.ts";
+import { ProtocolStoreError, RunStore } from "../src/store.ts";
 import {
+	requireDurableConvergence,
 	runSupervisor,
 	type SupervisorDependencies,
 	type SupervisorSleep,
@@ -41,6 +42,7 @@ class FakeStore {
 	reportPublicationStages: ReportPublicationStage[] | undefined;
 	readStateError: Error | undefined;
 	writeStateFailures = 0;
+	terminalLifecycleAppendFailures = 0;
 
 	constructor(
 		manifest: RunManifest,
@@ -100,6 +102,16 @@ class FakeStore {
 		if (runId !== event.runId) {
 			return Promise.reject(new Error("event run ID mismatch"));
 		}
+		if (
+			event.type === "lifecycle" &&
+			(event.lifecycle === "stopped" ||
+				event.lifecycle === "completed" ||
+				event.lifecycle === "failed") &&
+			this.terminalLifecycleAppendFailures > 0
+		) {
+			this.terminalLifecycleAppendFailures -= 1;
+			return Promise.reject(new Error("injected lifecycle append failure"));
+		}
 		if (event.type === "report") {
 			this.reportPublicationStages?.push("appendEvent");
 		}
@@ -125,6 +137,15 @@ class FakeStore {
 			return Promise.reject(new Error("event run ID mismatch"));
 		}
 		return Promise.resolve(structuredClone(this.events));
+	}
+
+	listStoredReports(runId: string): Promise<ReportRecord[]> {
+		if (runId !== this.state.runId) {
+			return Promise.reject(new Error("unexpected run ID"));
+		}
+		return Promise.resolve(
+			this.reportWrites.map(({ record }) => structuredClone(record)),
+		);
 	}
 }
 
@@ -240,6 +261,23 @@ function makeStore(manifest: RunManifest): FakeStore {
 		manifest,
 		makeState({ runId: manifest.runId, updatedAt: manifest.updatedAt }),
 	);
+}
+
+function bindStore(
+	store: FakeStore,
+	overrides: Partial<SupervisorDependencies["store"]> = {},
+): SupervisorDependencies["store"] {
+	return {
+		readManifest: store.readManifest.bind(store),
+		readState: store.readState.bind(store),
+		writeState: store.writeState.bind(store),
+		transitionManifest: store.transitionManifest.bind(store),
+		appendEvent: store.appendEvent.bind(store),
+		writeReport: store.writeReport.bind(store),
+		readEvents: store.readEvents.bind(store),
+		listStoredReports: store.listStoredReports.bind(store),
+		...overrides,
+	};
 }
 
 function dependencies(
@@ -819,17 +857,416 @@ describe("runSupervisor", () => {
 		expect(failingStore.reportPublicationStages).toEqual([
 			"writeReport",
 			"writeState",
+			"writeState",
+			"appendEvent",
 		]);
 		expect(failingStore.reportWrites).toHaveLength(1);
-		expect(failingStore.state.reports).toEqual([]);
+		expect(failingStore.state.reports).toEqual(
+			failingStore.reportWrites.map(({ record }) => record),
+		);
 		expect(
-			failingStore.events.filter((event) => event.type === "report"),
-		).toEqual([]);
+			failingStore.events
+				.filter((event) => event.type === "report")
+				.map((event) => event.report),
+		).toEqual(failingStore.state.reports);
 		expect(failedManifest).toMatchObject({
 			lifecycle: "failed",
 			lastError: "state write failed",
 			stoppedAt: NOW_ISO,
 		});
+	});
+
+	test("recovers in-call from one transient state failure after report file publication", async () => {
+		const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+			lifecycle: "running",
+		});
+		const store = makeStore(manifest);
+		store.reportPublicationStages = [];
+		store.writeStateFailures = 1;
+		const report = reportRecord(
+			"pane-worker",
+			"worker-one",
+			"rev-state-repair",
+			"done",
+			NOW_ISO,
+		);
+		const herdr = new FakeHerdr(
+			[
+				[
+					agent(
+						"pane-worker",
+						"workspace-main",
+						"worker-one",
+						"done",
+						"rev-state-repair",
+					),
+				],
+			],
+			{ "pane-worker": "UNTRUSTED REPORT BODY" },
+		);
+
+		const finalManifest = await runSupervisor(
+			{ manifest },
+			dependencies(store, herdr, makeClock()),
+		);
+
+		expect(store.reportWrites).toHaveLength(1);
+		expect(store.reportWrites[0]?.record).toEqual(report);
+		expect(store.writeStateFailures).toBe(0);
+		expect(finalManifest).toMatchObject({
+			lifecycle: "failed",
+			lastError: "state write failed",
+			updatedAt: NOW_ISO,
+			stoppedAt: NOW_ISO,
+		});
+		expect(store.manifest).toMatchObject({
+			lifecycle: "failed",
+			lastError: "state write failed",
+			updatedAt: NOW_ISO,
+			stoppedAt: NOW_ISO,
+		});
+		expect(store.manifestWrites.map(({ lifecycle }) => lifecycle)).toEqual([
+			"failed",
+		]);
+		expect(store.state.reports).toEqual([report]);
+		expect(
+			store.events.filter(
+				(event) =>
+					event.type === "report" ||
+					(event.type === "lifecycle" && event.lifecycle === "failed"),
+			),
+		).toEqual([
+			{
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "report",
+				timestamp: report.observedAt,
+				report,
+			},
+			{
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: NOW_ISO,
+				lifecycle: "failed",
+				lastError: "state write failed",
+			},
+		]);
+		expect(store.events.at(-1)).toEqual({
+			schemaVersion: 1,
+			runId: "supervisor-run",
+			type: "lifecycle",
+			timestamp: NOW_ISO,
+			lifecycle: "failed",
+			lastError: "state write failed",
+		});
+		expect(store.reportPublicationStages).toEqual([
+			"writeReport",
+			"writeState",
+			"writeState",
+			"appendEvent",
+		]);
+		expect(JSON.stringify(finalManifest)).not.toContain(
+			"RAW STORE FAILURE DETAILS",
+		);
+		expect(herdr.listCalls).toEqual(["workspace-main"]);
+	});
+
+	test("recovers in-call from one report event append failure with the same failed convergence", async () => {
+		const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+			lifecycle: "running",
+		});
+		const store = makeStore(manifest);
+		store.reportPublicationStages = [];
+		let reportEventFailures = 1;
+		const report = reportRecord(
+			"pane-worker",
+			"worker-one",
+			"rev-event-repair",
+			"done",
+			NOW_ISO,
+		);
+		const herdr = new FakeHerdr(
+			[
+				[
+					agent(
+						"pane-worker",
+						"workspace-main",
+						"worker-one",
+						"done",
+						"rev-event-repair",
+					),
+				],
+			],
+			{ "pane-worker": "UNTRUSTED REPORT BODY" },
+		);
+		const recovering = bindStore(store, {
+			listStoredReports: store.listStoredReports.bind(store),
+			appendEvent: async (runId, event) => {
+				if (event.type === "report" && reportEventFailures > 0) {
+					reportEventFailures -= 1;
+					return Promise.reject(new Error("report event append failed"));
+				}
+				return store.appendEvent(runId, event);
+			},
+		});
+
+		const finalManifest = await runSupervisor(
+			{ manifest },
+			dependencies(recovering, herdr, makeClock()),
+		);
+
+		expect(store.reportWrites).toHaveLength(1);
+		expect(store.reportWrites[0]?.record).toEqual(report);
+		expect(reportEventFailures).toBe(0);
+		expect(finalManifest).toMatchObject({
+			lifecycle: "failed",
+			lastError: "event append failed",
+			updatedAt: NOW_ISO,
+			stoppedAt: NOW_ISO,
+		});
+		expect(store.manifest).toMatchObject({
+			lifecycle: "failed",
+			lastError: "event append failed",
+			updatedAt: NOW_ISO,
+			stoppedAt: NOW_ISO,
+		});
+		expect(store.manifestWrites.map(({ lifecycle }) => lifecycle)).toEqual([
+			"failed",
+		]);
+		expect(store.state.reports).toEqual([report]);
+		expect(
+			store.events.filter(
+				(event) =>
+					event.type === "report" ||
+					(event.type === "lifecycle" && event.lifecycle === "failed"),
+			),
+		).toEqual([
+			{
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "report",
+				timestamp: report.observedAt,
+				report,
+			},
+			{
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: NOW_ISO,
+				lifecycle: "failed",
+				lastError: "event append failed",
+			},
+		]);
+		expect(store.events.at(-1)).toEqual({
+			schemaVersion: 1,
+			runId: "supervisor-run",
+			type: "lifecycle",
+			timestamp: NOW_ISO,
+			lifecycle: "failed",
+			lastError: "event append failed",
+		});
+		expect(store.reportPublicationStages).toEqual([
+			"writeReport",
+			"writeState",
+			"appendEvent",
+		]);
+		expect(herdr.listCalls).toEqual(["workspace-main"]);
+	});
+
+	test("rejects persistent state and report-event failures after a failed win instead of returning stranded success", async () => {
+		for (const gap of ["state", "report-event"] as const) {
+			const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+				lifecycle: "running",
+			});
+			const store = makeStore(manifest);
+			const report = reportRecord(
+				"pane-worker",
+				"worker-one",
+				`rev-persistent-${gap}`,
+				"done",
+				NOW_ISO,
+			);
+			const herdr = new FakeHerdr(
+				[
+					[
+						agent(
+							"pane-worker",
+							"workspace-main",
+							"worker-one",
+							"done",
+							`rev-persistent-${gap}`,
+						),
+					],
+				],
+				{ "pane-worker": "UNTRUSTED REPORT BODY" },
+			);
+			const failing = bindStore(store, {
+				listStoredReports: store.listStoredReports.bind(store),
+				...(gap === "state"
+					? {
+							writeState: () =>
+								Promise.reject(new Error("RAW STORE FAILURE DETAILS")),
+						}
+					: {
+							appendEvent: async (runId, event) => {
+								if (event.type === "report") {
+									return Promise.reject(
+										new Error("report event append failed"),
+									);
+								}
+								return store.appendEvent(runId, event);
+							},
+						}),
+			});
+
+			await expect(
+				runSupervisor({ manifest }, dependencies(failing, herdr, makeClock())),
+			).rejects.toThrow(
+				gap === "state" ? "state write failed" : "event append failed",
+			);
+			expect(store.manifest).toMatchObject({
+				lifecycle: "failed",
+				lastError:
+					gap === "state" ? "state write failed" : "event append failed",
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			expect(store.manifestWrites.map(({ lifecycle }) => lifecycle)).toEqual([
+				"failed",
+			]);
+			expect(store.reportWrites).toHaveLength(1);
+			expect(store.reportWrites[0]?.record).toEqual(report);
+			if (gap === "state") {
+				expect(store.state.reports).toEqual([]);
+			} else {
+				expect(store.state.reports).toEqual([report]);
+			}
+			expect(store.events.filter((event) => event.type === "report")).toEqual(
+				[],
+			);
+			expect(
+				store.events.filter(
+					(event) => event.type === "lifecycle" && event.lifecycle === "failed",
+				),
+			).toEqual([]);
+			expect(JSON.stringify(store.manifest)).not.toContain(
+				"RAW STORE FAILURE DETAILS",
+			);
+			expect(herdr.listCalls).toEqual(["workspace-main"]);
+		}
+	});
+
+	test("preserves a concurrent stopping winner during failure handling until report-converged stopped", async () => {
+		const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+			lifecycle: "running",
+		});
+		const store = makeStore(manifest);
+		store.writeStateFailures = 1;
+		const stoppingAt = "2026-08-11T11:59:30.000Z";
+		let injected = false;
+		const report = reportRecord(
+			"pane-worker",
+			"worker-one",
+			"rev-stop-winner",
+			"done",
+			NOW_ISO,
+		);
+		const herdr = new FakeHerdr(
+			[
+				[
+					agent(
+						"pane-worker",
+						"workspace-main",
+						"worker-one",
+						"done",
+						"rev-stop-winner",
+					),
+				],
+			],
+			{ "pane-worker": "UNTRUSTED REPORT BODY" },
+		);
+		const racing = bindStore(store, {
+			listStoredReports: store.listStoredReports.bind(store),
+			transitionManifest: async (runId, allowedFrom, next) => {
+				if (!injected && next.lifecycle === "failed") {
+					const durable = await store.readManifest(runId);
+					await store.transitionManifest(runId, ["starting", "running"], {
+						...durable,
+						lifecycle: "stopping",
+						updatedAt: stoppingAt,
+					});
+					injected = true;
+				}
+				return await store.transitionManifest(runId, allowedFrom, next);
+			},
+		});
+
+		const finalManifest = await runSupervisor(
+			{ manifest },
+			dependencies(racing, herdr, makeClock()),
+		);
+
+		expect(injected).toBe(true);
+		expect(store.reportWrites).toHaveLength(1);
+		expect(store.reportWrites[0]?.record).toEqual(report);
+		expect(finalManifest).toMatchObject({
+			lifecycle: "stopped",
+			updatedAt: NOW_ISO,
+			stoppedAt: NOW_ISO,
+		});
+		expect(finalManifest.lastError).toBeUndefined();
+		expect(store.manifest).toMatchObject({
+			lifecycle: "stopped",
+			updatedAt: NOW_ISO,
+			stoppedAt: NOW_ISO,
+		});
+		expect(store.manifest.lastError).toBeUndefined();
+		expect(store.manifestWrites.map(({ lifecycle }) => lifecycle)).toEqual([
+			"stopping",
+			"stopped",
+		]);
+		expect(store.state.reports).toEqual([report]);
+		expect(
+			store.events.filter(
+				(event) =>
+					event.type === "report" ||
+					(event.type === "lifecycle" &&
+						(event.lifecycle === "stopping" ||
+							event.lifecycle === "stopped" ||
+							event.lifecycle === "failed")),
+			),
+		).toEqual([
+			{
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: stoppingAt,
+				lifecycle: "stopping",
+			},
+			{
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "report",
+				timestamp: report.observedAt,
+				report,
+			},
+			{
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: NOW_ISO,
+				lifecycle: "stopped",
+			},
+		]);
+		expect(store.events.at(-1)).toEqual({
+			schemaVersion: 1,
+			runId: "supervisor-run",
+			type: "lifecycle",
+			timestamp: NOW_ISO,
+			lifecycle: "stopped",
+		});
+		expect(herdr.listCalls).toEqual(["workspace-main"]);
 	});
 
 	test("persists a failed lifecycle when agent sampling fails", async () => {
@@ -875,12 +1312,11 @@ describe("runSupervisor", () => {
 		const herdr = new FakeHerdr([]);
 		const clock = makeClock();
 
-		const finalManifest = await runSupervisor(
-			{ manifest },
-			dependencies(store, herdr, clock),
-		);
+		await expect(
+			runSupervisor({ manifest }, dependencies(store, herdr, clock)),
+		).rejects.toThrow("state read failed");
 
-		expect(finalManifest).toMatchObject({
+		expect(store.manifest).toMatchObject({
 			lifecycle: "failed",
 			lastError: "state read failed",
 			stoppedAt: NOW_ISO,
@@ -888,17 +1324,67 @@ describe("runSupervisor", () => {
 		expect(store.manifestWrites.map(({ lifecycle }) => lifecycle)).toEqual([
 			"failed",
 		]);
-		expect(store.events).toEqual([
+		expect(store.events).toEqual([]);
+		expect(JSON.stringify(store.manifest)).not.toContain("RAW STORE CONTENTS");
+	});
+
+	test("persists a failed lifecycle when an observation event append fails", async () => {
+		const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+			lifecycle: "running",
+		});
+		const store = makeStore(manifest);
+		const herdr = new FakeHerdr([
+			[
+				agent(
+					"pane-worker",
+					"workspace-main",
+					"worker-one",
+					"working",
+					"rev-a",
+				),
+			],
+		]);
+		const failingStore: SupervisorDependencies["store"] = {
+			readManifest: store.readManifest.bind(store),
+			readState: store.readState.bind(store),
+			writeState: store.writeState.bind(store),
+			transitionManifest: store.transitionManifest.bind(store),
+			appendEvent: async (runId, event) => {
+				if (event.type === "agent" && event.outcome === "observed") {
+					throw new Error("observation append failure");
+				}
+				return store.appendEvent(runId, event);
+			},
+			writeReport: store.writeReport.bind(store),
+			readEvents: store.readEvents.bind(store),
+			listStoredReports: store.listStoredReports.bind(store),
+		};
+
+		const finalManifest = await runSupervisor(
+			{ manifest },
+			dependencies(failingStore, herdr, makeClock()),
+		);
+
+		expect(finalManifest).toMatchObject({
+			lifecycle: "failed",
+			lastError: "event append failed",
+			stoppedAt: NOW_ISO,
+		});
+		expect(store.manifest.lifecycle).toBe("failed");
+		expect(
+			store.events.filter(
+				(event) => event.type === "lifecycle" && event.lifecycle === "failed",
+			),
+		).toEqual([
 			{
 				schemaVersion: 1,
 				runId: "supervisor-run",
 				type: "lifecycle",
 				timestamp: NOW_ISO,
 				lifecycle: "failed",
-				lastError: "state read failed",
+				lastError: "event append failed",
 			},
 		]);
-		expect(JSON.stringify(finalManifest)).not.toContain("RAW STORE CONTENTS");
 	});
 
 	test("completes at the persisted deadline without sampling or sleeping", async () => {
@@ -1027,7 +1513,13 @@ describe("runSupervisor", () => {
 
 		const finalManifest = await runSupervisor(
 			{ manifest },
-			dependencies(store, herdr, clock),
+			dependencies(
+				bindStore(store, {
+					listStoredReports: () => Promise.resolve([report]),
+				}),
+				herdr,
+				clock,
+			),
 		);
 
 		expect(finalManifest.lifecycle).toBe("completed");
@@ -1039,6 +1531,13 @@ describe("runSupervisor", () => {
 				type: "report",
 				timestamp: "2026-08-11T11:59:00.000Z",
 				report,
+			},
+			{
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: NOW_ISO,
+				lifecycle: "running",
 			},
 			{
 				schemaVersion: 1,
@@ -1248,7 +1747,7 @@ describe("runSupervisor", () => {
 
 			expect(herdr.listCalls).toEqual(["workspace-main"]);
 			expect(finalManifest.lifecycle).toBe("stopped");
-			expect(lifecycles).toEqual(["running", "stopped"]);
+			expect(lifecycles).toEqual(["running", "stopping", "stopped"]);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -1355,12 +1854,15 @@ describe("runSupervisor", () => {
 				reports.push(report);
 			}
 			await store.writeState(
-				makeState({
-					runId: manifest.runId,
-					updatedAt: NOW_ISO,
-					reports,
-				}),
+				makeState({ runId: manifest.runId, updatedAt: NOW_ISO, reports }),
 			);
+			const orphanAtQuota = reportRecord(
+				"pane-quota-64",
+				"worker-quota-64",
+				"rev-quota-64",
+				"done",
+			);
+			await store.writeReport(manifest.runId, orphanAtQuota, "orphan at quota");
 			const herdr = new FakeHerdr([
 				[
 					agent(
@@ -1387,14 +1889,7 @@ describe("runSupervisor", () => {
 			const state = await store.readState(manifest.runId);
 
 			expect(finalManifest.lifecycle).toBe("completed");
-			expect(herdr.readCalls).toEqual([
-				{
-					paneId: "pane-quota-64",
-					workspaceId: "workspace-main",
-					lines: 200,
-					timeoutMs: 15_000,
-				},
-			]);
+			expect(herdr.readCalls).toEqual([]);
 			expect(state.reports).toHaveLength(64);
 			expect(
 				(await store.readEvents(manifest.runId)).filter(
@@ -1416,6 +1911,7 @@ describe("runSupervisor", () => {
 				clock.advance(5);
 			};
 			let injectedStopping = false;
+			let stoppingAt = "";
 			const racingStore: SupervisorDependencies["store"] = {
 				readManifest: store.readManifest.bind(store),
 				readState: store.readState.bind(store),
@@ -1423,10 +1919,11 @@ describe("runSupervisor", () => {
 				transitionManifest: async (runId, allowedFrom, next) => {
 					if (next.lifecycle === "completed" && !injectedStopping) {
 						const durable = await store.readManifest(runId);
+						stoppingAt = clock.now().toISOString();
 						await store.transitionManifest(runId, ["starting", "running"], {
 							...durable,
 							lifecycle: "stopping",
-							updatedAt: clock.now().toISOString(),
+							updatedAt: stoppingAt,
 						});
 						injectedStopping = true;
 					}
@@ -1435,6 +1932,7 @@ describe("runSupervisor", () => {
 				appendEvent: store.appendEvent.bind(store),
 				writeReport: store.writeReport.bind(store),
 				readEvents: store.readEvents.bind(store),
+				listStoredReports: store.listStoredReports.bind(store),
 			};
 
 			const finalManifest = await runSupervisor(
@@ -1442,14 +1940,21 @@ describe("runSupervisor", () => {
 				dependencies(racingStore, herdr, clock),
 			);
 			const durable = await store.readManifest(manifest.runId);
-			const lifecycles = (await store.readEvents(manifest.runId))
-				.filter((event) => event.type === "lifecycle")
-				.map((event) => event.lifecycle);
+			const lifecycleEvents = (await store.readEvents(manifest.runId)).filter(
+				(event) => event.type === "lifecycle",
+			);
 
 			expect(injectedStopping).toBe(true);
 			expect(finalManifest.lifecycle).toBe("stopped");
 			expect(durable.lifecycle).toBe("stopped");
-			expect(lifecycles).toEqual(["running", "stopped"]);
+			expect(lifecycleEvents.map((event) => event.lifecycle)).toEqual([
+				"running",
+				"stopping",
+				"stopped",
+			]);
+			expect(
+				lifecycleEvents.find((event) => event.lifecycle === "stopping"),
+			).toMatchObject({ timestamp: stoppingAt, lifecycle: "stopping" });
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -1486,7 +1991,13 @@ describe("runSupervisor", () => {
 			expect(finalManifest.lifecycle).toBe("stopped");
 			expect(durable.lifecycle).toBe("stopped");
 			expect(finalManifest.lastError).toBeUndefined();
-			expect(lifecycles).toEqual(["running", "stopped"]);
+			expect(lifecycles).toEqual(["running", "stopping", "stopped"]);
+			expect(
+				(await store.readEvents(manifest.runId)).find(
+					(event) =>
+						event.type === "lifecycle" && event.lifecycle === "stopping",
+				),
+			).toMatchObject({ timestamp: NOW_ISO, lifecycle: "stopping" });
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -1522,10 +2033,1210 @@ describe("runSupervisor", () => {
 				expect(finalManifest.lifecycle).toBe(lifecycle);
 				expect(durable).toEqual(terminal);
 				expect(herdr.listCalls).toEqual([]);
-				expect(await store.readEvents(manifest.runId)).toEqual([]);
+				expect(await store.readEvents(manifest.runId)).toEqual([
+					{
+						schemaVersion: 1,
+						runId: manifest.runId,
+						type: "lifecycle",
+						timestamp: terminal.updatedAt,
+						lifecycle,
+						...(lifecycle === "failed"
+							? { lastError: "existing durable failure" }
+							: {}),
+					},
+				]);
 			} finally {
 				await rm(root, { recursive: true, force: true });
 			}
 		}
+	});
+	test("recovers file-only reports before terminal deadline return", async () => {
+		const manifest = makeWindowManifest(0);
+		const { root, store } = await createRealStore(manifest);
+		try {
+			const orphan = reportRecord(
+				"pane-deadline-gap",
+				"worker-deadline-gap",
+				"rev-deadline-gap",
+				"done",
+				"2026-08-11T11:59:59.000Z",
+			);
+			await store.writeReport(manifest.runId, orphan, "orphan output\n");
+			const herdr = new FakeHerdr([]);
+			const finalManifest = await runSupervisor(
+				{ manifest },
+				dependencies(store, herdr, makeClock()),
+			);
+			expect(finalManifest.lifecycle).toBe("completed");
+			expect(herdr.listCalls).toEqual([]);
+			expect((await store.readState(manifest.runId)).reports).toEqual([orphan]);
+			expect(
+				(await store.readEvents(manifest.runId))
+					.filter((event) => event.type === "report")
+					.map((event) => event.report),
+			).toEqual([orphan]);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+	test("seals report publication after a terminal stored-report snapshot", async () => {
+		const manifest = makeWindowManifest(POLL_SECONDS * 1_000);
+		const { root, store } = await createRealStore(manifest);
+		try {
+			await store.ensureLifecycle(manifest.runId);
+			const completed: RunManifest = {
+				...manifest,
+				lifecycle: "completed",
+				updatedAt: NOW_ISO,
+			};
+			await store.ensureLifecycle(manifest.runId, {
+				allowedFrom: ["starting"],
+				next: completed,
+			});
+			const lateReport = reportRecord(
+				"pane-terminal-snapshot",
+				"worker-terminal-snapshot",
+				"rev-terminal-snapshot",
+				"done",
+				NOW_ISO,
+			);
+			const publisher = new RunStore(root);
+			let publicationError: unknown;
+			const convergingStore = {
+				readState: store.readState.bind(store),
+				writeState: store.writeState.bind(store),
+				appendEvent: store.appendEvent.bind(store),
+				readEvents: store.readEvents.bind(store),
+				listStoredReports: async (runId: string) => {
+					const snapshot = await store.listStoredReports(runId);
+					try {
+						await publisher.writeReport(runId, lateReport, "late output\n");
+					} catch (error) {
+						publicationError = error;
+					}
+					return snapshot;
+				},
+			};
+
+			const state = await requireDurableConvergence(convergingStore, completed);
+
+			expect(publicationError).toBeInstanceOf(ProtocolStoreError);
+			expect(state.reports).toEqual([]);
+			expect(await store.listStoredReports(manifest.runId)).toEqual([]);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("repairs completed, stopped, and failed event appends after the terminal CAS", async () => {
+		for (const lifecycle of ["completed", "stopped", "failed"] as const) {
+			const manifest = makeWindowManifest(
+				lifecycle === "completed" ? 0 : POLL_SECONDS * 1_000,
+				{ lifecycle: "running" },
+			);
+			const store = makeStore(manifest);
+			store.terminalLifecycleAppendFailures = 1;
+			const herdr = new FakeHerdr([]);
+			const controller = new AbortController();
+			if (lifecycle === "stopped") controller.abort();
+			if (lifecycle === "failed") {
+				herdr.listError = new Error("RAW HERDR RESPONSE");
+			}
+
+			const finalManifest = await runSupervisor(
+				lifecycle === "stopped"
+					? { manifest, signal: controller.signal }
+					: { manifest },
+				dependencies(store, herdr, makeClock()),
+			);
+
+			expect(finalManifest.lifecycle).toBe(lifecycle);
+			expect(store.manifestWrites).toHaveLength(1);
+			expect(store.manifestWrites[0]?.lifecycle).toBe(lifecycle);
+			expect(store.terminalLifecycleAppendFailures).toBe(0);
+			expect(
+				store.events
+					.filter((event) => event.type === "lifecycle")
+					.map((event) => event.lifecycle),
+			).toEqual(["running", lifecycle]);
+			if (lifecycle === "failed") {
+				expect(finalManifest.lastError).toBe("agent sampling failed");
+				expect(JSON.stringify(finalManifest)).not.toContain(
+					"RAW HERDR RESPONSE",
+				);
+			}
+			expect(herdr.listCalls).toEqual(
+				lifecycle === "failed" ? ["workspace-main"] : [],
+			);
+		}
+	});
+
+	test("fails closed without an event reader, then repairs the durable terminal with readers", async () => {
+		for (const lifecycle of ["completed", "stopped", "failed"] as const) {
+			const manifest = makeWindowManifest(
+				lifecycle === "completed" ? 0 : POLL_SECONDS * 1_000,
+				{ lifecycle: "running" },
+			);
+			const store = makeStore(manifest);
+			const herdr = new FakeHerdr([]);
+			const controller = new AbortController();
+			if (lifecycle === "stopped") controller.abort();
+			if (lifecycle === "failed") {
+				herdr.listError = new Error("RAW HERDR RESPONSE");
+			}
+			const noReaderStore: SupervisorDependencies["store"] = {
+				readManifest: store.readManifest.bind(store),
+				readState: store.readState.bind(store),
+				writeState: store.writeState.bind(store),
+				transitionManifest: store.transitionManifest.bind(store),
+				appendEvent: store.appendEvent.bind(store),
+				writeReport: store.writeReport.bind(store),
+				listStoredReports: store.listStoredReports.bind(store),
+			};
+
+			await expect(
+				runSupervisor(
+					lifecycle === "stopped"
+						? { manifest, signal: controller.signal }
+						: { manifest },
+					dependencies(noReaderStore, herdr, makeClock()),
+				),
+			).rejects.toThrow("event append failed");
+			expect(store.manifest).toMatchObject({
+				lifecycle,
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			expect(store.events).toEqual([]);
+
+			const repaired = await runSupervisor(
+				lifecycle === "stopped"
+					? { manifest, signal: controller.signal }
+					: { manifest },
+				dependencies(store, herdr, makeClock()),
+			);
+			expect(repaired).toMatchObject({
+				lifecycle,
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			expect(store.events.at(-1)).toMatchObject({
+				type: "lifecycle",
+				lifecycle,
+				timestamp: NOW_ISO,
+			});
+		}
+	});
+
+	test("repairs a concurrent terminal winner whose event append was lost", async () => {
+		for (const lifecycle of ["stopped", "completed", "failed"] as const) {
+			const manifest = makeWindowManifest(0);
+			const { root, store } = await createRealStore(manifest);
+			try {
+				const winnerAt = "2026-08-11T11:59:00.000Z";
+				let injected = false;
+				const racingStore: SupervisorDependencies["store"] = {
+					readManifest: store.readManifest.bind(store),
+					readState: store.readState.bind(store),
+					writeState: store.writeState.bind(store),
+					transitionManifest: async (runId, allowedFrom, next) => {
+						if (!injected && next.lifecycle === "completed") {
+							const durable = await store.readManifest(runId);
+							await store.transitionManifest(runId, ["starting", "running"], {
+								...durable,
+								lifecycle,
+								updatedAt: winnerAt,
+								stoppedAt: winnerAt,
+								...(lifecycle === "failed"
+									? { lastError: "winner failure" }
+									: {}),
+							});
+							injected = true;
+						}
+						return await store.transitionManifest(runId, allowedFrom, next);
+					},
+					appendEvent: store.appendEvent.bind(store),
+					writeReport: store.writeReport.bind(store),
+					readEvents: store.readEvents.bind(store),
+					listStoredReports: store.listStoredReports.bind(store),
+				};
+
+				const finalManifest = await runSupervisor(
+					{ manifest },
+					dependencies(racingStore, new FakeHerdr([]), makeClock()),
+				);
+				const durable = await store.readManifest(manifest.runId);
+				const lifecycleEvents = (await store.readEvents(manifest.runId)).filter(
+					(event) => event.type === "lifecycle",
+				);
+
+				expect(injected).toBe(true);
+				expect(finalManifest.lifecycle).toBe(lifecycle);
+				expect(finalManifest.updatedAt).toBe(winnerAt);
+				expect(durable.updatedAt).toBe(winnerAt);
+				expect(finalManifest.lastError).toBe(
+					lifecycle === "failed" ? "winner failure" : undefined,
+				);
+				expect(lifecycleEvents).toEqual([
+					{
+						schemaVersion: 1,
+						runId: manifest.runId,
+						type: "lifecycle",
+						timestamp: winnerAt,
+						lifecycle,
+						...(lifecycle === "failed" ? { lastError: "winner failure" } : {}),
+					},
+				]);
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("repairs a stopping winner event before advancing to stopped", async () => {
+		const manifest = makeWindowManifest(0);
+		const { root, store } = await createRealStore(manifest);
+		try {
+			const stoppingAt = "2026-08-11T11:59:30.000Z";
+			let injected = false;
+			const racingStore: SupervisorDependencies["store"] = {
+				readManifest: store.readManifest.bind(store),
+				readState: store.readState.bind(store),
+				writeState: store.writeState.bind(store),
+				transitionManifest: async (runId, allowedFrom, next) => {
+					if (!injected && next.lifecycle === "completed") {
+						const durable = await store.readManifest(runId);
+						await store.transitionManifest(runId, ["starting", "running"], {
+							...durable,
+							lifecycle: "stopping",
+							updatedAt: stoppingAt,
+						});
+						injected = true;
+					}
+					return await store.transitionManifest(runId, allowedFrom, next);
+				},
+				appendEvent: store.appendEvent.bind(store),
+				writeReport: store.writeReport.bind(store),
+				readEvents: store.readEvents.bind(store),
+				listStoredReports: store.listStoredReports.bind(store),
+			};
+
+			const finalManifest = await runSupervisor(
+				{ manifest },
+				dependencies(racingStore, new FakeHerdr([]), makeClock()),
+			);
+			const durable = await store.readManifest(manifest.runId);
+			const lifecycleEvents = (await store.readEvents(manifest.runId)).filter(
+				(event) => event.type === "lifecycle",
+			);
+
+			expect(injected).toBe(true);
+			expect(finalManifest.lifecycle).toBe("stopped");
+			expect(durable.lifecycle).toBe("stopped");
+			expect(finalManifest.updatedAt).toBe(NOW_ISO);
+			expect(lifecycleEvents).toEqual([
+				{
+					schemaVersion: 1,
+					runId: manifest.runId,
+					type: "lifecycle",
+					timestamp: stoppingAt,
+					lifecycle: "stopping",
+				},
+				{
+					schemaVersion: 1,
+					runId: manifest.runId,
+					type: "lifecycle",
+					timestamp: NOW_ISO,
+					lifecycle: "stopped",
+				},
+			]);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("retries a failed terminal event then exits boundedly when appends stay unavailable", async () => {
+		const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+			lifecycle: "running",
+		});
+		const store = makeStore(manifest);
+		store.readStateError = new Error("RAW STORE CONTENTS");
+		const herdr = new FakeHerdr([]);
+		const failingStore: SupervisorDependencies["store"] = {
+			readManifest: store.readManifest.bind(store),
+			readState: store.readState.bind(store),
+			writeState: store.writeState.bind(store),
+			transitionManifest: store.transitionManifest.bind(store),
+			appendEvent: async (runId, event) => {
+				if (event.type === "lifecycle" && event.lifecycle === "failed") {
+					throw new Error("permanent lifecycle append failure");
+				}
+				return store.appendEvent(runId, event);
+			},
+			writeReport: store.writeReport.bind(store),
+			readEvents: store.readEvents.bind(store),
+			listStoredReports: store.listStoredReports.bind(store),
+		};
+
+		await expect(
+			runSupervisor(
+				{ manifest },
+				dependencies(failingStore, herdr, makeClock()),
+			),
+		).rejects.toThrow();
+		expect(store.manifest).toMatchObject({
+			lifecycle: "failed",
+			lastError: "state read failed",
+			stoppedAt: NOW_ISO,
+		});
+		expect(
+			store.events.filter(
+				(event) => event.type === "lifecycle" && event.lifecycle === "failed",
+			),
+		).toEqual([]);
+
+		store.readStateError = undefined;
+		const repaired = await runSupervisor(
+			{ manifest },
+			dependencies(store, herdr, makeClock()),
+		);
+		expect(repaired).toMatchObject({
+			lifecycle: "failed",
+			lastError: "state read failed",
+			updatedAt: NOW_ISO,
+		});
+		expect(store.events.filter((event) => event.type === "lifecycle")).toEqual([
+			{
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: NOW_ISO,
+				lifecycle: "failed",
+				lastError: "state read failed",
+			},
+		]);
+		expect(herdr.listCalls).toEqual([]);
+	});
+
+	test("fails closed when a store without an event reader cannot append a failed event", async () => {
+		const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+			lifecycle: "running",
+		});
+		const store = makeStore(manifest);
+		store.readStateError = new Error("RAW STORE CONTENTS");
+		const herdr = new FakeHerdr([]);
+		const failingStore: SupervisorDependencies["store"] = {
+			readManifest: store.readManifest.bind(store),
+			readState: store.readState.bind(store),
+			writeState: store.writeState.bind(store),
+			transitionManifest: store.transitionManifest.bind(store),
+			appendEvent: async (runId, event) => {
+				if (event.type === "lifecycle" && event.lifecycle === "failed") {
+					throw new Error("permanent lifecycle append failure");
+				}
+				return store.appendEvent(runId, event);
+			},
+			writeReport: store.writeReport.bind(store),
+		};
+
+		await expect(
+			runSupervisor(
+				{ manifest },
+				dependencies(failingStore, herdr, makeClock()),
+			),
+		).rejects.toThrow();
+		expect(store.manifest).toMatchObject({
+			lifecycle: "failed",
+			lastError: "state read failed",
+			stoppedAt: NOW_ISO,
+		});
+		expect(
+			store.events.filter(
+				(event) => event.type === "lifecycle" && event.lifecycle === "failed",
+			),
+		).toEqual([]);
+		expect(herdr.listCalls).toEqual([]);
+	});
+
+	test("fails closed on a no-reader CAS winner rather than inventing a lifecycle event", async () => {
+		for (const lifecycle of ["stopped", "completed", "failed"] as const) {
+			const manifest = makeWindowManifest(0, { lifecycle: "running" });
+			const store = makeStore(manifest);
+			const winnerAt = "2026-08-11T11:59:00.000Z";
+			let injected = false;
+			const racingStore: SupervisorDependencies["store"] = {
+				readManifest: store.readManifest.bind(store),
+				readState: store.readState.bind(store),
+				writeState: store.writeState.bind(store),
+				transitionManifest: async (runId, allowedFrom, next) => {
+					if (!injected && next.lifecycle === "completed") {
+						const durable = await store.readManifest(runId);
+						await store.transitionManifest(runId, ["starting", "running"], {
+							...durable,
+							lifecycle,
+							updatedAt: winnerAt,
+							stoppedAt: winnerAt,
+							...(lifecycle === "failed"
+								? { lastError: "winner failure" }
+								: {}),
+						});
+						injected = true;
+					}
+					return await store.transitionManifest(runId, allowedFrom, next);
+				},
+				appendEvent: store.appendEvent.bind(store),
+				writeReport: store.writeReport.bind(store),
+			};
+
+			await expect(
+				runSupervisor(
+					{ manifest },
+					dependencies(racingStore, new FakeHerdr([]), makeClock()),
+				),
+			).rejects.toThrow();
+			expect(injected).toBe(true);
+			expect(store.manifest).toMatchObject({
+				lifecycle,
+				updatedAt: winnerAt,
+				...(lifecycle === "failed" ? { lastError: "winner failure" } : {}),
+			});
+			expect(
+				store.events.filter(
+					(event) =>
+						event.type === "lifecycle" && event.lifecycle === lifecycle,
+				),
+			).toEqual([]);
+		}
+	});
+
+	test("fails closed on a no-reader stopping winner rather than inventing events or advancing", async () => {
+		const manifest = makeWindowManifest(0, { lifecycle: "running" });
+		const store = makeStore(manifest);
+		const stoppingAt = "2026-08-11T11:59:30.000Z";
+		let injected = false;
+		const racingStore: SupervisorDependencies["store"] = {
+			readManifest: store.readManifest.bind(store),
+			readState: store.readState.bind(store),
+			writeState: store.writeState.bind(store),
+			transitionManifest: async (runId, allowedFrom, next) => {
+				if (!injected && next.lifecycle === "completed") {
+					const durable = await store.readManifest(runId);
+					await store.transitionManifest(runId, ["starting", "running"], {
+						...durable,
+						lifecycle: "stopping",
+						updatedAt: stoppingAt,
+					});
+					injected = true;
+				}
+				return await store.transitionManifest(runId, allowedFrom, next);
+			},
+			appendEvent: store.appendEvent.bind(store),
+			writeReport: store.writeReport.bind(store),
+		};
+
+		await expect(
+			runSupervisor(
+				{ manifest },
+				dependencies(racingStore, new FakeHerdr([]), makeClock()),
+			),
+		).rejects.toThrow();
+		expect(injected).toBe(true);
+		expect(store.manifest).toMatchObject({
+			lifecycle: "stopping",
+			updatedAt: stoppingAt,
+		});
+		expect(store.events.filter((event) => event.type === "lifecycle")).toEqual(
+			[],
+		);
+	});
+
+	test("fails closed when a no-reader CAS winner event cannot be appended", async () => {
+		for (const lifecycle of ["stopped", "completed", "failed"] as const) {
+			const manifest = makeWindowManifest(0, { lifecycle: "running" });
+			const store = makeStore(manifest);
+			const winnerAt = "2026-08-11T11:59:00.000Z";
+			let injected = false;
+			const racingStore: SupervisorDependencies["store"] = {
+				readManifest: store.readManifest.bind(store),
+				readState: store.readState.bind(store),
+				writeState: store.writeState.bind(store),
+				transitionManifest: async (runId, allowedFrom, next) => {
+					if (!injected && next.lifecycle === "completed") {
+						const durable = await store.readManifest(runId);
+						await store.transitionManifest(runId, ["starting", "running"], {
+							...durable,
+							lifecycle,
+							updatedAt: winnerAt,
+							stoppedAt: winnerAt,
+							...(lifecycle === "failed"
+								? { lastError: "winner failure" }
+								: {}),
+						});
+						injected = true;
+					}
+					return await store.transitionManifest(runId, allowedFrom, next);
+				},
+				appendEvent: async (runId, event) => {
+					if (event.type === "lifecycle" && event.lifecycle === lifecycle) {
+						throw new Error("permanent winner append failure");
+					}
+					return store.appendEvent(runId, event);
+				},
+				writeReport: store.writeReport.bind(store),
+			};
+
+			await expect(
+				runSupervisor(
+					{ manifest },
+					dependencies(racingStore, new FakeHerdr([]), makeClock()),
+				),
+			).rejects.toThrow();
+			expect(injected).toBe(true);
+			expect(store.manifest).toMatchObject({
+				lifecycle,
+				updatedAt: winnerAt,
+				...(lifecycle === "failed" ? { lastError: "winner failure" } : {}),
+			});
+			expect(
+				store.events.filter(
+					(event) =>
+						event.type === "lifecycle" && event.lifecycle === lifecycle,
+				),
+			).toEqual([]);
+		}
+	});
+
+	test("does not advance a no-reader stopping winner when its event cannot be appended", async () => {
+		const manifest = makeWindowManifest(0, { lifecycle: "running" });
+		const store = makeStore(manifest);
+		const stoppingAt = "2026-08-11T11:59:30.000Z";
+		let injected = false;
+		const racingStore: SupervisorDependencies["store"] = {
+			readManifest: store.readManifest.bind(store),
+			readState: store.readState.bind(store),
+			writeState: store.writeState.bind(store),
+			transitionManifest: async (runId, allowedFrom, next) => {
+				if (!injected && next.lifecycle === "completed") {
+					const durable = await store.readManifest(runId);
+					await store.transitionManifest(runId, ["starting", "running"], {
+						...durable,
+						lifecycle: "stopping",
+						updatedAt: stoppingAt,
+					});
+					injected = true;
+				}
+				return await store.transitionManifest(runId, allowedFrom, next);
+			},
+			appendEvent: async (runId, event) => {
+				if (event.type === "lifecycle" && event.lifecycle === "stopping") {
+					throw new Error("permanent stopping append failure");
+				}
+				return store.appendEvent(runId, event);
+			},
+			writeReport: store.writeReport.bind(store),
+		};
+
+		await expect(
+			runSupervisor(
+				{ manifest },
+				dependencies(racingStore, new FakeHerdr([]), makeClock()),
+			),
+		).rejects.toThrow();
+		expect(injected).toBe(true);
+		expect(store.manifest).toMatchObject({
+			lifecycle: "stopping",
+			updatedAt: stoppingAt,
+		});
+		expect(store.events.filter((event) => event.type === "lifecycle")).toEqual(
+			[],
+		);
+	});
+
+	test("rejects no-reader terminal restarts until a reader can repair the event", async () => {
+		const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+			lifecycle: "failed",
+			updatedAt: NOW_ISO,
+			stoppedAt: NOW_ISO,
+			lastError: "state read failed",
+		});
+		const store = makeStore(manifest);
+		const herdr = new FakeHerdr([]);
+		const noReaderStore: SupervisorDependencies["store"] = {
+			readManifest: store.readManifest.bind(store),
+			readState: store.readState.bind(store),
+			writeState: store.writeState.bind(store),
+			transitionManifest: store.transitionManifest.bind(store),
+			appendEvent: store.appendEvent.bind(store),
+			writeReport: store.writeReport.bind(store),
+		};
+
+		for (let attempt = 0; attempt < 2; attempt++) {
+			await expect(
+				runSupervisor(
+					{ manifest },
+					dependencies(noReaderStore, herdr, makeClock()),
+				),
+			).rejects.toThrow();
+			expect(store.manifest).toMatchObject({
+				lifecycle: "failed",
+				lastError: "state read failed",
+				updatedAt: NOW_ISO,
+			});
+			expect(
+				store.events.filter((event) => event.type === "lifecycle"),
+			).toEqual([]);
+		}
+
+		const repaired = await runSupervisor(
+			{ manifest },
+			dependencies(store, herdr, makeClock()),
+		);
+		expect(repaired).toMatchObject({
+			lifecycle: "failed",
+			lastError: "state read failed",
+			updatedAt: NOW_ISO,
+		});
+		expect(store.events.filter((event) => event.type === "lifecycle")).toEqual([
+			{
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: NOW_ISO,
+				lifecycle: "failed",
+				lastError: "state read failed",
+			},
+		]);
+		expect(herdr.listCalls).toEqual([]);
+	});
+
+	test("repairs terminal lifecycle events by lifecycle and manifest update time", async () => {
+		const manifest = makeWindowManifest(POLL_SECONDS * 1_000);
+		const { root, store } = await createRealStore(manifest);
+		try {
+			const terminal: RunManifest = {
+				...manifest,
+				lifecycle: "completed",
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			};
+			await store.transitionManifest(manifest.runId, ["starting"], terminal);
+			const herdr = new FakeHerdr([]);
+			await runSupervisor(
+				{ manifest },
+				dependencies(store, herdr, makeClock()),
+			);
+			await runSupervisor(
+				{ manifest },
+				dependencies(store, herdr, makeClock()),
+			);
+			expect(
+				(await store.readEvents(manifest.runId)).filter(
+					(event) => event.type === "lifecycle",
+				),
+			).toEqual([
+				{
+					schemaVersion: 1,
+					runId: manifest.runId,
+					type: "lifecycle",
+					timestamp: NOW_ISO,
+					lifecycle: "completed",
+				},
+			]);
+			expect(herdr.listCalls).toEqual([]);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("throws on durable terminal convergence gaps so sidecar would exit nonzero, then recovers without rewriting them", async () => {
+		const gaps = [
+			"state",
+			"report-file",
+			"report-event",
+			"lifecycle-event",
+		] as const;
+		for (const lifecycle of ["completed", "stopped"] as const) {
+			for (const gap of gaps) {
+				const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+					lifecycle,
+					updatedAt: NOW_ISO,
+					stoppedAt: NOW_ISO,
+				});
+				const report = reportRecord(
+					"pane-terminal-gap",
+					"worker-terminal-gap",
+					"rev-terminal-gap",
+					"done",
+					"2026-08-11T11:59:00.000Z",
+				);
+				const store = new FakeStore(
+					manifest,
+					makeState({
+						runId: manifest.runId,
+						updatedAt: NOW_ISO,
+						reports: gap === "report-event" ? [report] : [],
+					}),
+				);
+				const herdr = new FakeHerdr([]);
+				const controller = new AbortController();
+				controller.abort();
+				let failingStore: SupervisorDependencies["store"];
+				if (gap === "state") {
+					failingStore = bindStore(store, {
+						readState: () => Promise.reject(new Error("RAW STORE CONTENTS")),
+					});
+				} else if (gap === "report-file") {
+					failingStore = bindStore(store, {
+						listStoredReports: () =>
+							Promise.reject(new Error("stored report listing failed")),
+					});
+				} else if (gap === "report-event") {
+					failingStore = bindStore(store, {
+						listStoredReports: () => Promise.resolve([report]),
+						appendEvent: async (runId, event) => {
+							if (event.type === "report") {
+								throw new Error("report event append failed");
+							}
+							return store.appendEvent(runId, event);
+						},
+					});
+				} else {
+					failingStore = bindStore(store, {
+						listStoredReports: () => Promise.resolve([]),
+						appendEvent: async (runId, event) => {
+							if (event.type === "lifecycle") {
+								throw new Error("lifecycle event append failed");
+							}
+							return store.appendEvent(runId, event);
+						},
+					});
+				}
+
+				await expect(
+					runSupervisor(
+						{ manifest, signal: controller.signal },
+						dependencies(failingStore, herdr, makeClock()),
+					),
+				).rejects.toThrow(
+					gap === "state"
+						? "state read failed"
+						: gap === "report-file"
+							? "stored report read failed"
+							: "event append failed",
+				);
+				expect(store.manifest).toMatchObject({
+					lifecycle,
+					updatedAt: NOW_ISO,
+					stoppedAt: NOW_ISO,
+				});
+				expect(store.manifestWrites).toEqual([]);
+				expect(herdr.listCalls).toEqual([]);
+
+				const recoveringStore =
+					gap === "report-file" || gap === "report-event"
+						? bindStore(store, {
+								listStoredReports: () => Promise.resolve([report]),
+							})
+						: store;
+				const repaired = await runSupervisor(
+					{ manifest },
+					dependencies(recoveringStore, herdr, makeClock()),
+				);
+				expect(repaired).toMatchObject({
+					lifecycle,
+					updatedAt: NOW_ISO,
+					stoppedAt: NOW_ISO,
+				});
+				expect(store.manifestWrites).toEqual([]);
+				expect(store.manifest.lifecycle).toBe(lifecycle);
+				const terminalLifecycle: RunEvent = {
+					schemaVersion: 1,
+					runId: "supervisor-run",
+					type: "lifecycle" as const,
+					timestamp: NOW_ISO,
+					lifecycle,
+				};
+				const reportEvent: RunEvent = {
+					schemaVersion: 1,
+					runId: "supervisor-run",
+					type: "report" as const,
+					timestamp: report.observedAt,
+					report,
+				};
+				expect(store.events).toEqual(
+					gap === "report-file" || gap === "report-event"
+						? [reportEvent, terminalLifecycle]
+						: [terminalLifecycle],
+				);
+				expect(store.events.at(-1)).toEqual(terminalLifecycle);
+				if (gap === "report-file" || gap === "report-event") {
+					expect(store.state.reports).toEqual([report]);
+				}
+				expect(herdr.listCalls).toEqual([]);
+			}
+		}
+	});
+
+	test("throws when a durable terminal report event conflicts with state, then recovers after the event is repaired", async () => {
+		for (const lifecycle of ["completed", "stopped"] as const) {
+			const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+				lifecycle,
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			const report = reportRecord(
+				"pane-event-conflict",
+				"worker-event-conflict",
+				"rev-event-conflict",
+				"done",
+				"2026-08-11T11:59:00.000Z",
+			);
+			const stale = reportRecord(
+				"pane-event-conflict",
+				"worker-event-conflict",
+				"rev-event-conflict",
+				"done",
+				"2026-08-11T11:00:00.000Z",
+			);
+			const store = new FakeStore(
+				manifest,
+				makeState({
+					runId: manifest.runId,
+					updatedAt: NOW_ISO,
+					reports: [report],
+				}),
+				[
+					{
+						schemaVersion: 1,
+						runId: "supervisor-run",
+						type: "report",
+						timestamp: stale.observedAt,
+						report: stale,
+					},
+					{
+						schemaVersion: 1,
+						runId: "supervisor-run",
+						type: "lifecycle",
+						timestamp: NOW_ISO,
+						lifecycle,
+					},
+				],
+			);
+			const herdr = new FakeHerdr([]);
+			const controller = new AbortController();
+			controller.abort();
+			const filesPresent = bindStore(store, {
+				listStoredReports: () => Promise.resolve([report]),
+			});
+
+			await expect(
+				runSupervisor(
+					{ manifest, signal: controller.signal },
+					dependencies(filesPresent, herdr, makeClock()),
+				),
+			).rejects.toThrow();
+			expect(store.manifest).toMatchObject({
+				lifecycle,
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			expect(store.manifestWrites).toEqual([]);
+			expect(store.state.reports).toEqual([report]);
+			expect(store.events.filter((event) => event.type === "report")).toEqual([
+				{
+					schemaVersion: 1,
+					runId: "supervisor-run",
+					type: "report",
+					timestamp: stale.observedAt,
+					report: stale,
+				},
+			]);
+			expect(herdr.listCalls).toEqual([]);
+
+			store.events.splice(0, store.events.length, {
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: NOW_ISO,
+				lifecycle,
+			});
+			const repaired = await runSupervisor(
+				{ manifest },
+				dependencies(filesPresent, herdr, makeClock()),
+			);
+			expect(repaired).toMatchObject({
+				lifecycle,
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			expect(store.manifestWrites).toEqual([]);
+			expect(store.manifest.lifecycle).toBe(lifecycle);
+			expect(store.state.reports).toEqual([report]);
+			expect(store.events).toEqual([
+				{
+					schemaVersion: 1,
+					runId: "supervisor-run",
+					type: "lifecycle",
+					timestamp: NOW_ISO,
+					lifecycle,
+				},
+				{
+					schemaVersion: 1,
+					runId: "supervisor-run",
+					type: "report",
+					timestamp: report.observedAt,
+					report,
+				},
+				{
+					schemaVersion: 1,
+					runId: "supervisor-run",
+					type: "lifecycle",
+					timestamp: NOW_ISO,
+					lifecycle,
+				},
+			]);
+			expect(store.events.at(-1)).toEqual({
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: NOW_ISO,
+				lifecycle,
+			});
+			expect(herdr.listCalls).toEqual([]);
+		}
+	});
+
+	test("throws when a durable terminal state report has no stored file, then recovers when the file appears", async () => {
+		for (const lifecycle of ["completed", "stopped"] as const) {
+			const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+				lifecycle,
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			const report = reportRecord(
+				"pane-state-only",
+				"worker-state-only",
+				"rev-state-only",
+				"done",
+				"2026-08-11T11:59:00.000Z",
+			);
+			const store = new FakeStore(
+				manifest,
+				makeState({
+					runId: manifest.runId,
+					updatedAt: NOW_ISO,
+					reports: [report],
+				}),
+				[
+					{
+						schemaVersion: 1,
+						runId: "supervisor-run",
+						type: "report",
+						timestamp: report.observedAt,
+						report,
+					},
+					{
+						schemaVersion: 1,
+						runId: "supervisor-run",
+						type: "lifecycle",
+						timestamp: NOW_ISO,
+						lifecycle,
+					},
+				],
+			);
+			const herdr = new FakeHerdr([]);
+			const controller = new AbortController();
+			controller.abort();
+
+			await expect(
+				runSupervisor(
+					{ manifest, signal: controller.signal },
+					dependencies(store, herdr, makeClock()),
+				),
+			).rejects.toThrow();
+			expect(store.manifest).toMatchObject({
+				lifecycle,
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			expect(store.manifestWrites).toEqual([]);
+			expect(store.state.reports).toEqual([report]);
+			expect(herdr.listCalls).toEqual([]);
+
+			const repaired = await runSupervisor(
+				{ manifest },
+				dependencies(
+					bindStore(store, {
+						listStoredReports: () => Promise.resolve([report]),
+					}),
+					herdr,
+					makeClock(),
+				),
+			);
+			expect(repaired).toMatchObject({
+				lifecycle,
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			expect(store.manifestWrites).toEqual([]);
+			expect(store.manifest.lifecycle).toBe(lifecycle);
+			expect(store.state.reports).toEqual([report]);
+			expect(store.events).toEqual([
+				{
+					schemaVersion: 1,
+					runId: "supervisor-run",
+					type: "report",
+					timestamp: report.observedAt,
+					report,
+				},
+				{
+					schemaVersion: 1,
+					runId: "supervisor-run",
+					type: "lifecycle",
+					timestamp: NOW_ISO,
+					lifecycle,
+				},
+			]);
+			expect(store.events.at(-1)).toEqual({
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: NOW_ISO,
+				lifecycle,
+			});
+			expect(herdr.listCalls).toEqual([]);
+		}
+	});
+
+	test("throws when adopting a durable terminal without a stored-report reader", async () => {
+		for (const lifecycle of ["completed", "stopped"] as const) {
+			const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+				lifecycle,
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			const store = makeStore(manifest);
+			const herdr = new FakeHerdr([]);
+			const controller = new AbortController();
+			controller.abort();
+			const readerless = bindStore(store);
+			delete readerless.listStoredReports;
+
+			await expect(
+				runSupervisor(
+					{ manifest, signal: controller.signal },
+					dependencies(readerless, herdr, makeClock()),
+				),
+			).rejects.toThrow();
+			expect(store.manifest).toMatchObject({
+				lifecycle,
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			expect(store.manifestWrites).toEqual([]);
+			expect(herdr.listCalls).toEqual([]);
+
+			const repaired = await runSupervisor(
+				{ manifest },
+				dependencies(store, herdr, makeClock()),
+			);
+			expect(repaired).toMatchObject({
+				lifecycle,
+				updatedAt: NOW_ISO,
+				stoppedAt: NOW_ISO,
+			});
+			expect(store.manifestWrites).toEqual([]);
+			expect(store.manifest.lifecycle).toBe(lifecycle);
+			expect(store.events).toEqual([
+				{
+					schemaVersion: 1,
+					runId: "supervisor-run",
+					type: "lifecycle",
+					timestamp: NOW_ISO,
+					lifecycle,
+				},
+			]);
+			expect(store.events.at(-1)).toEqual({
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: NOW_ISO,
+				lifecycle,
+			});
+			expect(herdr.listCalls).toEqual([]);
+		}
+	});
+
+	test("does not let signal.aborted convert a simultaneous durable error into a clean stop", async () => {
+		const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+			lifecycle: "running",
+		});
+		const store = makeStore(manifest);
+		store.readStateError = new Error("RAW STORE CONTENTS");
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(
+			runSupervisor(
+				{ manifest, signal: controller.signal },
+				dependencies(store, new FakeHerdr([]), makeClock()),
+			),
+		).rejects.toThrow("state read failed");
+
+		expect(store.manifest).toMatchObject({
+			lifecycle: "failed",
+			lastError: "state read failed",
+			stoppedAt: NOW_ISO,
+		});
+		expect(store.manifest.lifecycle).toBe("failed");
+		expect(store.manifestWrites.map(({ lifecycle }) => lifecycle)).toEqual([
+			"failed",
+		]);
+	});
+
+	test("stops cleanly for typed cancellation without a durable error", async () => {
+		const manifest = makeWindowManifest(POLL_SECONDS * 1_000, {
+			lifecycle: "running",
+		});
+		const store = makeStore(manifest);
+		const cancellation = new Error("The operation was aborted.");
+		cancellation.name = "AbortError";
+		let readStateCalls = 0;
+		const cancellingStore = bindStore(store, {
+			readState: (runId) => {
+				readStateCalls += 1;
+				return readStateCalls === 1
+					? Promise.reject(cancellation)
+					: store.readState(runId);
+			},
+		});
+
+		const finalManifest = await runSupervisor(
+			{ manifest },
+			dependencies(cancellingStore, new FakeHerdr([]), makeClock()),
+		);
+
+		expect(finalManifest).toMatchObject({
+			lifecycle: "stopped",
+			updatedAt: NOW_ISO,
+			stoppedAt: NOW_ISO,
+		});
+		expect(store.manifest.lifecycle).toBe("stopped");
+		expect(store.manifestWrites.map(({ lifecycle }) => lifecycle)).toEqual([
+			"stopped",
+		]);
+		expect(
+			store.events.filter(
+				(event) => event.type === "lifecycle" && event.lifecycle === "stopped",
+			),
+		).toEqual([
+			{
+				schemaVersion: 1,
+				runId: "supervisor-run",
+				type: "lifecycle",
+				timestamp: NOW_ISO,
+				lifecycle: "stopped",
+			},
+		]);
 	});
 });

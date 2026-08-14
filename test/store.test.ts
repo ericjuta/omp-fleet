@@ -18,7 +18,9 @@ import {
 } from "../src/store.ts";
 import {
 	type LifecycleRunEvent,
+	PLUGIN_VERSION,
 	ProtocolValidationError,
+	REPORT_LIMIT,
 	type ReportRecord,
 	type RunManifest,
 	reportKey,
@@ -53,7 +55,20 @@ const REPORT_METADATA_PREFIX = "OMP-FLEET-METADATA ";
 const REPORT_BODY_BYTE_LIMIT = 262_144;
 const REPORT_TRUNCATION_MARKER =
 	"\n[OMP-FLEET OUTPUT TRUNCATED TO 262144 UTF-8 BYTES]\n";
-const MANIFEST_MUTEX_FILE = ".manifest-lock.sqlite";
+const MANIFEST_MUTEX_DIRECTORY = ".manifest-lock.sqlite";
+
+function manifestMutexPath(store: RunStore, runId: string): string {
+	return join(store.root, MANIFEST_MUTEX_DIRECTORY, `${runId}.sqlite`);
+}
+
+function controlMutexPath(store: RunStore, runId: string): string {
+	return join(
+		store.root,
+		MANIFEST_MUTEX_DIRECTORY,
+		"control",
+		`${runId}.sqlite`,
+	);
+}
 
 function reportBody(reportText: string): string {
 	const envelopeEnd = reportText.indexOf("\n\n");
@@ -101,6 +116,13 @@ function indexedReport(index: number): ReportRecord {
 	};
 }
 
+function legacyReportTempName(reportPath: string, hex: string): string {
+	if (!/^[a-f0-9]{32}$/.test(hex)) {
+		throw new Error("legacy temp hex must be 32 lowercase hex characters");
+	}
+	return `.${basename(reportPath)}.${hex}.tmp`;
+}
+
 async function withStore(
 	action: (fixture: StoreFixture) => Promise<void>,
 ): Promise<void> {
@@ -129,7 +151,6 @@ describe("RunStore", () => {
 			const store = new RunStore(storeRoot);
 
 			await expect(store.listRuns()).resolves.toEqual([]);
-			await expect(store.findLatest()).resolves.toBeUndefined();
 			await expect(store.readManifest("missing-run")).rejects.toBeInstanceOf(
 				ProtocolStoreError,
 			);
@@ -176,6 +197,7 @@ describe("RunStore", () => {
 						status: "working",
 						revision: "refs/heads/main",
 						observedAt: "2026-08-11T00:00:01.000Z",
+						lastActivityAt: "2026-08-11T00:00:01.000Z",
 					},
 				],
 			});
@@ -187,7 +209,7 @@ describe("RunStore", () => {
 
 			const runDirectory = join(storeRoot, runId);
 			expect((await readdir(storeRoot)).sort()).toEqual([
-				MANIFEST_MUTEX_FILE,
+				MANIFEST_MUTEX_DIRECTORY,
 				runId,
 			]);
 			expect((await readdir(runDirectory)).sort()).toEqual([
@@ -228,12 +250,123 @@ describe("RunStore", () => {
 			expect(successfulTransitions).toBe(1);
 			expect(runningResult).toEqual(failedResult);
 			expect(await store.readManifest(runId)).toEqual(runningResult);
-			const mutexPath = join(store.root, MANIFEST_MUTEX_FILE);
+			const mutexDirectory = join(store.root, MANIFEST_MUTEX_DIRECTORY);
+			const mutexDirectoryEntry = await lstat(mutexDirectory);
+			expect(mutexDirectoryEntry.isDirectory()).toBe(true);
+			expect(mutexDirectoryEntry.mode & 0o777).toBe(0o700);
+			const mutexPath = manifestMutexPath(store, runId);
 			const mutexEntry = await lstat(mutexPath);
 			expect(mutexEntry.isFile()).toBe(true);
 			expect(mutexEntry.mode & 0o777).toBe(0o600);
 		});
 	});
+
+	test("namespaces control locks away from colliding manifest lock names", async () => {
+		await withStore(async ({ store, repoPath }) => {
+			const runId = "mutex-name";
+			const collidingRunId = `${runId}.control`;
+			const initial = makeManifest({ runId, repoPath });
+			const collidingInitial = makeManifest({
+				runId: collidingRunId,
+				repoPath,
+			});
+			const collidingRunning: RunManifest = {
+				...collidingInitial,
+				lifecycle: "running",
+				updatedAt: "2026-08-11T00:00:01.000Z",
+			};
+			await store.createRun(initial);
+			await store.createRun(collidingInitial);
+			await store.transitionManifest(
+				collidingRunId,
+				["starting"],
+				collidingRunning,
+			);
+
+			expect(
+				await store.withControlLock(runId, async (manifest) => manifest),
+			).toEqual(initial);
+			const manifestPath = manifestMutexPath(store, collidingRunId);
+			const controlPath = controlMutexPath(store, runId);
+			expect(manifestPath).not.toBe(controlPath);
+			expect((await lstat(manifestPath)).mode & 0o777).toBe(0o600);
+			expect((await lstat(controlPath)).mode & 0o777).toBe(0o600);
+			expect(
+				(await lstat(join(store.root, MANIFEST_MUTEX_DIRECTORY, "control")))
+					.mode & 0o777,
+			).toBe(0o700);
+		});
+	});
+
+	test("queues a cross-process control contender beyond the manifest timeout", async () => {
+		await withStore(async ({ store, repoPath }) => {
+			const runId = "cross-process-control-queue";
+			await store.createRun(makeManifest({ runId, repoPath }));
+			await store.withControlLock(runId, async () => undefined);
+			const mutexPath = controlMutexPath(store, runId);
+			const holderCode = [
+				'import { constants, Database } from "bun:sqlite";',
+				"const path = process.env.CONTROL_MUTEX_PATH;",
+				'if (path === undefined) throw new Error("missing control mutex path");',
+				"const flags = constants.SQLITE_OPEN_READWRITE | constants.SQLITE_OPEN_NOFOLLOW;",
+				"const database = new Database(path, flags);",
+				'database.run("BEGIN IMMEDIATE");',
+				'process.stdout.write("locked\\n");',
+				"await Bun.sleep(250);",
+				'process.stdout.write("early\\n");',
+				"await Bun.sleep(1_900);",
+				'process.stdout.write("held\\n");',
+				"await new Response(Bun.stdin.stream()).text();",
+				'database.run("ROLLBACK");',
+				"database.close(false);",
+			].join("\n");
+			const holder = Bun.spawn([process.execPath, "-e", holderCode], {
+				env: { CONTROL_MUTEX_PATH: mutexPath },
+				stdin: "pipe",
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const holderOutput = holder.stdout.getReader();
+			let heartbeat = 0;
+			let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+			try {
+				const locked = await holderOutput.read();
+				expect(new TextDecoder().decode(locked.value)).toContain("locked");
+				heartbeat = 0;
+				heartbeatTimer = setInterval(() => {
+					heartbeat += 1;
+				}, 10);
+				let entered = false;
+				const contender = store.withControlLock(runId, async (manifest) => {
+					entered = true;
+					return manifest.runId;
+				});
+				// Fake timers cannot advance the child SQLite holder; this early
+				// marker catches a synchronous busy wait before the old two-second limit.
+				const early = await holderOutput.read();
+				expect(new TextDecoder().decode(early.value)).toContain("early");
+				expect(entered).toBe(false);
+				expect(heartbeat).toBeGreaterThan(5);
+				const held = await holderOutput.read();
+				expect(new TextDecoder().decode(held.value)).toContain("held");
+				expect(entered).toBe(false);
+
+				holder.stdin.write("release\n");
+				holder.stdin.end();
+				expect(await contender).toBe(runId);
+				expect(entered).toBe(true);
+				expect(await holder.exited).toBe(0);
+			} finally {
+				clearInterval(heartbeatTimer);
+				holderOutput.releaseLock();
+				if (holder.exitCode === null) {
+					holder.stdin.end();
+					holder.kill("SIGKILL");
+				}
+				await holder.exited;
+			}
+		});
+	}, 10_000);
 
 	test("refuses to regress a terminal manifest from a stale lifecycle", async () => {
 		await withStore(async ({ store, repoPath }) => {
@@ -277,7 +410,7 @@ describe("RunStore", () => {
 				updatedAt: "2026-08-11T00:00:01.000Z",
 			};
 			await store.createRun(initial);
-			const mutexPath = join(store.root, MANIFEST_MUTEX_FILE);
+			const mutexPath = manifestMutexPath(store, runId);
 			await writeFile(mutexPath, "", { flag: "wx", mode: 0o600 });
 			await chmod(mutexPath, 0o600);
 			const holder = new Database(
@@ -312,6 +445,53 @@ describe("RunStore", () => {
 		});
 	});
 
+	test("does not block an unrelated run behind a held per-run mutex", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runA = "held-run-mutex";
+			const runB = "independent-run-mutex";
+			const initialA = makeManifest({ runId: runA, repoPath });
+			const runningA: RunManifest = {
+				...initialA,
+				lifecycle: "running",
+				updatedAt: "2026-08-11T00:00:01.000Z",
+			};
+			await store.createRun(initialA);
+			const initialB = makeManifest({ runId: runB, repoPath });
+			const runningB: RunManifest = {
+				...initialB,
+				lifecycle: "running",
+				updatedAt: "2026-08-11T00:00:01.000Z",
+			};
+			await store.createRun(initialB);
+			const competingStore = new RunStore(storeRoot);
+
+			const mutexAPath = manifestMutexPath(store, runA);
+			await writeFile(mutexAPath, "", { flag: "wx", mode: 0o600 });
+			await chmod(mutexAPath, 0o600);
+			const holder = new Database(
+				mutexAPath,
+				sqliteConstants.SQLITE_OPEN_READWRITE |
+					sqliteConstants.SQLITE_OPEN_NOFOLLOW,
+			);
+			holder.run("BEGIN IMMEDIATE");
+			try {
+				expect(
+					await store.transitionManifest(runB, ["starting"], runningB),
+				).toBe(runningB);
+				await expect(
+					competingStore.transitionManifest(runA, ["starting"], runningA),
+				).rejects.toBeInstanceOf(ProtocolStoreError);
+				expect(holder.inTransaction).toBe(true);
+			} finally {
+				if (holder.inTransaction) holder.run("ROLLBACK");
+				holder.close(false);
+			}
+
+			expect(await store.readManifest(runB)).toEqual(runningB);
+			expect(await store.readManifest(runA)).toEqual(initialA);
+		});
+	});
+
 	test("reacquires the SQLite manifest mutex after its holder is killed", async () => {
 		await withStore(async ({ store, repoPath }) => {
 			const runId = "crashed-sqlite-manifest-mutex";
@@ -322,7 +502,7 @@ describe("RunStore", () => {
 				updatedAt: "2026-08-11T00:00:01.000Z",
 			};
 			await store.createRun(initial);
-			const mutexPath = join(store.root, MANIFEST_MUTEX_FILE);
+			const mutexPath = manifestMutexPath(store, runId);
 			await writeFile(mutexPath, "", { flag: "wx", mode: 0o600 });
 			await chmod(mutexPath, 0o600);
 			const childCode = [
@@ -370,7 +550,7 @@ describe("RunStore", () => {
 				updatedAt: "2026-08-11T00:00:01.000Z",
 			};
 			await store.createRun(initial);
-			const mutexPath = join(store.root, MANIFEST_MUTEX_FILE);
+			const mutexPath = manifestMutexPath(store, runId);
 			expect(await store.transitionManifest(runId, ["starting"], running)).toBe(
 				running,
 			);
@@ -393,6 +573,36 @@ describe("RunStore", () => {
 			expect((await lstat(mutexPath)).isDirectory()).toBe(true);
 			await rm(mutexPath, { recursive: true });
 			expect(await store.readManifest(runId)).toEqual(running);
+			await rm(sentinelPath);
+		});
+	});
+
+	test("rejects legacy files and symlinks at the mutex container path", async () => {
+		await withStore(async ({ store, repoPath }) => {
+			const runId = "invalid-manifest-mutex-container";
+			const initial = makeManifest({ runId, repoPath });
+			await store.createRun(initial);
+			const mutexDirectory = join(store.root, MANIFEST_MUTEX_DIRECTORY);
+			await rm(mutexDirectory, { recursive: true });
+			const sentinelPath = join(repoPath, "manifest-mutex-container-target");
+			await writeFile(sentinelPath, "unchanged\n", "utf8");
+			await symlink(sentinelPath, mutexDirectory, "file");
+
+			await expect(store.writeManifest(initial)).rejects.toBeInstanceOf(
+				ProtocolStoreError,
+			);
+			expect((await lstat(mutexDirectory)).isSymbolicLink()).toBe(true);
+			expect(await readFile(sentinelPath, "utf8")).toBe("unchanged\n");
+
+			await rm(mutexDirectory);
+			await writeFile(mutexDirectory, "legacy sqlite file", {
+				mode: 0o600,
+			});
+			await expect(store.writeManifest(initial)).rejects.toBeInstanceOf(
+				ProtocolStoreError,
+			);
+			expect((await lstat(mutexDirectory)).isFile()).toBe(true);
+			await rm(mutexDirectory);
 			await rm(sentinelPath);
 		});
 	});
@@ -477,8 +687,18 @@ describe("RunStore", () => {
 				},
 			];
 
-			for (const event of events) {
-				await store.appendEvent(runId, event);
+			await store.ensureLifecycle(runId);
+			for (const event of events.slice(1)) {
+				if (event.type !== "lifecycle") throw new Error("expected lifecycle");
+				const current = await store.readManifest(runId);
+				await store.ensureLifecycle(runId, {
+					allowedFrom: [current.lifecycle],
+					next: {
+						...current,
+						lifecycle: event.lifecycle,
+						updatedAt: event.timestamp,
+					},
+				});
 			}
 
 			const loadedEvents = await store.readEvents(runId);
@@ -517,7 +737,7 @@ describe("RunStore", () => {
 			const envelopeEnd = reportText.indexOf("\n\n");
 			const expectedMetadata = `${REPORT_METADATA_PREFIX}${JSON.stringify({
 				schemaVersion: 1,
-				pluginVersion: "0.1.0",
+				pluginVersion: PLUGIN_VERSION,
 				classification: "untrusted-output",
 				runId,
 				report: FIXED_REPORT,
@@ -563,6 +783,46 @@ describe("RunStore", () => {
 			).toEqual(FIXED_REPORT);
 			expect(await readFile(reportPath, "utf8")).toBe(originalPublication);
 			expect((await store.readState(runId)).reports).toEqual([]);
+		});
+	});
+
+	test("rejects new terminal reports while permitting immutable publication retries", async () => {
+		await withStore(async ({ store, repoPath }) => {
+			const runId = "terminal-report-seal";
+			const starting = makeManifest({ runId, repoPath });
+			await store.createRun(starting);
+			expect(
+				await store.writeReport(
+					runId,
+					FIXED_REPORT,
+					"published before terminal\n",
+				),
+			).toEqual(FIXED_REPORT);
+			const completed: RunManifest = {
+				...starting,
+				lifecycle: "completed",
+				updatedAt: "2026-08-11T00:01:00.000Z",
+			};
+			expect(
+				await store.ensureLifecycle(runId, {
+					allowedFrom: ["starting"],
+					next: completed,
+				}),
+			).toEqual(completed);
+
+			expect(
+				await store.writeReport(
+					runId,
+					FIXED_REPORT,
+					"immutable retry after terminal\n",
+				),
+			).toEqual(FIXED_REPORT);
+			await expect(
+				store.writeReport(runId, indexedReport(1), "new terminal report\n"),
+			).rejects.toThrow(
+				"cannot publish a new report after the run is terminal",
+			);
+			expect(await store.listStoredReports(runId)).toEqual([FIXED_REPORT]);
 		});
 	});
 
@@ -638,7 +898,7 @@ describe("RunStore", () => {
 		await withStore(async ({ store, storeRoot, repoPath }) => {
 			const runId = "bounded-report-count";
 			await store.createRun(makeManifest({ runId, repoPath }));
-			const reports = Array.from({ length: 64 }, (_, index) =>
+			const reports = Array.from({ length: REPORT_LIMIT }, (_, index) =>
 				indexedReport(index),
 			);
 			const firstReport = reports[0];
@@ -653,7 +913,7 @@ describe("RunStore", () => {
 			const firstPath = join(storeRoot, runId, firstReport.path);
 			const firstPublication = await readFile(firstPath, "utf8");
 
-			expect(originalEntries).toHaveLength(64);
+			expect(originalEntries).toHaveLength(REPORT_LIMIT);
 			expect(
 				await store.writeReport(
 					runId,
@@ -665,7 +925,7 @@ describe("RunStore", () => {
 
 			const rejected = store.writeReport(
 				runId,
-				indexedReport(64),
+				indexedReport(REPORT_LIMIT),
 				"sixty-fifth report\n",
 			);
 			await expect(rejected).rejects.toBeInstanceOf(ProtocolStoreError);
@@ -726,12 +986,16 @@ describe("RunStore", () => {
 		await withStore(async ({ store, storeRoot, repoPath }) => {
 			const runId = "state-report-without-matching-file";
 			await store.createRun(makeManifest({ runId, repoPath }));
-			await store.writeState(
-				makeState({
-					runId,
-					updatedAt: "2026-08-11T00:01:00.000Z",
-					reports: [FIXED_REPORT],
-				}),
+			await writeFile(
+				join(storeRoot, runId, "state.json"),
+				`${JSON.stringify(
+					makeState({
+						runId,
+						updatedAt: "2026-08-11T00:01:00.000Z",
+						reports: [FIXED_REPORT],
+					}),
+				)}\n`,
+				"utf8",
 			);
 			const reportPath = join(storeRoot, runId, FIXED_REPORT.path);
 
@@ -746,7 +1010,7 @@ describe("RunStore", () => {
 			};
 			const tamperedMetadata = JSON.stringify({
 				schemaVersion: 1,
-				pluginVersion: "0.1.0",
+				pluginVersion: PLUGIN_VERSION,
 				classification: "untrusted-output",
 				runId,
 				report: tamperedRecord,
@@ -770,17 +1034,10 @@ describe("RunStore", () => {
 		await withStore(async ({ store, storeRoot, repoPath }) => {
 			const runId = "later-plugin-report";
 			await store.createRun(makeManifest({ runId, repoPath }));
-			await store.writeState(
-				makeState({
-					runId,
-					updatedAt: "2026-08-11T00:01:00.000Z",
-					reports: [FIXED_REPORT],
-				}),
-			);
 			const reportPath = join(storeRoot, runId, FIXED_REPORT.path);
 			const metadata = JSON.stringify({
 				schemaVersion: 1,
-				pluginVersion: "0.1.1",
+				pluginVersion: "0.1.5",
 				classification: "untrusted-output",
 				runId,
 				report: FIXED_REPORT,
@@ -790,6 +1047,13 @@ describe("RunStore", () => {
 				encoding: "utf8",
 				mode: 0o600,
 			});
+			await store.writeState(
+				makeState({
+					runId,
+					updatedAt: "2026-08-11T00:01:00.000Z",
+					reports: [FIXED_REPORT],
+				}),
+			);
 
 			expect(
 				await store.writeReport(
@@ -820,7 +1084,7 @@ describe("RunStore", () => {
 		});
 	});
 
-	test("discovery skips files, staging names, and incomplete run directories", async () => {
+	test("discovery can skip or fail closed on incomplete run directories", async () => {
 		await withStore(async ({ store, storeRoot, repoPath }) => {
 			const runId = "discoverable-run";
 			const manifest = makeManifest({ runId, repoPath });
@@ -830,7 +1094,444 @@ describe("RunStore", () => {
 			await mkdir(join(storeRoot, "missing-protocol"));
 
 			expect(await store.listRuns()).toEqual([manifest]);
-			expect(await store.findLatest({ repoPath })).toEqual(manifest);
+			await expect(
+				store.listRuns({ failOnInvalid: true }),
+			).rejects.toBeInstanceOf(ProtocolStoreError);
+		});
+	});
+
+	test("discovers valid manifests despite missing or corrupt state", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const first = makeManifest({ runId: "manifest-corrupt-state", repoPath });
+			const second = makeManifest({
+				runId: "manifest-missing-state",
+				repoPath,
+				createdAt: "2026-08-11T00:00:01.000Z",
+			});
+			await store.createRun(first);
+			await store.createRun(second);
+			await writeFile(
+				join(storeRoot, first.runId, "state.json"),
+				"{bad",
+				"utf8",
+			);
+			await rm(join(storeRoot, second.runId, "state.json"));
+			expect(await store.listRuns()).toEqual([second, first]);
+		});
+	});
+
+	test("fails closed on malformed stored reports without deleting artifacts", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runId = "malformed-stored-report";
+			await store.createRun(makeManifest({ runId, repoPath }));
+			await store.writeReport(runId, FIXED_REPORT, "valid\n");
+			expect(await store.listStoredReports(runId)).toEqual([FIXED_REPORT]);
+			const malformed = indexedReport(1);
+			const malformedPath = join(storeRoot, runId, malformed.path);
+			await writeFile(malformedPath, "malformed\n", "utf8");
+			await expect(store.listStoredReports(runId)).rejects.toBeInstanceOf(
+				ProtocolValidationError,
+			);
+			expect(await readFile(malformedPath, "utf8")).toBe("malformed\n");
+			expect(
+				await readFile(join(storeRoot, runId, FIXED_REPORT.path), "utf8"),
+			).toContain("valid");
+		});
+	});
+
+	test("ignores bounded legacy pre-link residue without listing it as inventory", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runId = "legacy-pre-link-residue";
+			await store.createRun(makeManifest({ runId, repoPath }));
+			const reportsDirectory = join(storeRoot, runId, "reports");
+			const residueName = legacyReportTempName(
+				FIXED_REPORT.path,
+				"ab".repeat(16),
+			);
+			await writeFile(
+				join(reportsDirectory, residueName),
+				"pre-link residue\n",
+				{
+					encoding: "utf8",
+					mode: 0o600,
+				},
+			);
+
+			expect(await store.listStoredReports(runId)).toEqual([]);
+			expect(
+				await store.writeReport(runId, FIXED_REPORT, "published\n"),
+			).toEqual(FIXED_REPORT);
+			expect(await store.listStoredReports(runId)).toEqual([FIXED_REPORT]);
+			expect((await readdir(reportsDirectory)).sort()).toEqual(
+				[residueName, basename(FIXED_REPORT.path)].sort(),
+			);
+			expect(
+				(await readdir(join(storeRoot, runId))).filter((name) =>
+					name.endsWith(".tmp"),
+				),
+			).toEqual([]);
+		});
+	});
+
+	test("ignores bounded legacy post-link residue beside a published report", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runId = "legacy-post-link-residue";
+			await store.createRun(makeManifest({ runId, repoPath }));
+			expect(
+				await store.writeReport(runId, FIXED_REPORT, "published\n"),
+			).toEqual(FIXED_REPORT);
+			const reportsDirectory = join(storeRoot, runId, "reports");
+			const residueName = legacyReportTempName(
+				FIXED_REPORT.path,
+				"cd".repeat(16),
+			);
+			await writeFile(
+				join(reportsDirectory, residueName),
+				"post-link residue\n",
+				{
+					encoding: "utf8",
+					mode: 0o600,
+				},
+			);
+
+			expect(await store.listStoredReports(runId)).toEqual([FIXED_REPORT]);
+			expect(
+				await store.writeReport(runId, FIXED_REPORT, "must not replace\n"),
+			).toEqual(FIXED_REPORT);
+			expect((await readdir(reportsDirectory)).sort()).toEqual(
+				[residueName, basename(FIXED_REPORT.path)].sort(),
+			);
+		});
+	});
+
+	test("rejects a second path for a file-only report identity", async () => {
+		await withStore(async ({ store, repoPath }) => {
+			const runId = "file-only-report-identity";
+			await store.createRun(makeManifest({ runId, repoPath }));
+			await store.writeReport(runId, FIXED_REPORT, "published once\n");
+			const conflicting: ReportRecord = {
+				...FIXED_REPORT,
+				workerName: "worker-renamed",
+				path: reportRelativePath(
+					FIXED_REPORT.paneId,
+					"worker-renamed",
+					FIXED_REPORT.revision,
+					FIXED_REPORT.status,
+				),
+			};
+
+			const rejected = store.writeReport(
+				runId,
+				conflicting,
+				"conflicting identity\n",
+			);
+			await expect(rejected).rejects.toBeInstanceOf(ProtocolValidationError);
+			await expect(rejected).rejects.toThrow(/key is already assigned/);
+			expect(await store.listStoredReports(runId)).toEqual([FIXED_REPORT]);
+		});
+	});
+
+	test("rejects a legacy-named directory or symlink instead of skipping it", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runId = "legacy-named-nonfile";
+			await store.createRun(makeManifest({ runId, repoPath }));
+			const reportsDirectory = join(storeRoot, runId, "reports");
+			const residueName = legacyReportTempName(
+				FIXED_REPORT.path,
+				"ef".repeat(16),
+			);
+			const residuePath = join(reportsDirectory, residueName);
+			await mkdir(residuePath);
+			const directoryListing = store.listStoredReports(runId);
+			await expect(directoryListing).rejects.toBeInstanceOf(ProtocolStoreError);
+			await expect(directoryListing).rejects.toThrow(/not a regular file/);
+			await rm(residuePath, { recursive: true });
+			await symlink(repoPath, residuePath, "dir");
+			const symlinkListing = store.listStoredReports(runId);
+			await expect(symlinkListing).rejects.toBeInstanceOf(ProtocolStoreError);
+			await expect(symlinkListing).rejects.toThrow(/not a regular file/);
+			expect(await readdir(repoPath)).toEqual([]);
+		});
+	});
+
+	test("counts state-only identities toward the report quota", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runId = "state-only-quota";
+			await store.createRun(makeManifest({ runId, repoPath }));
+			const reports = Array.from({ length: REPORT_LIMIT }, (_, index) =>
+				indexedReport(index),
+			);
+			await writeFile(
+				join(storeRoot, runId, "state.json"),
+				`${JSON.stringify(
+					makeState({
+						runId,
+						updatedAt: "2026-08-11T00:01:00.000Z",
+						reports,
+					}),
+				)}\n`,
+				"utf8",
+			);
+			const reportsDirectory = join(storeRoot, runId, "reports");
+
+			expect(await store.listStoredReports(runId)).toEqual([]);
+			const rejected = store.writeReport(
+				runId,
+				indexedReport(REPORT_LIMIT),
+				"state-only sixty-fifth report\n",
+			);
+			await expect(rejected).rejects.toBeInstanceOf(ProtocolStoreError);
+			await expect(rejected).rejects.toThrow(/quota of 64/);
+			expect(await readdir(reportsDirectory)).toEqual([]);
+		});
+	});
+
+	test("serializes concurrent 63-to-64 publications across store instances", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runId = "concurrent-report-quota";
+			await store.createRun(makeManifest({ runId, repoPath }));
+			for (let index = 0; index < REPORT_LIMIT - 1; index += 1) {
+				const report = indexedReport(index);
+				await store.writeReport(runId, report, `body ${report.paneId}\n`);
+			}
+			const competingStore = new RunStore(storeRoot);
+			const firstNew = indexedReport(REPORT_LIMIT - 1);
+			const secondNew = indexedReport(REPORT_LIMIT);
+			const results = await Promise.allSettled([
+				store.writeReport(runId, firstNew, "first new identity\n"),
+				competingStore.writeReport(runId, secondNew, "second new identity\n"),
+			]);
+			const fulfilled = results.filter(
+				(result) => result.status === "fulfilled",
+			);
+			const rejected = results.filter((result) => result.status === "rejected");
+			expect(fulfilled).toHaveLength(1);
+			expect(rejected).toHaveLength(1);
+			const rejectedResult = rejected[0];
+			if (
+				rejectedResult === undefined ||
+				rejectedResult.status !== "rejected"
+			) {
+				throw new Error("expected one rejected concurrent publication");
+			}
+			expect(rejectedResult.reason).toBeInstanceOf(ProtocolStoreError);
+			expect(String(rejectedResult.reason)).toMatch(/quota of 64/);
+			const reportsDirectory = join(storeRoot, runId, "reports");
+			const publishedNames = (await readdir(reportsDirectory)).sort();
+			expect(publishedNames).toHaveLength(REPORT_LIMIT);
+			expect(
+				publishedNames.every((name) =>
+					/^agent-[a-f0-9]{12}-report-[a-f0-9]{64}\.txt$/.test(name),
+				),
+			).toBe(true);
+			expect(await store.listStoredReports(runId)).toHaveLength(REPORT_LIMIT);
+		});
+	});
+
+	test("rejects a later state write that omits another instance's published artifact", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runId = "inter-instance-state-union-quota";
+			await store.createRun(makeManifest({ runId, repoPath }));
+			for (let index = 0; index < REPORT_LIMIT - 1; index += 1) {
+				const report = indexedReport(index);
+				await store.writeReport(runId, report, `body ${report.paneId}\n`);
+			}
+			const competingStore = new RunStore(storeRoot);
+			const published = indexedReport(REPORT_LIMIT - 1);
+			const stateOnly = indexedReport(REPORT_LIMIT);
+			const stateReports = [
+				...Array.from({ length: REPORT_LIMIT - 1 }, (_, index) =>
+					indexedReport(index),
+				),
+				stateOnly,
+			];
+			await store.writeReport(runId, published, "sixty-fourth artifact\n");
+			const rejectedStateWrite = competingStore.writeState(
+				makeState({
+					runId,
+					updatedAt: "2026-08-11T00:01:00.000Z",
+					reports: stateReports,
+				}),
+			);
+			await expect(rejectedStateWrite).rejects.toBeInstanceOf(
+				ProtocolStoreError,
+			);
+			await expect(rejectedStateWrite).rejects.toThrow(/quota of 64/);
+
+			const stored = await store.listStoredReports(runId);
+			const persisted = await store.readState(runId);
+			const union = new Set<string>();
+			for (const report of persisted.reports) {
+				union.add(report.key);
+			}
+			for (const report of stored) {
+				union.add(report.key);
+			}
+			expect(union.size).toBeLessThanOrEqual(REPORT_LIMIT);
+			expect(stored.length).toBeLessThanOrEqual(REPORT_LIMIT);
+			expect(persisted.reports.length).toBeLessThanOrEqual(REPORT_LIMIT);
+		});
+	});
+	test("preserves a concurrently published report through a stale state write", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runId = "stale-state-report-merge";
+			await store.createRun(makeManifest({ runId, repoPath }));
+			const stale = await store.readState(runId);
+			const publisher = new RunStore(storeRoot);
+			await publisher.writeReport(runId, FIXED_REPORT, "concurrent output\n");
+			await publisher.writeState(
+				makeState({
+					runId,
+					updatedAt: "2026-08-11T00:01:00.000Z",
+					reports: [FIXED_REPORT],
+				}),
+			);
+
+			await store.writeState({
+				...stale,
+				updatedAt: "2026-08-11T00:02:00.000Z",
+			});
+
+			expect((await store.readState(runId)).reports).toEqual([FIXED_REPORT]);
+		});
+	});
+
+	test("rejects state-only and conflicting report events before append", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runId = "report-event-identity";
+			await store.createRun(makeManifest({ runId, repoPath }));
+			const statePath = join(storeRoot, runId, "state.json");
+			await writeFile(
+				statePath,
+				`${JSON.stringify(makeState({ runId, reports: [FIXED_REPORT] }))}\n`,
+				"utf8",
+			);
+			const reportEvent = {
+				schemaVersion: 1 as const,
+				runId,
+				timestamp: FIXED_REPORT.observedAt,
+				type: "report" as const,
+				report: FIXED_REPORT,
+			};
+			await expect(store.appendEvent(runId, reportEvent)).rejects.toThrow(
+				/does not match a stored report envelope/,
+			);
+			expect(await store.readEvents(runId)).toEqual([]);
+
+			await writeFile(
+				statePath,
+				`${JSON.stringify(makeState({ runId }))}\n`,
+				"utf8",
+			);
+			await store.writeReport(runId, FIXED_REPORT, "durable output\n");
+			const conflicting = {
+				...FIXED_REPORT,
+				observedAt: "2026-08-11T00:09:00.000Z",
+			};
+			await writeFile(
+				statePath,
+				`${JSON.stringify(makeState({ runId, reports: [conflicting] }))}\n`,
+				"utf8",
+			);
+			await expect(store.appendEvent(runId, reportEvent)).rejects.toThrow(
+				/does not match a stored report envelope/,
+			);
+			expect(await store.readEvents(runId)).toEqual([]);
+		});
+	});
+
+	test("repairs full lifecycle identity at the event-log tail", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runId = "lifecycle-full-identity";
+			const initial = makeManifest({ runId, repoPath });
+			const failed: RunManifest = {
+				...initial,
+				lifecycle: "failed",
+				updatedAt: "2026-08-11T00:01:00.000Z",
+				lastError: "durable failure",
+			};
+			await store.createRun(initial);
+			await store.transitionManifest(runId, ["starting"], failed);
+			await writeFile(
+				join(storeRoot, runId, "events.jsonl"),
+				`${JSON.stringify({
+					schemaVersion: 1,
+					runId,
+					timestamp: failed.updatedAt,
+					type: "lifecycle",
+					lifecycle: "failed",
+					lastError: "wrong failure",
+				})}\n`,
+				"utf8",
+			);
+
+			await store.ensureLifecycle(runId);
+			const tail = (await store.readEvents(runId)).at(-1);
+			expect(tail).toEqual({
+				schemaVersion: 1,
+				runId,
+				timestamp: failed.updatedAt,
+				type: "lifecycle",
+				lifecycle: "failed",
+				lastError: "durable failure",
+			});
+		});
+	});
+
+	test("never appends stale stopping after a later stopped event", async () => {
+		await withStore(async ({ store, storeRoot, repoPath }) => {
+			const runId = "stopping-stopped-tail";
+			const initial = makeManifest({ runId, repoPath });
+			const running: RunManifest = {
+				...initial,
+				lifecycle: "running",
+				updatedAt: "2026-08-11T00:00:01.000Z",
+			};
+			const stopping: RunManifest = {
+				...running,
+				lifecycle: "stopping",
+				updatedAt: "2026-08-11T00:00:02.000Z",
+			};
+			const stopped: RunManifest = {
+				...stopping,
+				lifecycle: "stopped",
+				updatedAt: "2026-08-11T00:00:03.000Z",
+				stoppedAt: "2026-08-11T00:00:03.000Z",
+			};
+			await store.createRun(initial);
+			await store.ensureLifecycle(runId, {
+				allowedFrom: ["starting"],
+				next: running,
+			});
+			await store.ensureLifecycle(runId, {
+				allowedFrom: ["running"],
+				next: stopping,
+			});
+			const competing = new RunStore(storeRoot);
+			await competing.ensureLifecycle(runId, {
+				allowedFrom: ["stopping"],
+				next: stopped,
+			});
+			const staleResult = await store.ensureLifecycle(runId, {
+				allowedFrom: ["running"],
+				next: stopping,
+			});
+
+			expect(staleResult).toEqual(stopped);
+			const events = await store.readEvents(runId);
+			expect(events.at(-1)).toMatchObject({
+				type: "lifecycle",
+				lifecycle: "stopped",
+				timestamp: stopped.updatedAt,
+			});
+			expect(
+				events.slice(
+					events.findLastIndex(
+						(event) =>
+							event.type === "lifecycle" && event.lifecycle === "stopped",
+					) + 1,
+				),
+			).toEqual([]);
 		});
 	});
 });

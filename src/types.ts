@@ -3,7 +3,8 @@ import { homedir } from "node:os";
 import { isAbsolute, normalize, parse, resolve } from "node:path";
 
 export const SCHEMA_VERSION = 1 as const;
-export const PLUGIN_VERSION = "0.1.0" as const;
+export const PLUGIN_VERSION = "0.1.5" as const;
+export const REPORT_LIMIT = 64 as const;
 
 export const RUN_LIFECYCLES = [
 	"starting",
@@ -109,11 +110,6 @@ export interface ReportRunEvent extends RunEventBase {
 }
 
 export type RunEvent = LifecycleRunEvent | AgentRunEvent | ReportRunEvent;
-
-export interface RunSelector {
-	repoPath?: string;
-	coordinatorPaneId?: string;
-}
 
 export class ProtocolValidationError extends Error {
 	override readonly name = "ProtocolValidationError";
@@ -414,6 +410,12 @@ export function assertOpaqueId(
 	}
 }
 
+export function assertWorkerPrefix(value: unknown): asserts value is string {
+	if (typeof value !== "string" || !RUN_ID.test(value)) {
+		throw new ProtocolValidationError("workerPrefix is not protocol-safe");
+	}
+}
+
 export function assertRunId(value: unknown): asserts value is string {
 	if (typeof value !== "string" || !RUN_ID.test(value)) {
 		throw new ProtocolValidationError("runId is not filesystem-safe");
@@ -469,7 +471,7 @@ export function assertStartOptions(
 	assertOpaqueId(record["workspaceId"], "startOptions.workspaceId");
 	assertSafeRepoPath(record["repoPath"], "startOptions.repoPath");
 	assertOpaqueId(record["coordinatorPaneId"], "startOptions.coordinatorPaneId");
-	assertBoundedText(record["workerPrefix"], "startOptions.workerPrefix", 128);
+	assertWorkerPrefix(record["workerPrefix"]);
 	assertIntegerInRange(
 		record["durationSeconds"],
 		"startOptions.durationSeconds",
@@ -674,6 +676,11 @@ export function assertRunState(value: unknown): asserts value is RunState {
 	if (!Array.isArray(reportsValue)) {
 		throw new ProtocolValidationError("state.reports must be an array");
 	}
+	if (reportsValue.length > REPORT_LIMIT) {
+		throw new ProtocolValidationError(
+			`state.reports must contain at most ${REPORT_LIMIT} records`,
+		);
+	}
 	const reportKeys = new Set<string>();
 	const reportPaths = new Set<string>();
 	for (const element of reportsValue) {
@@ -766,23 +773,6 @@ export function assertRunEvent(value: unknown): asserts value is RunEvent {
 export function parseRunEvent(value: unknown): RunEvent {
 	assertRunEvent(value);
 	return value;
-}
-
-export function assertRunSelector(
-	value: unknown,
-): asserts value is RunSelector {
-	const record = readRecord(
-		value,
-		"selector",
-		[],
-		["repoPath", "coordinatorPaneId"],
-	);
-	if (record["repoPath"] !== undefined) {
-		assertSafeRepoPath(record["repoPath"], "selector.repoPath");
-	}
-	if (record["coordinatorPaneId"] !== undefined) {
-		assertOpaqueId(record["coordinatorPaneId"], "selector.coordinatorPaneId");
-	}
 }
 
 export function generateRunId(now = new Date()): string {

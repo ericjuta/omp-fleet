@@ -14,6 +14,7 @@ import {
 	HerdrServerError,
 	normalizeHerdrAgent,
 	normalizeHerdrAgents,
+	paneProcessIsEmpty,
 	paneProcessOwnsCommand,
 } from "../src/herdr.ts";
 import { makeTempDirectory, removeTempDirectory } from "./helpers.ts";
@@ -499,7 +500,7 @@ describe("HerdrClient", () => {
 		);
 	});
 
-	test("uses fixed pane run, read, inspect, interrupt, and close arguments", async () => {
+	test("uses fixed pane run, read, inspect, and close arguments", async () => {
 		const paneId = "pane://worker/$alpha?slot=9#tail";
 		const tabId = "tab://fleet/$alpha?slot=9#tail";
 		const workspaceId = "workspace://team/$alpha?slot=1";
@@ -531,7 +532,6 @@ describe("HerdrClient", () => {
 				}),
 			}),
 			commandResult(),
-			commandResult(),
 		);
 		const client = new HerdrClient(fake.runner);
 
@@ -540,7 +540,7 @@ describe("HerdrClient", () => {
 			"line one\nline two\n",
 		);
 		const processInfo = await client.inspectPane(paneId, workspaceId);
-		expect(processInfo).toEqual({ command: paneCommand });
+		expect(processInfo).toEqual({ kind: "command", command: paneCommand });
 		expect(paneProcessOwnsCommand(processInfo, paneCommand)).toBe(true);
 		expect(
 			paneProcessOwnsCommand(processInfo, "'/opt/Bun Runtime/bin/bun'"),
@@ -548,7 +548,6 @@ describe("HerdrClient", () => {
 		expect(paneProcessOwnsCommand(processInfo, `${paneCommand} 'extra'`)).toBe(
 			false,
 		);
-		await client.interruptPane(paneId, workspaceId);
 		await client.closeTab(tabId, workspaceId);
 
 		expect(fake.calls).toEqual([
@@ -581,14 +580,6 @@ describe("HerdrClient", () => {
 			{
 				command: "herdr",
 				args: ["pane", "process-info", "--pane", paneId],
-				options: {
-					env: { HERDR_WORKSPACE_ID: workspaceId },
-					timeoutMs: 15_000,
-				},
-			},
-			{
-				command: "herdr",
-				args: ["pane", "send-keys", paneId, "C-c"],
 				options: {
 					env: { HERDR_WORKSPACE_ID: workspaceId },
 					timeoutMs: 15_000,
@@ -665,12 +656,14 @@ describe("HerdrClient", () => {
 		const client = new HerdrClient(fake.runner);
 
 		const ambiguous = await client.inspectPane(paneId, "workspace-owned");
-		expect(ambiguous).toEqual({ command: undefined });
+		expect(ambiguous).toEqual({ kind: "ambiguous" });
 		expect(paneProcessOwnsCommand(ambiguous, expectedCommand)).toBe(false);
+		expect(paneProcessIsEmpty(ambiguous)).toBe(false);
 
 		const fuzzy = await client.inspectPane(paneId, "workspace-owned");
-		expect(fuzzy).toEqual({ command: undefined });
+		expect(fuzzy).toEqual({ kind: "ambiguous" });
 		expect(paneProcessOwnsCommand(fuzzy, expectedCommand)).toBe(false);
+		expect(paneProcessIsEmpty(fuzzy)).toBe(false);
 
 		const error = await catchRejection(() =>
 			client.inspectPane(paneId, "workspace-owned"),
@@ -681,12 +674,108 @@ describe("HerdrClient", () => {
 		);
 	});
 
+	test("classifies empty, exact, and untrusted pane process data", async () => {
+		const paneId = "pane-owned";
+		const expectedCommand = buildPaneCommand("/opt/bun", [
+			"sidecar.ts",
+			"--run-id",
+			"run-owned",
+		]);
+		const matchingProcess = {
+			pid: 91,
+			name: "bun",
+			argv: ["/opt/bun", "sidecar.ts", "--run-id", "run-owned"],
+		};
+		const fake = makeFakeRunner(
+			commandResult({
+				stdout: JSON.stringify({
+					id: "inspect-empty",
+					result: {
+						process_info: {
+							pane_id: paneId,
+							foreground_processes: [],
+						},
+					},
+				}),
+			}),
+			commandResult({
+				stdout: JSON.stringify({
+					id: "inspect-exact",
+					result: {
+						process_info: {
+							pane_id: paneId,
+							foreground_processes: [matchingProcess],
+						},
+					},
+				}),
+			}),
+			commandResult({
+				stdout: JSON.stringify({
+					id: "inspect-missing-list",
+					result: {
+						process_info: {
+							pane_id: paneId,
+						},
+					},
+				}),
+			}),
+			commandResult({
+				stdout: JSON.stringify({
+					id: "inspect-malformed",
+					result: {
+						process_info: {
+							pane_id: paneId,
+							foreground_processes: [{ pid: 0, name: "", argv: ["/opt/bun"] }],
+						},
+					},
+				}),
+			}),
+			commandResult({
+				stdout: JSON.stringify({
+					id: "inspect-oversized",
+					result: {
+						process_info: {
+							pane_id: paneId,
+							foreground_processes: [
+								{
+									pid: 94,
+									name: "bun",
+									argv: ["x".repeat(4097)],
+								},
+							],
+						},
+					},
+				}),
+			}),
+		);
+		const client = new HerdrClient(fake.runner);
+
+		const empty = await client.inspectPane(paneId, "workspace-owned");
+		expect(empty).toEqual({ kind: "empty" });
+		expect(paneProcessIsEmpty(empty)).toBe(true);
+		expect(paneProcessOwnsCommand(empty, expectedCommand)).toBe(false);
+
+		const exact = await client.inspectPane(paneId, "workspace-owned");
+		expect(exact).toEqual({ kind: "command", command: expectedCommand });
+		expect(paneProcessIsEmpty(exact)).toBe(false);
+		expect(paneProcessOwnsCommand(exact, expectedCommand)).toBe(true);
+
+		const missing = await client.inspectPane(paneId, "workspace-owned");
+		const malformed = await client.inspectPane(paneId, "workspace-owned");
+		const oversized = await client.inspectPane(paneId, "workspace-owned");
+		for (const untrusted of [missing, malformed, oversized]) {
+			expect(untrusted).toEqual({ kind: "ambiguous" });
+			expect(paneProcessIsEmpty(untrusted)).toBe(false);
+			expect(paneProcessOwnsCommand(untrusted, expectedCommand)).toBe(false);
+		}
+	});
+
 	test("rejects non-opaque IDs before invoking the runner", async () => {
 		const fake = makeFakeRunner();
 		const client = new HerdrClient(fake.runner);
 
 		const error = await catchRejection(() =>
-			client.interruptPane(" pane-one", "workspace-one"),
+			client.inspectPane(" pane-one", "workspace-one"),
 		);
 
 		expect(error).toBeInstanceOf(HerdrAdapterError);

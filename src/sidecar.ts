@@ -124,8 +124,15 @@ async function assertExternalState(
 		canonicalizePath(arguments_.stateRoot),
 		canonicalizePath(join(arguments_.stateRoot, arguments_.runId)),
 	]);
-	if (isWithin(repository, stateRoot) || isWithin(repository, runDirectory)) {
-		throw new Error("state directory is inside the monitored repository");
+	if (
+		isWithin(repository, stateRoot) ||
+		isWithin(stateRoot, repository) ||
+		isWithin(repository, runDirectory) ||
+		isWithin(runDirectory, repository)
+	) {
+		throw new Error(
+			"state directory and monitored repository must not contain one another",
+		);
 	}
 }
 

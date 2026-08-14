@@ -4,6 +4,7 @@ import {
 	type AgentSnapshot,
 	isHarvestStatus,
 	isTerminalLifecycle,
+	REPORT_LIMIT,
 	type ReportRecord,
 	type RunEvent,
 	type RunLifecycle,
@@ -15,7 +16,6 @@ import {
 } from "./types.ts";
 
 const REPORT_LINES = 200;
-const MAX_REPORTS_PER_RUN = 64;
 const MAX_HERDR_TIMEOUT_MILLISECONDS = 15_000;
 const STARTING_LIFECYCLE = ["starting"] as const;
 const ACTIVE_LIFECYCLES = ["starting", "running"] as const;
@@ -32,23 +32,25 @@ export interface SupervisorOptions {
 	signal?: AbortSignal;
 }
 
+export type DurablePublicationStore = Pick<
+	RunStore,
+	"readState" | "writeState" | "appendEvent"
+> &
+	Partial<Pick<RunStore, "readEvents" | "listStoredReports">>;
+
 export interface SupervisorDependencies {
-	store: Pick<
-		RunStore,
-		| "readManifest"
-		| "readState"
-		| "writeState"
-		| "transitionManifest"
-		| "appendEvent"
-		| "writeReport"
-	> &
-		Partial<Pick<RunStore, "readEvents">>;
+	store: DurablePublicationStore &
+		Pick<RunStore, "readManifest" | "transitionManifest" | "writeReport">;
 	herdr: Pick<HerdrClient, "listAgents" | "readPane">;
 	now?: SupervisorClock;
 	sleep?: SupervisorSleep;
 }
 
 class FatalSupervisorError extends Error {}
+
+function isTypedCancellation(error: unknown): boolean {
+	return error instanceof Error && error.name === "AbortError";
+}
 
 export function sleepUntil(
 	milliseconds: number,
@@ -172,6 +174,18 @@ function lifecycleEvent(manifest: RunManifest, timestamp: string): RunEvent {
 	};
 }
 
+function sameLifecycleEvent(left: RunEvent, right: RunEvent): boolean {
+	return (
+		left.type === "lifecycle" &&
+		right.type === "lifecycle" &&
+		left.schemaVersion === right.schemaVersion &&
+		left.runId === right.runId &&
+		left.timestamp === right.timestamp &&
+		left.lifecycle === right.lifecycle &&
+		left.lastError === right.lastError
+	);
+}
+
 function observationEvent(
 	manifest: RunManifest,
 	snapshot: AgentSnapshot,
@@ -218,41 +232,210 @@ async function required<T>(
 ): Promise<T> {
 	try {
 		return await operation();
-	} catch {
+	} catch (error) {
+		if (isTypedCancellation(error)) {
+			throw error;
+		}
 		throw new FatalSupervisorError(message);
 	}
 }
 
 async function reconcileReportEvents(
-	store: SupervisorDependencies["store"],
+	store: DurablePublicationStore,
 	manifest: RunManifest,
 	state: RunState,
 ): Promise<void> {
 	const readEvents = store.readEvents?.bind(store);
-	if (readEvents === undefined || state.reports.length === 0) {
+	if (readEvents === undefined) {
 		return;
 	}
 	const events = await required("event read failed", () =>
 		readEvents(manifest.runId),
 	);
-	const reported = new Set(
-		events
-			.filter((event) => event.type === "report")
-			.map((event) => event.report.key),
-	);
+	const reportedKeys = new Set<string>();
+	const reportedPaths = new Set<string>();
+	for (const event of events) {
+		if (event.type !== "report") {
+			continue;
+		}
+		const match = state.reports.find(
+			(report) =>
+				report.key === event.report.key || report.path === event.report.path,
+		);
+		if (
+			match === undefined ||
+			event.timestamp !== event.report.observedAt ||
+			!sameReportRecord(match, event.report)
+		) {
+			throw new FatalSupervisorError(
+				"state report conflicts with report event",
+			);
+		}
+		reportedKeys.add(event.report.key);
+		reportedPaths.add(event.report.path);
+	}
 	for (const report of state.reports) {
-		if (reported.has(report.key)) {
+		if (reportedKeys.has(report.key) || reportedPaths.has(report.path)) {
 			continue;
 		}
 		await required("event append failed", () =>
 			store.appendEvent(manifest.runId, reportEvent(manifest, report)),
 		);
-		reported.add(report.key);
+		reportedKeys.add(report.key);
+		reportedPaths.add(report.path);
 	}
+}
+function sameReportRecord(left: ReportRecord, right: ReportRecord): boolean {
+	return (
+		left.key === right.key &&
+		left.paneId === right.paneId &&
+		left.workerName === right.workerName &&
+		left.status === right.status &&
+		left.revision === right.revision &&
+		left.path === right.path &&
+		left.observedAt === right.observedAt
+	);
+}
+async function reconcileStoredReports(
+	store: DurablePublicationStore,
+	state: RunState,
+	requireStoredAgreement = false,
+): Promise<RunState> {
+	const listStoredReports = store.listStoredReports?.bind(store);
+	if (listStoredReports === undefined) {
+		return state;
+	}
+	const stored = await required("stored report read failed", () =>
+		listStoredReports(state.runId),
+	);
+	const reports = [...state.reports];
+	const byKey = new Map(reports.map((report) => [report.key, report]));
+	const byPath = new Map(reports.map((report) => [report.path, report]));
+	let changed = false;
+	for (const report of stored) {
+		const keyMatch = byKey.get(report.key);
+		const pathMatch = byPath.get(report.path);
+		if (keyMatch === undefined && pathMatch === undefined) {
+			reports.push(report);
+			byKey.set(report.key, report);
+			byPath.set(report.path, report);
+			changed = true;
+			continue;
+		}
+		if (
+			keyMatch !== undefined &&
+			keyMatch === pathMatch &&
+			sameReportRecord(keyMatch, report)
+		) {
+			continue;
+		}
+		throw new FatalSupervisorError(
+			"stored report metadata conflicts with state",
+		);
+	}
+	if (requireStoredAgreement) {
+		const storedByKey = new Map(stored.map((report) => [report.key, report]));
+		const storedByPath = new Map(stored.map((report) => [report.path, report]));
+		for (const report of reports) {
+			const keyed = storedByKey.get(report.key);
+			const pathed = storedByPath.get(report.path);
+			if (
+				keyed === undefined ||
+				pathed === undefined ||
+				!sameReportRecord(keyed, report) ||
+				!sameReportRecord(pathed, report)
+			) {
+				throw new FatalSupervisorError(
+					"stored report metadata conflicts with state",
+				);
+			}
+		}
+	}
+	return changed ? await persistState(store, { ...state, reports }) : state;
+}
+async function reconcileLifecycleEvent(
+	store: DurablePublicationStore,
+	manifest: RunManifest,
+): Promise<void> {
+	if (manifest.lifecycle === "starting") {
+		return;
+	}
+	const readEvents = store.readEvents?.bind(store);
+	if (readEvents === undefined) {
+		return;
+	}
+	const events = await required("event read failed", () =>
+		readEvents(manifest.runId),
+	);
+	const expected = lifecycleEvent(manifest, manifest.updatedAt);
+	if (isTerminalLifecycle(manifest.lifecycle)) {
+		const tail = events.at(-1);
+		if (tail !== undefined && sameLifecycleEvent(tail, expected)) {
+			return;
+		}
+	} else if (
+		events.some(
+			(event) =>
+				event.type === "lifecycle" &&
+				event.lifecycle === manifest.lifecycle &&
+				event.timestamp === manifest.updatedAt,
+		)
+	) {
+		return;
+	}
+	await required("event append failed", () =>
+		store.appendEvent(manifest.runId, expected),
+	);
+}
+async function guaranteeLifecycleEvent(
+	store: DurablePublicationStore,
+	manifest: RunManifest,
+): Promise<void> {
+	if (store.readEvents === undefined) {
+		if (
+			isTerminalLifecycle(manifest.lifecycle) ||
+			manifest.lifecycle === "stopping"
+		) {
+			throw new FatalSupervisorError("event append failed");
+		}
+		return;
+	}
+	await reconcileLifecycleEvent(store, manifest);
+}
+
+async function reconcileDurablePublication(
+	store: DurablePublicationStore,
+	manifest: RunManifest,
+	state: RunState,
+): Promise<RunState> {
+	if (
+		isTerminalLifecycle(manifest.lifecycle) &&
+		store.listStoredReports === undefined
+	) {
+		throw new FatalSupervisorError("stored report read failed");
+	}
+	const reconciled = await reconcileStoredReports(
+		store,
+		state,
+		isTerminalLifecycle(manifest.lifecycle),
+	);
+	await reconcileReportEvents(store, manifest, reconciled);
+	await guaranteeLifecycleEvent(store, manifest);
+	return reconciled;
+}
+
+export async function requireDurableConvergence(
+	store: DurablePublicationStore,
+	manifest: RunManifest,
+): Promise<RunState> {
+	const state = await required("state read failed", () =>
+		store.readState(manifest.runId),
+	);
+	return await reconcileDurablePublication(store, manifest, state);
 }
 
 async function persistState(
-	store: SupervisorDependencies["store"],
+	store: DurablePublicationStore,
 	state: RunState,
 ): Promise<RunState> {
 	const durable = await required("state read failed", () =>
@@ -319,17 +502,35 @@ async function persistLifecycle(
 	lifecycle: RunLifecycle,
 	at: string,
 	lastError?: string,
-	bestEffortEvent = false,
 ): Promise<RunManifest> {
 	let durable = await readDurableManifest(store, manifest.runId);
+	let ensured: { lifecycle: RunLifecycle; updatedAt: string } | undefined;
+	const ensureEvent = async (target: RunManifest): Promise<void> => {
+		if (
+			ensured?.lifecycle === target.lifecycle &&
+			ensured.updatedAt === target.updatedAt
+		) {
+			return;
+		}
+		await guaranteeLifecycleEvent(store, target);
+		ensured = {
+			lifecycle: target.lifecycle,
+			updatedAt: target.updatedAt,
+		};
+	};
 	while (true) {
 		if (isTerminalLifecycle(durable.lifecycle)) {
+			await requireDurableConvergence(store, durable);
 			return durable;
+		}
+		if (durable.lifecycle === "stopping") {
+			await ensureEvent(durable);
 		}
 
 		const resolvedLifecycle =
 			durable.lifecycle === "stopping" ? "stopped" : lifecycle;
 		if (durable.lifecycle === resolvedLifecycle && lastError === undefined) {
+			await ensureEvent(durable);
 			return durable;
 		}
 		const allowedFrom =
@@ -348,17 +549,34 @@ async function persistLifecycle(
 			store.transitionManifest(manifest.runId, allowedFrom, next),
 		);
 		if (current !== next) {
-			if (current.lifecycle === "stopping") {
-				durable = current;
+			durable = current;
+			if (isTerminalLifecycle(durable.lifecycle)) {
+				await requireDurableConvergence(store, durable);
+				return durable;
+			}
+			await ensureEvent(durable);
+			if (durable.lifecycle === "stopping") {
 				continue;
 			}
-			return current;
+			return durable;
+		}
+		if (isTerminalLifecycle(next.lifecycle)) {
+			try {
+				await requireDurableConvergence(store, next);
+			} catch {
+				await requireDurableConvergence(store, next);
+			}
+			return next;
 		}
 		try {
 			await store.appendEvent(next.runId, lifecycleEvent(next, at));
 		} catch {
-			if (!bestEffortEvent) {
-				throw new FatalSupervisorError("event append failed");
+			if (store.readEvents === undefined) {
+				await required("event append failed", () =>
+					store.appendEvent(next.runId, lifecycleEvent(next, at)),
+				);
+			} else {
+				await reconcileLifecycleEvent(store, next);
 			}
 		}
 		return next;
@@ -434,7 +652,7 @@ async function sample(
 	const harvested = new Set(state.reports.map((report) => report.key));
 
 	for (const snapshot of snapshots) {
-		if (signal.aborted || nextState.reports.length >= MAX_REPORTS_PER_RUN) {
+		if (signal.aborted || nextState.reports.length >= REPORT_LIMIT) {
 			break;
 		}
 		const status = snapshot.status;
@@ -519,9 +737,11 @@ export async function runSupervisor(
 	const signal = options.signal ?? new AbortController().signal;
 	let manifest = { ...options.manifest };
 	let deadline: number | undefined;
+	let state: RunState;
 
 	try {
 		manifest = await readDurableManifest(dependencies.store, manifest.runId);
+		state = await requireDurableConvergence(dependencies.store, manifest);
 		if (isTerminalLifecycle(manifest.lifecycle)) {
 			return manifest;
 		}
@@ -546,12 +766,8 @@ export async function runSupervisor(
 		}
 		deadline = Math.min(declaredDeadline, boundedDeadline);
 
-		let state = await required("state read failed", () =>
-			dependencies.store.readState(manifest.runId),
-		);
-		await reconcileReportEvents(dependencies.store, manifest, state);
-
 		manifest = await readDurableManifest(dependencies.store, manifest.runId);
+		state = await requireDurableConvergence(dependencies.store, manifest);
 		if (isTerminalLifecycle(manifest.lifecycle)) {
 			return manifest;
 		}
@@ -603,6 +819,7 @@ export async function runSupervisor(
 			}
 
 			manifest = await readDurableManifest(dependencies.store, manifest.runId);
+			state = await requireDurableConvergence(dependencies.store, manifest);
 			if (isTerminalLifecycle(manifest.lifecycle)) {
 				return manifest;
 			}
@@ -657,7 +874,7 @@ export async function runSupervisor(
 	} catch (error) {
 		const terminalTime = now();
 		const terminalAt = iso(terminalTime);
-		if (signal.aborted) {
+		if (isTypedCancellation(error)) {
 			return await persistLifecycle(
 				dependencies.store,
 				manifest,
@@ -675,7 +892,6 @@ export async function runSupervisor(
 			"failed",
 			terminalAt,
 			message,
-			true,
 		);
 	}
 }
