@@ -15,11 +15,6 @@ import {
 } from "./store.ts";
 import { isTerminalLifecycle } from "./types.ts";
 
-const SIDECAR_NEEDLES = [
-	"omp-fleet/src/sidecar.ts",
-	"@ericjuta/omp-fleet/src/sidecar.ts",
-];
-
 export interface LegacyLockMigrationDeps {
 	readonly runner?: CommandRunner;
 	readonly herdr?: Pick<HerdrClient, "inspectPane">;
@@ -52,23 +47,30 @@ async function runCaptured(
 	}
 }
 
-function parsePidLines(text: string): string[] {
+function parsePidOutput(
+	text: string,
+	label: string,
+	requireBarePid: boolean,
+): string[] {
 	const pids: string[] = [];
 	for (const line of text.split("\n")) {
-		const match = /^(\d+)\b/.exec(line.trim());
-		if (match?.[1] !== undefined) pids.push(match[1]);
+		if (line.length === 0) continue;
+		const match = requireBarePid
+			? /^(\d+)$/.exec(line)
+			: /^(\d+)(?:\s|$)/.exec(line);
+		if (match?.[1] === undefined) {
+			throw new ProtocolStoreError(
+				`legacy lock migration could not parse ${label}`,
+			);
+		}
+		pids.push(match[1]);
 	}
 	return pids;
-}
-
-function isDocumentedNoMatch(exitCode: number): boolean {
-	return exitCode === 1;
 }
 
 function requireCleanProbe(
 	result: CommandResult | undefined,
 	label: string,
-	allowNoMatch: boolean,
 ): CommandResult {
 	if (result === undefined) {
 		throw new ProtocolStoreError(
@@ -85,20 +87,33 @@ function requireCleanProbe(
 			`legacy lock migration ${label} query was truncated`,
 		);
 	}
-	if (result.stderr.trim().length > 0) {
+	if (result.stderr.length > 0) {
 		throw new ProtocolStoreError(
 			`legacy lock migration ${label} query returned stderr`,
 		);
 	}
-	if (
-		result.exitCode !== 0 &&
-		!(allowNoMatch && isDocumentedNoMatch(result.exitCode))
-	) {
+	if (result.exitCode !== 0 && result.exitCode !== 1) {
 		throw new ProtocolStoreError(
 			`legacy lock migration could not query ${label}`,
 		);
 	}
 	return result;
+}
+
+function parseProbePids(
+	result: CommandResult,
+	label: string,
+	requireBarePid: boolean,
+): string[] {
+	if (result.exitCode === 1) {
+		if (result.stdout.length === 0) return [];
+	} else if (result.stdout.length > 0) {
+		const pids = parsePidOutput(result.stdout, label, requireBarePid);
+		if (pids.length > 0) return pids;
+	}
+	throw new ProtocolStoreError(
+		`legacy lock migration ${label} query returned contradictory output`,
+	);
 }
 
 export async function collectLegacyLockLiveEvidence(
@@ -117,26 +132,14 @@ export async function collectLegacyLockLiveEvidence(
 	const pgrep = requireCleanProbe(
 		await runCaptured(runner, "pgrep", ["-af", "sidecar.ts"]),
 		"sidecar PIDs",
-		true,
 	);
-	const sidecarPids = pgrep.stdout
-		.split("\n")
-		.map((line) => line.trim())
-		.filter(
-			(line) =>
-				line.length > 0 &&
-				SIDECAR_NEEDLES.some((needle) => line.includes(needle)),
-		)
-		.flatMap((line) => parsePidLines(line));
+	const sidecarPids = parseProbePids(pgrep, "sidecar PIDs", false);
 
 	const lsof = requireCleanProbe(
 		await runCaptured(runner, "lsof", ["-t", "--", lockPath]),
 		"lock holders",
-		true,
 	);
-	const lockHolders = isDocumentedNoMatch(lsof.exitCode)
-		? []
-		: parsePidLines(lsof.stdout);
+	const lockHolders = parseProbePids(lsof, "lock holder PIDs", true);
 
 	const store = new RunStore(root);
 	const herdr = deps.herdr ?? new HerdrClient(runner);
@@ -153,9 +156,7 @@ export async function collectLegacyLockLiveEvidence(
 			liveSupervisorPanes.push(manifest.supervisorPaneId);
 		} catch (error) {
 			const paneMissing =
-				(error instanceof HerdrServerError &&
-					error.code === "pane_not_found") ||
-				(error instanceof Error && /\bpane_not_found\b/.test(error.message));
+				error instanceof HerdrServerError && error.code === "pane_not_found";
 			if (!paneMissing) {
 				throw new ProtocolStoreError(
 					"legacy lock migration could not inspect a recorded supervisor pane",
