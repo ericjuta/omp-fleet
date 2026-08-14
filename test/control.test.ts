@@ -630,6 +630,7 @@ describe("fleet control", () => {
 		store.createRunError = new ProtocolStoreError(
 			"manifest mutex container is not a regular directory",
 		);
+		const lockPath = join(await realpath(stateRoot), ".manifest-lock.sqlite");
 
 		await expect(
 			executeFleetAction(
@@ -638,7 +639,7 @@ describe("fleet control", () => {
 				controlDependencies(repoPath, stateRoot, store, herdr),
 			),
 		).rejects.toThrow(
-			"Fleet found the leftover v0.1 SQLite lock file at ~/.omp/fleet/runs/.manifest-lock.sqlite. Archive that legacy file only after proving no Fleet sidecar PID, lock holder, or supervisor pane is active.",
+			`Fleet found the leftover v0.1 SQLite lock file at ${lockPath}. Archive that legacy file only after proving no Fleet sidecar PID, lock holder, or supervisor pane is active.`,
 		);
 		expect(herdr.createSupervisorTabCalls).toEqual([]);
 		expect(herdr.runInPaneCalls).toEqual([]);

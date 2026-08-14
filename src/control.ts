@@ -564,7 +564,7 @@ async function startFleet(
 			error.message === "manifest mutex container is not a regular directory"
 		) {
 			throw conciseFailure(
-				"Fleet found the leftover v0.1 SQLite lock file at ~/.omp/fleet/runs/.manifest-lock.sqlite. Archive that legacy file only after proving no Fleet sidecar PID, lock holder, or supervisor pane is active.",
+				`Fleet found the leftover v0.1 SQLite lock file at ${join(stateRoot, ".manifest-lock.sqlite")}. Archive that legacy file only after proving no Fleet sidecar PID, lock holder, or supervisor pane is active.`,
 			);
 		}
 		throw conciseFailure("Fleet could not initialize its external run state.");
