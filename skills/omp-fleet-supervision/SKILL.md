@@ -136,11 +136,12 @@ Run this algorithm whenever case 3 or the handoff branch of case 4 applies:
    ambiguously owned agent, and never create a second coordinator merely
    because the first is slow.
 4. **Create when absent.** In the target workspace, create an available shell
-   pane with `herdr_layout` (`tab_create` or `pane_split`, using the repository
-   cwd), then start one uniquely named OMP coordinator A with `herdr_agent`.
-   Layout always precedes agent start. If no target workspace exists and the
-   repository is known, create the workspace with that cwd rather than asking
-   the user to do it.
+   pane with `herdr_layout` `pane_split` from a live shell (repository cwd),
+   then start one uniquely named OMP coordinator A with `herdr_agent`.
+   Empty `tab_create` panes are not available shells; fail closed instead of
+   injecting bash via hub or send-text. Layout always precedes agent start.
+   If no target workspace exists and the repository is known, create the
+   workspace with that cwd rather than asking the user to do it.
 5. **Send once, then observe.** Write or transmit the self-contained mission
    packet, prompt coordinator A once, and use `get`, `wait`, or `read` to
    observe it. Do not repeatedly prompt a working coordinator. Coordinator A

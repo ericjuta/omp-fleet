@@ -55,10 +55,10 @@ the plugin-native `omp-fleet-supervision` skill installed with Fleet below.
 
 ## Install the plugin and skill
 
-Install the immutable v0.2.0 Git tag directly over HTTPS:
+Install the immutable v0.2.1 Git tag directly over HTTPS:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.2.0'
+omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.2.1'
 ```
 
 This single command installs both the Fleet extension and its packaged
@@ -159,7 +159,9 @@ summarize report bodies. For prompt-evaluation cohorts, see the
 ## Auto-handoff operating model
 
 The shared topology is **parent session → Herdr delegation → Fleet inside
-coordinator A**. The recommended daily shape is one coordinator A, one captain
+coordinator A**. Create coordinator and worker shells with `pane_split` from a
+live shell. Empty `tab_create` panes are not available shells; fail closed
+instead of injecting bash via hub or send-text. The recommended daily shape is one coordinator A, one captain
 prefix cohort, and one active Fleet supervisor per active repository. This is a
 convention, not enforcement: Fleet permits additional coordinators and
 concurrent runs. The parent delegates coordinator A, captains, and workers
@@ -315,6 +317,27 @@ remain provenance only. Fleet does not copy the process environment. Reports
 can contain sensitive terminal text: they are private (`0600`), are not
 automatically redacted, are capped at 262144 UTF-8 bytes each, and are limited
 to 64 files per run.
+
+### Legacy v0.1 lock-file migration
+
+v0.1 used `.manifest-lock.sqlite` as a regular SQLite file. v0.2 requires that
+same path to be a private `0700` directory. Do not rename the mutex path or
+create a second lock domain.
+
+The operator command is `bun run migrate:legacy-lock` (optional
+`--state-root`). It queries live sidecar PIDs (`pgrep`), lock holders
+(`lsof`), and recorded supervisor panes (`herdr pane process-info`). Missing
+probes fail closed. Caller-supplied booleans are not proof.
+
+1. Query live sidecar PIDs, lock holders, and supervisor panes.
+2. Refuse if any of those lists is non-empty.
+3. Atomically archive the file to
+   `.manifest-lock.sqlite.v0.1-file-<UTC>` and `mkdir 0700` the container.
+4. No-op if the container is already a private directory. Refuse a symlink.
+
+This host already archived one leftover file to
+`.manifest-lock.sqlite.v0.1-file-20260814T142317Z`. Leave leftover run
+directories in place.
 
 ## Operational example
 

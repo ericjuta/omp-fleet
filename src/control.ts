@@ -20,7 +20,7 @@ import {
 	paneProcessIsEmpty,
 	paneProcessOwnsCommand,
 } from "./herdr.ts";
-import { RunStore } from "./store.ts";
+import { ProtocolStoreError, RunStore } from "./store.ts";
 import { requireDurableConvergence } from "./supervisor.ts";
 import {
 	AGENT_STATUSES,
@@ -545,7 +545,7 @@ async function startFleet(
 		await store.createRun(manifest, state);
 		runCreated = true;
 		manifest = await store.ensureLifecycle(runId);
-	} catch {
+	} catch (error) {
 		if (runCreated) {
 			const failure = await persistFailedLifecycle(
 				store,
@@ -557,6 +557,14 @@ async function startFleet(
 				failure.persisted
 					? `Fleet run ${runId} could not initialize and is marked failed.`
 					: "Fleet could not initialize or persist failure for its external run state.",
+			);
+		}
+		if (
+			error instanceof ProtocolStoreError &&
+			error.message === "manifest mutex container is not a regular directory"
+		) {
+			throw conciseFailure(
+				"Fleet found the leftover v0.1 SQLite lock file at ~/.omp/fleet/runs/.manifest-lock.sqlite. Archive that legacy file only after proving no Fleet sidecar PID, lock holder, or supervisor pane is active.",
 			);
 		}
 		throw conciseFailure("Fleet could not initialize its external run state.");
@@ -962,7 +970,12 @@ async function selectRun(
 	return { manifest, store };
 }
 
-function statusText(manifest: RunManifest, state: RunState, now: Date): string {
+function statusText(
+	manifest: RunManifest,
+	state: RunState,
+	now: Date,
+	supervisorMissing = false,
+): string {
 	const nowMs = now.getTime();
 	const staleAfterMs = observationStaleAfterMs(manifest.pollSeconds);
 	const health = deriveObservationHealth(manifest, state, now);
@@ -985,6 +998,20 @@ function statusText(manifest: RunManifest, state: RunState, now: Date): string {
 		"Fleet observes only; workers may still be running.",
 		"Fleet does not observe repository diffs or verify worker claims.",
 	];
+	if (
+		(manifest.lifecycle === "starting" || manifest.lifecycle === "running") &&
+		supervisorMissing
+	) {
+		lines.push(
+			"Supervisor pane is missing; this observation is not a live sidecar.",
+		);
+	}
+	if (
+		(manifest.lifecycle === "starting" || manifest.lifecycle === "running") &&
+		nowMs >= Date.parse(manifest.deadlineAt)
+	) {
+		lines.push("Deadline is past; this observation is not a live sidecar.");
+	}
 	if (state.reports.length === REPORT_LIMIT) {
 		lines.push(
 			"Report budget saturated; additional terminal reports cannot be harvested.",
@@ -1033,10 +1060,27 @@ async function statusFleet(
 		}
 	}
 	const now = currentDate(dependencies);
+	let supervisorMissing = false;
+	if (manifest.lifecycle === "starting" || manifest.lifecycle === "running") {
+		if (manifest.supervisorPaneId === undefined) {
+			supervisorMissing = true;
+		} else {
+			try {
+				const herdr = dependencies.herdr ?? new HerdrClient();
+				const processInfo = await herdr.inspectPane(
+					manifest.supervisorPaneId,
+					manifest.workspaceId,
+				);
+				supervisorMissing = paneProcessIsEmpty(processInfo);
+			} catch {
+				supervisorMissing = true;
+			}
+		}
+	}
 	return manifestActionResult(
 		"status",
 		manifest,
-		statusText(manifest, state, now),
+		statusText(manifest, state, now, supervisorMissing),
 		observationResultFields(manifest, state, now),
 	);
 }

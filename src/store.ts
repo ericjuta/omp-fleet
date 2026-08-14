@@ -89,6 +89,12 @@ export interface LifecycleTransition {
 	next: RunManifest;
 }
 
+export interface LegacyManifestLockMigrationEvidence {
+	readonly noSidecarPids: boolean;
+	readonly noLockHolders: boolean;
+	readonly missingSupervisorPanes: boolean;
+}
+
 function isForbiddenReportCodePoint(codePoint: number): boolean {
 	return (
 		(codePoint <= 0x1f && codePoint !== 0x09 && codePoint !== 0x0a) ||
@@ -392,6 +398,85 @@ async function ensureManifestMutexDirectory(root: string): Promise<string> {
 		root,
 		"manifest mutex container",
 	);
+}
+
+function legacyManifestLockArchiveSuffix(now: Date): string {
+	if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+		throw new ProtocolStoreError("legacy lock migration timestamp is invalid");
+	}
+	const iso = new Date(now.getTime()).toISOString();
+	return `${iso.slice(0, 19).replaceAll("-", "").replaceAll(":", "")}Z`;
+}
+
+/**
+ * Replace the v0.1 single-file manifest mutex with the v0.2 private container.
+ * The legacy file is retained under a timestamped sibling path.
+ */
+export async function migrateLegacyManifestLockFile(
+	storeRoot: string,
+	evidence: LegacyManifestLockMigrationEvidence,
+	now = new Date(),
+): Promise<string | undefined> {
+	const root = new RunStore(storeRoot).root;
+	const rootEntry = await lstatIfPresent(root);
+	if (
+		rootEntry === undefined ||
+		!rootEntry.isDirectory() ||
+		rootEntry.isSymbolicLink()
+	) {
+		throw new ProtocolStoreError("store root is not a real directory");
+	}
+	const currentUserId =
+		typeof process.getuid === "function" ? process.getuid() : undefined;
+	if (currentUserId !== undefined && rootEntry.uid !== currentUserId) {
+		throw new ProtocolStoreError("store root is not owned by the current user");
+	}
+	if ((rootEntry.mode & 0o022) !== 0) {
+		throw new ProtocolStoreError(
+			"store root must not be group or other writable",
+		);
+	}
+
+	const mutexPath = resolve(root, MANIFEST_MUTEX_DIRECTORY);
+	assertContained(root, mutexPath, "manifest mutex container");
+	const entry = await lstatIfPresent(mutexPath);
+	if (entry?.isDirectory() === true && !entry.isSymbolicLink()) {
+		await ensureManifestMutexDirectory(root);
+		return undefined;
+	}
+	if (entry === undefined) {
+		throw new ProtocolStoreError("legacy manifest mutex file does not exist");
+	}
+	if (!entry.isFile() || entry.isSymbolicLink()) {
+		throw new ProtocolStoreError(
+			"legacy manifest mutex path is not a regular file",
+		);
+	}
+	if (
+		!isUnknownRecord(evidence) ||
+		evidence["noSidecarPids"] !== true ||
+		evidence["noLockHolders"] !== true ||
+		evidence["missingSupervisorPanes"] !== true
+	) {
+		throw new ProtocolStoreError(
+			"legacy manifest mutex migration requires no sidecar PIDs, no lock holders, and missing supervisor panes",
+		);
+	}
+
+	const archivePath = resolve(
+		root,
+		`${MANIFEST_MUTEX_DIRECTORY}.v0.1-file-${legacyManifestLockArchiveSuffix(now)}`,
+	);
+	assertContained(root, archivePath, "legacy manifest mutex archive");
+	if ((await lstatIfPresent(archivePath)) !== undefined) {
+		throw new ProtocolStoreError(
+			"legacy manifest mutex archive path already exists",
+		);
+	}
+	await rename(mutexPath, archivePath);
+	await mkdir(mutexPath, { mode: 0o700 });
+	await ensureManifestMutexDirectory(root);
+	return archivePath;
 }
 
 async function ensureControlMutexDirectory(root: string): Promise<string> {

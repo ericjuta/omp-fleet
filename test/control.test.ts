@@ -16,7 +16,7 @@ import type {
 	CreateSupervisorTabInput,
 	PaneProcessInfo,
 } from "../src/herdr.ts";
-import { RunStore } from "../src/store.ts";
+import { ProtocolStoreError, RunStore } from "../src/store.ts";
 import {
 	type AgentSnapshot,
 	agentHandle,
@@ -622,6 +622,27 @@ describe("fleet control", () => {
 			expect(herdr.runInPaneCalls).toEqual([]);
 		});
 	}
+
+	test("start names the leftover v0.1 SQLite manifest lock file", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		store.createRunError = new ProtocolStoreError(
+			"manifest mutex container is not a regular directory",
+		);
+
+		await expect(
+			executeFleetAction(
+				"start",
+				{},
+				controlDependencies(repoPath, stateRoot, store, herdr),
+			),
+		).rejects.toThrow(
+			"Fleet found the leftover v0.1 SQLite lock file at ~/.omp/fleet/runs/.manifest-lock.sqlite. Archive that legacy file only after proving no Fleet sidecar PID, lock holder, or supervisor pane is active.",
+		);
+		expect(herdr.createSupervisorTabCalls).toEqual([]);
+		expect(herdr.runInPaneCalls).toEqual([]);
+	});
 
 	test("start persists exact ownership before dispatch and leaves lifecycle ownership to the sidecar", async () => {
 		const { repoPath, stateRoot } = await fixturePaths();
@@ -1545,6 +1566,7 @@ describe("fleet control", () => {
 		const runId = "run-dashboard";
 		const store = new MemoryFleetStore();
 		const herdr = new FakeHerdr();
+		herdr.inspectedProcess = { kind: "command", command: "bun sidecar" };
 		const manifest = makeManifest({
 			runId,
 			lifecycle: "running",
@@ -1620,6 +1642,156 @@ describe("fleet control", () => {
 		expect(store.readStateIds).toEqual([runId]);
 		expect(result.text).not.toContain("worker-pane-alpha");
 		expect(result.text).not.toContain("workspace-main");
+	});
+
+	test("status appends missing-supervisor and overdue-deadline lines without rewriting lifecycle", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const missingLine =
+			"Supervisor pane is missing; this observation is not a live sidecar.";
+		const overdueLine =
+			"Deadline is past; this observation is not a live sidecar.";
+		const liveCreatedAt = "2030-01-02T03:00:00.000Z";
+		const overdueCreatedAt = "2030-01-01T20:00:00.000Z";
+		const ownership = {
+			supervisorTabId: "supervisor-tab",
+			supervisorPaneId: "supervisor-main",
+			supervisorCommand: "bun sidecar",
+		} as const;
+		const scenarios = [
+			{
+				name: "empty-inspect",
+				lifecycle: "running" as const,
+				createdAt: liveCreatedAt,
+				owned: true,
+				inspect: { kind: "empty" as const },
+				expectMissing: true,
+				expectOverdue: false,
+				expectInspect: true,
+			},
+			{
+				name: "inspect-throw",
+				lifecycle: "starting" as const,
+				createdAt: liveCreatedAt,
+				owned: true,
+				inspectError: new Error("inspect failed"),
+				expectMissing: true,
+				expectOverdue: false,
+				expectInspect: true,
+			},
+			{
+				name: "pane-not-found",
+				lifecycle: "running" as const,
+				createdAt: liveCreatedAt,
+				owned: true,
+				inspectError: new Error("pane_not_found"),
+				expectMissing: true,
+				expectOverdue: false,
+				expectInspect: true,
+			},
+			{
+				name: "unassigned-pane",
+				lifecycle: "running" as const,
+				createdAt: liveCreatedAt,
+				owned: false,
+				expectMissing: true,
+				expectOverdue: false,
+				expectInspect: false,
+			},
+			{
+				name: "ambiguous-process",
+				lifecycle: "running" as const,
+				createdAt: liveCreatedAt,
+				owned: true,
+				inspect: { kind: "ambiguous" as const },
+				expectMissing: false,
+				expectOverdue: false,
+				expectInspect: true,
+			},
+			{
+				name: "other-command",
+				lifecycle: "running" as const,
+				createdAt: liveCreatedAt,
+				owned: true,
+				inspect: { kind: "command" as const, command: "sleep 90" },
+				expectMissing: false,
+				expectOverdue: false,
+				expectInspect: true,
+			},
+			{
+				name: "overdue-deadline",
+				lifecycle: "running" as const,
+				createdAt: overdueCreatedAt,
+				owned: true,
+				inspect: { kind: "command" as const, command: "bun sidecar" },
+				expectMissing: false,
+				expectOverdue: true,
+				expectInspect: true,
+			},
+			{
+				name: "missing-and-overdue",
+				lifecycle: "starting" as const,
+				createdAt: overdueCreatedAt,
+				owned: false,
+				expectMissing: true,
+				expectOverdue: true,
+				expectInspect: false,
+			},
+		] as const;
+
+		for (const scenario of scenarios) {
+			const runId = `run-zombie-${scenario.name}`;
+			const store = new MemoryFleetStore();
+			const herdr = new FakeHerdr();
+			if ("inspect" in scenario) {
+				herdr.inspectedProcess = scenario.inspect;
+			}
+			if ("inspectError" in scenario) {
+				herdr.inspectPaneError = scenario.inspectError;
+			}
+			store.manifests.set(
+				runId,
+				makeManifest({
+					runId,
+					lifecycle: scenario.lifecycle,
+					repoPath: canonicalRepo,
+					createdAt: scenario.createdAt,
+					...(scenario.owned ? ownership : {}),
+				}),
+			);
+			store.states.set(runId, makeState({ runId }));
+
+			const result = await executeFleetAction(
+				"status",
+				{ runId },
+				controlDependencies(repoPath, stateRoot, store, herdr),
+			);
+
+			expect(result.lifecycle).toBe(scenario.lifecycle);
+			expect(store.manifests.get(runId)?.lifecycle).toBe(scenario.lifecycle);
+			expect(store.writeManifestCalls).toEqual([]);
+			expect(store.transitionManifestCalls).toEqual([]);
+			if (scenario.expectMissing) {
+				expect(result.text).toContain(missingLine);
+			} else {
+				expect(result.text).not.toContain(missingLine);
+			}
+			if (scenario.expectOverdue) {
+				expect(result.text).toContain(overdueLine);
+			} else {
+				expect(result.text).not.toContain(overdueLine);
+			}
+			expect(herdr.inspectPaneCalls).toEqual(
+				scenario.expectInspect
+					? [
+							{
+								paneId: "supervisor-main",
+								workspaceId: "workspace-test",
+							},
+						]
+					: [],
+			);
+		}
 	});
 
 	test("status renders an explicit empty cohort", async () => {

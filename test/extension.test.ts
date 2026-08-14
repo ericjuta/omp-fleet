@@ -1273,6 +1273,7 @@ describe("fleet extension", () => {
 					"Report budget: 1/64.",
 					"Fleet observes only; workers may still be running.",
 					"Fleet does not observe repository diffs or verify worker claims.",
+					"Deadline is past; this observation is not a live sidecar.",
 					FALSE_SUCCESS_WARNING,
 				].join("\n"),
 			},
