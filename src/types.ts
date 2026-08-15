@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { isAbsolute, normalize, parse, resolve } from "node:path";
 
 export const SCHEMA_VERSION = 1 as const;
-export const PLUGIN_VERSION = "0.2.4" as const;
+export const PLUGIN_VERSION = "0.2.5" as const;
 export const REPORT_LIMIT = 64 as const;
 
 export const RUN_LIFECYCLES = [
