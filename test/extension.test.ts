@@ -201,6 +201,11 @@ class MemoryFleetStore implements FleetStore {
 		return [...this.manifests.values()];
 	}
 
+	async withStartLock<T>(action: () => Promise<T>): Promise<T> {
+		this.runtimeCalls.push("store.withStartLock");
+		return await action();
+	}
+
 	async readEvents(runId: string): Promise<RunEvent[]> {
 		this.runtimeCalls.push(`store.readEvents:${runId}`);
 		this.readEventIds.push(runId);
@@ -1270,7 +1275,7 @@ describe("fleet extension", () => {
 					"Observations updated: 2026-08-11T00:00:00.000Z",
 					"Deadline: 2026-08-11T06:00:00.000Z",
 					"Workers: none observed.",
-					"Report budget: 1/64.",
+					"Report budget: 1/64 for this run.",
 					"Fleet observes only; workers may still be running.",
 					"Fleet does not observe repository diffs or verify worker claims.",
 					"Deadline is past; this observation is not a live sidecar.",

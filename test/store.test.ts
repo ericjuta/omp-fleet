@@ -168,6 +168,87 @@ describe("RunStore", () => {
 		}
 	});
 
+	test("serializes starts across run IDs on one store root", async () => {
+		await withStore(async ({ store }) => {
+			const order: string[] = [];
+			const firstEntered = Promise.withResolvers<void>();
+			const releaseFirst = Promise.withResolvers<void>();
+			const first = store.withStartLock(async () => {
+				order.push("first entered");
+				firstEntered.resolve();
+				await releaseFirst.promise;
+				order.push("first exited");
+			});
+
+			await firstEntered.promise;
+			const second = store.withStartLock(async () => {
+				order.push("second entered");
+			});
+
+			// This integration test has no target-only hook for mutex acquisition.
+			await Bun.sleep(25);
+			expect(order).toEqual(["first entered"]);
+
+			releaseFirst.resolve();
+			await Promise.all([first, second]);
+			expect(order).toEqual([
+				"first entered",
+				"first exited",
+				"second entered",
+			]);
+		});
+	});
+
+	test("creates a missing store root and start mutex container", async () => {
+		const tempDirectory = await makeTempDirectory("omp-fleet-start-lock-");
+		try {
+			const storeRoot = join(tempDirectory, "missing-root");
+			const store = new RunStore(storeRoot);
+
+			await expect(store.withStartLock(async () => "started")).resolves.toBe(
+				"started",
+			);
+			const rootEntry = await lstat(storeRoot);
+			const mutexDirectory = join(store.root, MANIFEST_MUTEX_DIRECTORY);
+			const controlDirectory = join(mutexDirectory, "control");
+			expect(rootEntry.isDirectory()).toBe(true);
+			expect((await lstat(mutexDirectory)).isDirectory()).toBe(true);
+			expect((await lstat(controlDirectory)).isDirectory()).toBe(true);
+		} finally {
+			await removeTempDirectory(tempDirectory);
+		}
+	});
+
+	test("returns start actions, propagates errors, and releases the lock", async () => {
+		await withStore(async ({ store }) => {
+			await expect(store.withStartLock(async () => "started")).resolves.toBe(
+				"started",
+			);
+			await expect(
+				store.withStartLock(async () => {
+					throw new Error("start action failed");
+				}),
+			).rejects.toThrow("start action failed");
+			await expect(store.withStartLock(async () => "released")).resolves.toBe(
+				"released",
+			);
+		});
+	});
+
+	test("rejects a file at the start mutex container path", async () => {
+		await withStore(async ({ store, storeRoot }) => {
+			await mkdir(storeRoot, { mode: 0o700 });
+			const mutexDirectory = join(store.root, MANIFEST_MUTEX_DIRECTORY);
+			await writeFile(mutexDirectory, "unsuitable mutex file", {
+				mode: 0o600,
+			});
+
+			await expect(
+				store.withStartLock(async () => undefined),
+			).rejects.toBeInstanceOf(ProtocolStoreError);
+		});
+	});
+
 	test("atomically creates and round-trips manifest and state", async () => {
 		await withStore(async ({ store, storeRoot, repoPath }) => {
 			const runId = "atomic-round-trip";

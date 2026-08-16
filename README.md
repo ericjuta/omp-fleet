@@ -159,10 +159,10 @@ Occupied OMP/agent panes are not live shells: splitting them can show a fish
 prompt while `herdr_agent` start fails with `not an available shell`. A visual
 prompt is not eligibility; fail closed instead of injecting bash via hub or
 send-text.
-The recommended daily shape is one coordinator A, one captain
-prefix cohort, and one active Fleet supervisor per active repository. This is a
-convention, not enforcement: Fleet permits additional coordinators and
-concurrent runs.
+The recommended daily shape is one coordinator A and one captain-prefix cohort
+per Fleet supervisor. Concurrent supervisors require non-overlapping prefixes
+in a shared workspace, or separate workspaces; overlapping selections in one
+workspace are refused.
 
 The parent **composes**: it delegates coordinator A, captains, and workers
 through Herdr tooling. Coordinator A owns Fleet `start`/`stop`, captain
@@ -185,7 +185,8 @@ read-only and never mutates **coverage**.
 
 Restarting OMP in the same coordinator A pane and repository keeps the same run
 scope: reconciliation catches up with the independently running sidecar rather
-than launching another supervisor. Switching repository creates a distinct run.
+than launching another supervisor. Switching repository changes run identity,
+but does not bypass a root-scoped start-lock conflict.
 Switching coordinator changes in-Herdr implicit `status`/`reports` selection to
 the new repository, Herdr workspace, and coordinator; it does not hide a run
 from non-Herdr repository-wide discovery or from an explicit run ID. `start` and `stop` stay Herdr-only and do not follow the
@@ -198,7 +199,12 @@ observation is no longer needed.
 
 ## Configuration
 
-`start` and `stop` are Herdr-only. `start` derives its workspace and coordinator from `HERDR_WORKSPACE_ID` and `HERDR_PANE_ID`, and its repository from the current Git worktree.
+`start` and `stop` are Herdr-only. `start` derives its workspace and
+coordinator from `HERDR_WORKSPACE_ID` and `HERDR_PANE_ID`, and its repository
+from the current Git worktree. `start` refuses before creating a run or
+supervisor pane when the state root already has a nonterminal, non-overdue run
+for the same Herdr workspace whose worker prefix overlaps in either direction;
+the refusal returns that existing run ID.
 
 | Setting | Default | Allowed values |
 | --- | --- | --- |
@@ -227,9 +233,16 @@ Polling and harvesting remain outside OMP turns. The parent never starts Fleet b
 
 ## Durable state and protocol
 
-The default state root is `~/.omp/fleet/runs`, outside the monitored repository.
-Each run gets an unpredictable timestamp/random run ID. Per-run SQLite lock
-files live in a private root container, not in protocol run directories:
+The default state root for every repository is `~/.omp/fleet/runs`, outside
+the monitored repository.
+Each run gets an unpredictable timestamp/random run ID. A private root-scoped
+start lock serializes `start` across that state root: its conflict key is
+`(workspaceId, worker-prefix overlap in either direction)`. Before side
+effects, it checks for a nonterminal, non-overdue conflicting run and refuses
+with that existing run ID. A terminal or past-deadline run does not conflict.
+Refusal creates no run directory, manifest, state, or supervisor tab. Per-run
+SQLite lock files live in a private root container, not in protocol run
+directories:
 
 ```text
 ~/.omp/fleet/runs/
@@ -258,6 +271,11 @@ closed. Manifest, state,
 event, and report transactions for a run share that bounded OS-backed per-run
 lock, so same-run operations serialize across processes while unrelated runs
 proceed independently.
+The start lock is scoped to a state root, not a repository. The default shared
+root can therefore detect and reject conflicting starts from different
+repositories in the same Herdr workspace. Limitation: a caller-supplied state
+root partitions the inventory, so overlapping runs across state-root
+partitions cannot be detected or refused.
 Manifest lifecycle transitions also use compare-and-set semantics,
 so a concurrent stop cannot be overwritten by a stale terminal transition.
 Unknown future schema versions fail closed while valid writer-plugin versions

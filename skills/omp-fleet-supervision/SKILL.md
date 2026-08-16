@@ -54,19 +54,20 @@ Auto-handoff is parent composition through Herdr tooling, not a Fleet feature.
 - **Fleet** — observes externally created Herdr workers selected by workspace
   and worker-name prefix. Creates and controls only its supervisor pane.
 
-Convention, not a lock: one coordinator A, one captain-prefix cohort, and one
-active Fleet supervisor per active repository. Concurrent cohorts use
-explicit, non-overlapping prefixes and distinct runs. Never create
-supervisors whose `startsWith` worker selections overlap. Prefix selection
-is `startsWith`, so `eval-` and `eval-candidate-` overlap; prefer
-`pd-20260812-base-` and `pd-20260812-cand-`. Default prefix when none is
-established: `worker-`.
+A Fleet run observes every agent in its Herdr workspace whose name starts with
+its worker prefix, regardless of repository or coordinator. Two runs sharing a
+workspace with overlapping `startsWith` selections duplicate coverage; use
+explicit, non-overlapping prefixes and distinct runs. Prefixes may be reused
+in distinct workspaces. Prefix selection is `startsWith`, so `eval-` and
+`eval-candidate-` overlap, whereas `pd-20260812-base-` and
+`pd-20260812-cand-` do not. Two coordinators in one workspace both defaulting
+to `worker-` collide; a distinct prefix is the fix. Default prefix when none
+is established: `worker-`.
 
-Switching repository is a distinct `start`/`stop` scope. Switching
-coordinator changes in-Herdr implicit `status`/`reports` selection to the new
-repository, Herdr workspace, and coordinator; it does not hide a run from
-non-Herdr repository-wide discovery or from an explicit run ID. `start` and
-`stop` stay with the owning Herdr coordinator.
+Switching coordinator changes in-Herdr implicit `status`/`reports` selection
+to the new repository, Herdr workspace, and coordinator; it does not hide a
+run from non-Herdr repository-wide discovery or from an explicit run ID.
+`start` and `stop` stay with the owning Herdr coordinator.
 
 ## Five-case decision matrix
 
@@ -227,9 +228,10 @@ session. Without a run ID (**implicit selection**):
 - non-Herdr: sole active same-repository run, or the newest terminal run when
   none is active, across coordinators.
 
-An in-Herdr no-match is only coordinator-scoped, not proof that no
-repository-wide run exists; use a known explicit ID or non-Herdr parent
-discovery when another coordinator owns coverage. Another in-Herdr
+An in-Herdr no-match is only coordinator-scoped, not proof that no active
+supervisor has an overlapping prefix in the same workspace; use a known
+explicit ID or non-Herdr parent discovery when another coordinator owns
+coverage. Another in-Herdr
 coordinator cannot omit `runId` to search across coordinators. Ambiguous
 matches still need the explicit ID.
 
@@ -243,11 +245,22 @@ for direct operation; models use the tool. See `README.md`.
 
 ### Start parameters
 
-- `prefix`: established worker prefix for this cohort, else `worker-`
+- `prefix`: established worker prefix for this cohort, else `worker-`. It is a
+  `startsWith` selection within the target Herdr workspace and must not overlap
+  another active Fleet supervisor there.
 - `hours`: requested session duration (integer 1–24). For open-ended
   coordinator-A monitoring, **explicitly send 24**. Omitting `hours` defaults
   to **6**.
 - `pollSeconds`: integer 15–600; default **30**
+
+`start` refuses when a nonterminal, not-yet-overdue run already observes the
+same workspace with an overlapping prefix; its refusal names that run ID and
+lifecycle. A nonterminal run past its deadline does not block a new start.
+Three refusal shapes carry different remediation: a live run means reuse it or
+pick a non-overlapping prefix; a `starting` run with no recorded supervisor
+pane is mid-launch, so re-check its status instead of treating it as dead; a
+blocking run whose supervisor pane is missing is refused rather than replaced,
+so stop that run by ID from its owning Herdr coordinator.
 
 ### Status, reports, and stop parameters
 
@@ -279,8 +292,8 @@ inspection may use implicit selection.
 1. **Status first.** Call `status` for the implicitly scoped run (omit
    `runId` unless one is already known and still valid for this scope). If
    context or a parent packet says another coordinator owns coverage, pass
-   that known explicit ID or have the non-Herdr parent discover
-   repository-wide. Establish the intended prefix from the cohort assignment;
+   that known explicit ID or have the non-Herdr parent discover the relevant
+   coverage. Establish the intended prefix from the cohort assignment;
    use `worker-` only when no other prefix is established.
 2. **Resolve ambiguity without starting.** If implicit selection is refused or
    multiple active runs match, use the known cohort run ID or ask. Never guess
@@ -307,11 +320,14 @@ inspection may use implicit selection.
 7. **Start only when needed.** If there is no match, or the selected run is
    terminal (`stopped`, `completed`, or `failed`), **and** current user intent
    still authorizes continued supervision, call `start` with the intended prefix
-   and requested duration/poll. A coordinator-scoped no-match is not proof that
-   no repository-wide run exists; when context says another coordinator owns
-   coverage, use the known explicit ID or parent discovery instead of starting.
-   For open-ended coverage, send `hours: 24` explicitly. Do not auto-renew from
-   a notice, deadline, or terminal snapshot.
+   and requested duration/poll. A coordinator-scoped no-match does not prove
+   there is no active supervisor with an overlapping prefix in the same
+   workspace; use its known explicit ID or parent discovery instead of
+   starting. For open-ended coverage, send `hours: 24` explicitly. Do not
+   auto-renew from a notice, deadline, or terminal snapshot.
+   An overlap refusal is authoritative coverage information: use its returned
+   run ID for `status`, `reports`, and `stop` routing even when implicit
+   in-Herdr selection cannot see a run owned by another coordinator.
 8. **Bind the run ID.** From then on, pass that explicit `runId` into
    status/reports/stop.
 

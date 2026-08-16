@@ -64,6 +64,7 @@ const REPORT_BODY_BYTE_LIMIT = 262_144;
 const REPORT_TRUNCATION_MARKER =
 	"\n[OMP-FLEET OUTPUT TRUNCATED TO 262144 UTF-8 BYTES]\n";
 const MANIFEST_MUTEX_DIRECTORY = ".manifest-lock.sqlite";
+const START_MUTEX_FILE = ".start.sqlite";
 const MANIFEST_MUTEX_BUSY_TIMEOUT_MS = 2_000;
 const CONTROL_MUTEX_ATTEMPT_TIMEOUT_MS = 0;
 const CONTROL_MUTEX_RETRY_DELAY_MS = 25;
@@ -973,6 +974,25 @@ export class RunStore {
 			);
 		}
 		return await readFile(path, "utf8");
+	}
+
+	// Root-scoped lock that serializes run creation across run IDs.
+	async withStartLock<T>(action: () => Promise<T>): Promise<T> {
+		const deadline = performance.now() + CONTROL_MUTEX_QUEUE_TIMEOUT_MS;
+		await this.ensureRoot();
+		const mutexDirectory = await ensureControlMutexDirectory(this.root);
+		const mutexPath = resolve(mutexDirectory, START_MUTEX_FILE);
+		assertContained(this.root, mutexPath, "start mutex path");
+		assertContained(mutexDirectory, mutexPath, "start mutex path");
+		return await withProcessManifestMutex(
+			mutexPath,
+			async () =>
+				await withQueuedSqliteControlMutex(mutexPath, deadline, action),
+			{
+				deadline,
+				timeoutMessage: "timed out acquiring the fleet start lock",
+			},
+		);
 	}
 
 	async createRun(

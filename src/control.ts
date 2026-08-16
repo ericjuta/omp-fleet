@@ -97,6 +97,7 @@ export type FleetStore = Pick<
 	| "readManifest"
 	| "transitionManifest"
 	| "withControlLock"
+	| "withStartLock"
 	| "writeManifest"
 	| "readState"
 	| "writeState"
@@ -482,6 +483,72 @@ function sidecarPath(dependencies: FleetControlDeps): string {
 	return path;
 }
 
+function prefixesOverlap(left: string, right: string): boolean {
+	return left.startsWith(right) || right.startsWith(left);
+}
+
+async function assertNoOverlappingCohort(
+	store: FleetStore,
+	options: StartOptions,
+	herdr: FleetHerdr,
+	now: Date,
+): Promise<void> {
+	let candidates: RunManifest[];
+	try {
+		candidates = await store.listRuns({ failOnInvalid: true });
+	} catch {
+		throw conciseFailure(
+			"Fleet could not read the run inventory; start was refused.",
+		);
+	}
+	const blockingCandidates = candidates.filter((candidate) => {
+		const deadlineAt = Date.parse(candidate.deadlineAt);
+		return (
+			candidate.workspaceId === options.workspaceId &&
+			prefixesOverlap(candidate.workerPrefix, options.workerPrefix) &&
+			!isTerminalLifecycle(candidate.lifecycle) &&
+			(Number.isNaN(deadlineAt) || now.getTime() < deadlineAt)
+		);
+	});
+	if (blockingCandidates.length === 0) return;
+
+	const candidate = blockingCandidates.sort(compareNewestManifest)[0];
+	if (candidate === undefined) return;
+
+	if (
+		candidate.supervisorPaneId === undefined &&
+		candidate.lifecycle === "starting"
+	) {
+		throw conciseFailure(
+			`Fleet run ${candidate.runId} (${candidate.lifecycle}) is already claiming this Herdr workspace with the overlapping worker prefix ${candidate.workerPrefix} and has not yet recorded a supervisor pane; re-check its status, or stop that run by its run ID from its Herdr coordinator before starting a replacement.`,
+		);
+	}
+
+	let supervisorMissing = false;
+	if (candidate.supervisorPaneId === undefined) {
+		supervisorMissing = true;
+	} else {
+		try {
+			supervisorMissing = paneProcessIsEmpty(
+				await herdr.inspectPane(
+					candidate.supervisorPaneId,
+					candidate.workspaceId,
+				),
+			);
+		} catch {
+			supervisorMissing = true;
+		}
+	}
+	if (supervisorMissing) {
+		throw conciseFailure(
+			`Fleet run ${candidate.runId} (${candidate.lifecycle}) still claims this Herdr workspace with the overlapping worker prefix ${candidate.workerPrefix}, but its supervisor pane is missing; stop that run by its run ID from its Herdr coordinator before starting a replacement.`,
+		);
+	}
+	throw conciseFailure(
+		`Fleet run ${candidate.runId} (${candidate.lifecycle}) already observes this Herdr workspace with the overlapping worker prefix ${candidate.workerPrefix}; reuse that run or start with a non-overlapping prefix.`,
+	);
+}
+
 async function startFleet(
 	input: FleetActionInput,
 	dependencies: FleetControlDeps,
@@ -518,6 +585,7 @@ async function startFleet(
 	} catch {
 		throw conciseFailure("Herdr CLI is unavailable; fleet was not started.");
 	}
+	const store = createFleetStore(stateRoot, dependencies);
 
 	const createdAt = now.toISOString();
 	let manifest: RunManifest = {
@@ -539,17 +607,29 @@ async function startFleet(
 		agents: [],
 		reports: [],
 	};
-	const store = createFleetStore(stateRoot, dependencies);
 	try {
-		await store.createRun(manifest, state);
+		await store.withStartLock(async () => {
+			await assertNoOverlappingCohort(store, options, herdr, now);
+			try {
+				await store.createRun(manifest, state);
+			} catch (error) {
+				if (
+					error instanceof ProtocolStoreError &&
+					error.message ===
+						"manifest mutex container is not a regular directory"
+				) {
+					throw conciseFailure(
+						`Fleet state lock container at ${join(stateRoot, ".manifest-lock.sqlite")} must be a private directory.`,
+					);
+				}
+				throw conciseFailure(
+					"Fleet could not initialize its external run state.",
+				);
+			}
+		});
 	} catch (error) {
-		if (
-			error instanceof ProtocolStoreError &&
-			error.message === "manifest mutex container is not a regular directory"
-		) {
-			throw conciseFailure(
-				`Fleet state lock container at ${join(stateRoot, ".manifest-lock.sqlite")} must be a private directory.`,
-			);
+		if (error instanceof FleetControlError) {
+			throw error;
 		}
 		throw conciseFailure("Fleet could not initialize its external run state.");
 	}
@@ -993,7 +1073,7 @@ function statusText(
 		`Observations updated: ${state.updatedAt}`,
 		`Deadline: ${manifest.deadlineAt}`,
 		formatWorkerCounts(state.agents),
-		`Report budget: ${state.reports.length}/${REPORT_LIMIT}.`,
+		`Report budget: ${state.reports.length}/${REPORT_LIMIT} for this run.`,
 		"Fleet observes only; workers may still be running.",
 		"Fleet does not observe repository diffs or verify worker claims.",
 	];

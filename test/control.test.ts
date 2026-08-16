@@ -79,6 +79,7 @@ class MemoryFleetStore implements FleetStore {
 	readonly transitionManifestErrors: Array<Error | undefined> = [];
 	readStateError: Error | undefined;
 	appendEventError: Error | undefined;
+	listRunsError: Error | undefined;
 	controlLockAttemptEffect:
 		| ((runId: string) => void | Promise<void>)
 		| undefined;
@@ -86,12 +87,28 @@ class MemoryFleetStore implements FleetStore {
 	private controlMutexTail: Promise<void> = Promise.resolve();
 	private manifestMutexTail: Promise<void> = Promise.resolve();
 
+	private startMutexTail: Promise<void> = Promise.resolve();
 	constructor(readonly trace: string[] = []) {}
 
 	private async withManifestMutex<T>(action: () => Promise<T>): Promise<T> {
 		const previous = this.manifestMutexTail;
 		const gate = Promise.withResolvers<void>();
 		this.manifestMutexTail = previous.then(
+			() => gate.promise,
+			() => gate.promise,
+		);
+		await previous;
+		try {
+			return await action();
+		} finally {
+			gate.resolve();
+		}
+	}
+
+	private async withStartMutex<T>(action: () => Promise<T>): Promise<T> {
+		const previous = this.startMutexTail;
+		const gate = Promise.withResolvers<void>();
+		this.startMutexTail = previous.then(
 			() => gate.promise,
 			() => gate.promise,
 		);
@@ -185,6 +202,7 @@ class MemoryFleetStore implements FleetStore {
 
 	async listRuns(): Promise<RunManifest[]> {
 		this.trace.push("store.listRuns");
+		if (this.listRunsError !== undefined) throw this.listRunsError;
 		return [...this.manifests.values()];
 	}
 
@@ -206,6 +224,11 @@ class MemoryFleetStore implements FleetStore {
 		return await this.withControlMutex(async () => {
 			return await action(await this.readManifest(runId));
 		});
+	}
+
+	async withStartLock<T>(action: () => Promise<T>): Promise<T> {
+		this.trace.push("store.withStartLock");
+		return await this.withStartMutex(action);
 	}
 
 	async transitionManifest(
@@ -693,6 +716,8 @@ describe("fleet control", () => {
 		]);
 		expect(trace).toEqual([
 			"herdr.assertAvailable",
+			"store.withStartLock",
+			"store.listRuns",
 			"store.createRun",
 			"store.appendEvent:starting",
 			"store.readManifest:run-fixed-001",
@@ -887,6 +912,8 @@ describe("fleet control", () => {
 
 		expect(trace).toEqual([
 			"herdr.assertAvailable",
+			"store.withStartLock",
+			"store.listRuns",
 			"store.createRun",
 			"store.appendEvent:starting",
 			"store.readManifest:run-fixed-001",
@@ -1632,7 +1659,7 @@ describe("fleet control", () => {
 				"Observations updated: 2030-01-02T03:04:05.000Z",
 				"Deadline: 2030-01-02T09:04:05.000Z",
 				"Worker counts: 1 working, 1 blocked.",
-				`Report budget: 0/${REPORT_LIMIT}.`,
+				`Report budget: 0/${REPORT_LIMIT} for this run.`,
 				"Fleet observes only; workers may still be running.",
 				"Fleet does not observe repository diffs or verify worker claims.",
 				`- worker: ${agentHandle("worker-pane-beta")} → task: not observed → observed state: blocked → last activity: 2030-01-02T03:02:00.000Z`,
@@ -2086,7 +2113,7 @@ describe("fleet control", () => {
 		);
 		expect(result.reportCount).toBe(REPORT_LIMIT);
 		expect(result.text).toContain(
-			`Report budget: ${REPORT_LIMIT}/${REPORT_LIMIT}.`,
+			`Report budget: ${REPORT_LIMIT}/${REPORT_LIMIT} for this run.`,
 		);
 		expect(result.text).toContain("Report budget saturated");
 		const reportResult = await executeFleetAction(
@@ -3243,5 +3270,448 @@ describe("fleet control", () => {
 							),
 				),
 		).toBe(false);
+	});
+});
+
+describe("start overlap guard", () => {
+	const liveDeadlineAt = "2030-01-02T09:04:05.000Z";
+
+	function liveCandidate(
+		repoPath: string,
+		overrides: Partial<RunManifest> = {},
+	): RunManifest {
+		return makeManifest({
+			runId: "run-live-candidate",
+			lifecycle: "running",
+			workspaceId: "workspace-main",
+			repoPath,
+			coordinatorPaneId: "coordinator-main",
+			workerPrefix: "worker-",
+			createdAt: "2030-01-02T03:00:00.000Z",
+			updatedAt: "2030-01-02T03:00:00.000Z",
+			deadlineAt: liveDeadlineAt,
+			supervisorTabId: "live-supervisor-tab",
+			supervisorPaneId: "live-supervisor-pane",
+			supervisorCommand: "'live-supervisor-command'",
+			...overrides,
+		});
+	}
+
+	function liveConflictMessage(candidate: RunManifest): string {
+		return `Fleet run ${candidate.runId} (${candidate.lifecycle}) already observes this Herdr workspace with the overlapping worker prefix ${candidate.workerPrefix}; reuse that run or start with a non-overlapping prefix.`;
+	}
+
+	function preDispatchMessage(candidate: RunManifest): string {
+		return `Fleet run ${candidate.runId} (${candidate.lifecycle}) is already claiming this Herdr workspace with the overlapping worker prefix ${candidate.workerPrefix} and has not yet recorded a supervisor pane; re-check its status, or stop that run by its run ID from its Herdr coordinator before starting a replacement.`;
+	}
+
+	function assertNoStartSideEffects(
+		store: MemoryFleetStore,
+		herdr: FakeHerdr,
+	): void {
+		expect(store.createRunCalls).toEqual([]);
+		expect(store.appendEventCalls).toEqual([]);
+		expect(herdr.createSupervisorTabCalls).toEqual([]);
+	}
+
+	async function expectStartFailure({
+		repoPath,
+		stateRoot,
+		store,
+		herdr,
+		input = {},
+		message,
+	}: {
+		repoPath: string;
+		stateRoot: string;
+		store: MemoryFleetStore;
+		herdr: FakeHerdr;
+		input?: FleetActionInput;
+		message: string;
+	}): Promise<void> {
+		let failure: unknown;
+		try {
+			await executeFleetAction(
+				"start",
+				input,
+				controlDependencies(repoPath, stateRoot, store, herdr),
+			);
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(FleetControlError);
+		expect(failure).toEqual(expect.objectContaining({ message }));
+		assertNoStartSideEffects(store, herdr);
+	}
+
+	async function expectLiveConflict({
+		repoPath,
+		stateRoot,
+		store,
+		herdr,
+		candidate,
+		input = {},
+		message,
+	}: {
+		repoPath: string;
+		stateRoot: string;
+		store: MemoryFleetStore;
+		herdr: FakeHerdr;
+		candidate: RunManifest;
+		input?: FleetActionInput;
+		message?: string;
+	}): Promise<void> {
+		const expectedMessage = message ?? liveConflictMessage(candidate);
+		if (message === undefined) herdr.inspectedProcess = { kind: "ambiguous" };
+		store.manifests.set(candidate.runId, candidate);
+		await expectStartFailure({
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			input,
+			message: expectedMessage,
+		});
+	}
+
+	test("refuses an active identical cohort in the same workspace", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const candidate = liveCandidate(canonicalRepo, {
+			runId: "run-identical-cohort",
+		});
+
+		await expectLiveConflict({
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			candidate,
+		});
+	});
+
+	test("refuses lexical worker-prefix overlap in both directions", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		for (const { existingPrefix, requestedPrefix } of [
+			{ existingPrefix: "romcp-", requestedPrefix: "romcp-stack-" },
+			{ existingPrefix: "romcp-stack-", requestedPrefix: "romcp-" },
+		]) {
+			const store = new MemoryFleetStore();
+			const herdr = new FakeHerdr();
+			const candidate = liveCandidate(canonicalRepo, {
+				runId: `run-${existingPrefix.slice(0, -1)}`,
+				workerPrefix: existingPrefix,
+			});
+
+			await expectLiveConflict({
+				repoPath,
+				stateRoot,
+				store,
+				herdr,
+				candidate,
+				input: { workerPrefix: requestedPrefix },
+			});
+		}
+	});
+
+	test("refuses an overlapping cohort owned by a different coordinator pane", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const candidate = liveCandidate(canonicalRepo, {
+			runId: "run-other-coordinator",
+			coordinatorPaneId: "coordinator-other",
+		});
+
+		await expectLiveConflict({
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			candidate,
+		});
+	});
+
+	test("refuses an overlapping cohort that monitors a different repository", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const candidate = liveCandidate(join(canonicalRepo, "other-repository"), {
+			runId: "run-other-repository",
+		});
+
+		await expectLiveConflict({
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			candidate,
+		});
+	});
+
+	test("refuses starting candidates before and after supervisor ownership is recorded", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const candidate = liveCandidate(canonicalRepo, {
+			runId: "run-starting-candidate",
+			lifecycle: "starting",
+		});
+
+		await expectLiveConflict({
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			candidate,
+		});
+
+		const preDispatchStore = new MemoryFleetStore();
+		const preDispatchHerdr = new FakeHerdr();
+		const preDispatchCandidate = liveCandidate(canonicalRepo, {
+			runId: "run-starting-pre-dispatch",
+			lifecycle: "starting",
+		});
+		delete preDispatchCandidate.supervisorTabId;
+		delete preDispatchCandidate.supervisorPaneId;
+		delete preDispatchCandidate.supervisorCommand;
+
+		await expectLiveConflict({
+			repoPath,
+			stateRoot,
+			store: preDispatchStore,
+			herdr: preDispatchHerdr,
+			candidate: preDispatchCandidate,
+			message: preDispatchMessage(preDispatchCandidate),
+		});
+		expect(preDispatchHerdr.inspectPaneCalls).toEqual([]);
+	});
+
+	test("refuses a running candidate without a supervisor pane without inspection", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const candidate = liveCandidate(canonicalRepo, {
+			runId: "run-running-supervisor-missing",
+		});
+		delete candidate.supervisorTabId;
+		delete candidate.supervisorPaneId;
+		delete candidate.supervisorCommand;
+
+		await expectLiveConflict({
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			candidate,
+			message:
+				"Fleet run run-running-supervisor-missing (running) still claims this Herdr workspace with the overlapping worker prefix worker-, but its supervisor pane is missing; stop that run by its run ID from its Herdr coordinator before starting a replacement.",
+		});
+		expect(herdr.inspectPaneCalls).toEqual([]);
+	});
+
+	test("refuses a stopping candidate", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const candidate = liveCandidate(canonicalRepo, {
+			runId: "run-stopping-candidate",
+			lifecycle: "stopping",
+		});
+
+		await expectLiveConflict({
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			candidate,
+		});
+	});
+
+	test("allows terminal candidates to remain in the inventory", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		for (const lifecycle of ["stopped", "completed", "failed"] as const) {
+			const store = new MemoryFleetStore();
+			const herdr = new FakeHerdr();
+			const candidate = liveCandidate(canonicalRepo, {
+				runId: `run-terminal-${lifecycle}`,
+				lifecycle,
+			});
+			store.manifests.set(candidate.runId, candidate);
+
+			const result = await executeFleetAction(
+				"start",
+				{},
+				controlDependencies(repoPath, stateRoot, store, herdr),
+			);
+
+			expect(result).toMatchObject({
+				action: "start",
+				runId: "run-fixed-001",
+			});
+			expect(store.createRunCalls).toHaveLength(1);
+			expect(store.createRunCalls[0]?.manifest.runId).toBe("run-fixed-001");
+		}
+	});
+
+	test("allows non-overlapping prefixes in the same workspace", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const candidate = liveCandidate(canonicalRepo, {
+			runId: "run-base-prefix",
+			workerPrefix: "pd-base-",
+		});
+		store.manifests.set(candidate.runId, candidate);
+
+		const result = await executeFleetAction(
+			"start",
+			{ workerPrefix: "pd-cand-" },
+			controlDependencies(repoPath, stateRoot, store, herdr),
+		);
+
+		expect(result).toMatchObject({ action: "start", workerPrefix: "pd-cand-" });
+		expect(store.createRunCalls).toHaveLength(1);
+	});
+
+	test("allows an identical prefix in a different workspace", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const candidate = liveCandidate(canonicalRepo, {
+			runId: "run-other-workspace",
+			workspaceId: "workspace-other",
+		});
+		store.manifests.set(candidate.runId, candidate);
+
+		const result = await executeFleetAction(
+			"start",
+			{},
+			controlDependencies(repoPath, stateRoot, store, herdr),
+		);
+
+		expect(result).toMatchObject({ action: "start", runId: "run-fixed-001" });
+		expect(store.createRunCalls).toHaveLength(1);
+	});
+
+	test("allows a zombie candidate past its deadline without pane inspection", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const candidate = liveCandidate(canonicalRepo, {
+			runId: "run-zombie-past-deadline",
+			deadlineAt: new Date(FIXED_NOW.getTime() - 1).toISOString(),
+			supervisorTabId: "zombie-supervisor-tab",
+			supervisorPaneId: "zombie-supervisor-pane",
+			supervisorCommand: "'zombie-supervisor-command'",
+		});
+		store.manifests.set(candidate.runId, candidate);
+
+		const result = await executeFleetAction(
+			"start",
+			{},
+			controlDependencies(repoPath, stateRoot, store, herdr),
+		);
+
+		expect(result).toMatchObject({ action: "start", runId: "run-fixed-001" });
+		expect(store.createRunCalls).toHaveLength(1);
+		expect(herdr.inspectPaneCalls).toEqual([]);
+	});
+
+	test("refuses a blocking candidate whose supervisor pane is empty", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const canonicalRepo = await realpath(repoPath);
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const candidate = liveCandidate(canonicalRepo, {
+			runId: "run-supervisor-missing",
+			supervisorTabId: "missing-supervisor-tab",
+			supervisorPaneId: "missing-supervisor-pane",
+			supervisorCommand: "'missing-supervisor-command'",
+		});
+		herdr.inspectedProcess = { kind: "empty" };
+
+		await expectLiveConflict({
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			candidate,
+			message:
+				"Fleet run run-supervisor-missing (running) still claims this Herdr workspace with the overlapping worker prefix worker-, but its supervisor pane is missing; stop that run by its run ID from its Herdr coordinator before starting a replacement.",
+		});
+
+		expect(herdr.inspectPaneCalls).toEqual([
+			{
+				paneId: "missing-supervisor-pane",
+				workspaceId: "workspace-main",
+			},
+		]);
+	});
+
+	test("refuses when the run inventory cannot be read", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		store.listRunsError = new Error("inventory unavailable");
+
+		await expectStartFailure({
+			repoPath,
+			stateRoot,
+			store,
+			herdr,
+			message: "Fleet could not read the run inventory; start was refused.",
+		});
+	});
+
+	test("serializes concurrent starts with a valid pending-or-live refusal", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		herdr.inspectedProcess = { kind: "ambiguous" };
+		const dependencies = controlDependencies(repoPath, stateRoot, store, herdr);
+
+		const firstStart = executeFleetAction("start", {}, dependencies);
+		const secondStart = executeFleetAction("start", {}, dependencies);
+		const results = await Promise.allSettled([firstStart, secondStart]);
+
+		expect(
+			results.filter((result) => result.status === "fulfilled"),
+		).toHaveLength(1);
+		expect(
+			results.filter((result) => result.status === "rejected"),
+		).toHaveLength(1);
+		expect(store.createRunCalls).toHaveLength(1);
+		expect(herdr.createSupervisorTabCalls).toHaveLength(1);
+
+		const winner = store.createRunCalls[0]?.manifest;
+		expect(winner).toBeDefined();
+		if (winner === undefined) {
+			throw new Error("concurrent start did not record its winner");
+		}
+		const rejection = results.find((result) => result.status === "rejected");
+		expect(rejection).toBeDefined();
+		if (rejection === undefined || rejection.status !== "rejected") {
+			throw new Error("concurrent start did not reject its loser");
+		}
+		expect(rejection.reason).toBeInstanceOf(FleetControlError);
+		if (!(rejection.reason instanceof FleetControlError)) {
+			throw new Error("concurrent start rejected with the wrong error");
+		}
+		expect([preDispatchMessage(winner), liveConflictMessage(winner)]).toContain(
+			rejection.reason.message,
+		);
 	});
 });
