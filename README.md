@@ -55,10 +55,10 @@ the plugin-native `omp-fleet-supervision` skill installed with Fleet below.
 
 ## Install the plugin and skill
 
-Install the immutable v0.2.10 Git tag directly over HTTPS:
+Install the immutable v0.2.11 Git tag directly over HTTPS:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.2.10'
+omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.2.11'
 ```
 
 This single command installs both the Fleet extension and its packaged
