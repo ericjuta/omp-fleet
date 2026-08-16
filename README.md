@@ -55,10 +55,10 @@ the plugin-native `omp-fleet-supervision` skill installed with Fleet below.
 
 ## Install the plugin and skill
 
-Install the immutable v0.2.9 Git tag directly over HTTPS:
+Install the immutable v0.2.10 Git tag directly over HTTPS:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.2.9'
+omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.2.10'
 ```
 
 This single command installs both the Fleet extension and its packaged
@@ -152,9 +152,14 @@ For prompt-evaluation experiment design, see the
 ## Auto-handoff operating model
 
 The shared topology is **parent session → Herdr delegation → Fleet inside
-coordinator A**. Create coordinator and worker shells with `pane_split` from a
-live shell. Empty `tab_create` panes are not available shells; fail closed
-instead of injecting bash via hub or send-text. The recommended daily shape is one coordinator A, one captain
+coordinator A**. Create coordinator and worker shells with `pane_split` from an
+unoccupied interactive shell (repository cwd; no recognized agent on the
+source pane). Empty `tab_create` panes are not available shells.
+Occupied OMP/agent panes are not live shells: splitting them can show a fish
+prompt while `herdr_agent` start fails with `not an available shell`. A visual
+prompt is not eligibility; fail closed instead of injecting bash via hub or
+send-text.
+The recommended daily shape is one coordinator A, one captain
 prefix cohort, and one active Fleet supervisor per active repository. This is a
 convention, not enforcement: Fleet permits additional coordinators and
 concurrent runs.

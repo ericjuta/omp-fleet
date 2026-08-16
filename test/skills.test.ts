@@ -58,4 +58,28 @@ description:
 			}),
 		).toThrow(/Multiline implicit key/);
 	});
+
+	test("documents occupied agent panes are not available shells", async () => {
+		const skill = (
+			await Bun.file(
+				join(SKILLS_ROOT, "omp-fleet-supervision", "SKILL.md"),
+			).text()
+		).replace(/\s+/g, " ");
+		const readme = (
+			await Bun.file(join(dirname(SKILLS_ROOT), "README.md")).text()
+		).replace(/\s+/g, " ");
+
+		for (const body of [skill, readme]) {
+			expect(body).toContain("pane_split");
+			expect(body).toContain("tab_create");
+			expect(body).toContain("unoccupied interactive shell");
+			expect(body).toContain("not an available shell");
+			expect(body).toContain("Occupied OMP/agent panes are not live shells");
+		}
+
+		expect(skill).toContain(
+			"A fish prompt from `herdr_pane` `get`/`read` is not eligibility",
+		);
+		expect(readme).toContain("A visual prompt is not eligibility");
+	});
 });

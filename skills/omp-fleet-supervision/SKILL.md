@@ -137,9 +137,15 @@ Run this algorithm whenever case 3 or the handoff branch of case 4 applies:
    ambiguously owned agent, and never create a second coordinator merely
    because the first is slow.
 4. **Create when absent.** In the target workspace, create an available shell
-   pane with `herdr_layout` `pane_split` from a live shell (repository cwd),
-   then start one uniquely named OMP coordinator A with `herdr_agent`.
-   Empty `tab_create` panes are not available shells; fail closed instead of
+   pane with `herdr_layout` `pane_split` from an unoccupied interactive shell
+   (repository cwd; no recognized agent on that pane), then start one uniquely
+   named OMP coordinator A with `herdr_agent`. Empty `tab_create` panes are
+   not available shells. Occupied OMP/agent panes are not live shells:
+   `pane_split` from them can clone a visual fish prompt, cwd, and env dump,
+   but `herdr_agent` start still fails with `not an available shell`.
+   A fish prompt from `herdr_pane` `get`/`read` is not eligibility. If start fails
+   that way, do not retry the child or its siblings from the same occupied
+   source; split again from a proven unoccupied shell. Fail closed instead of
    injecting bash via hub or send-text. Layout always precedes agent start.
    If no target workspace exists and the repository is known, create the
    workspace with that cwd rather than asking the user to do it.
