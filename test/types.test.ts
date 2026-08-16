@@ -203,7 +203,7 @@ describe("start option validation", () => {
 describe("protocol identity invariants", () => {
 	test("pins protocol versions and canonical report identity to literals", () => {
 		expect(SCHEMA_VERSION).toBe(1);
-		expect(PLUGIN_VERSION).toBe("0.2.6");
+		expect(PLUGIN_VERSION).toBe("0.2.7");
 		expect(reportKey("pane-worker-17", "refs/heads/main", "done")).toBe(
 			"report-782f14e292a98a330a1f8340d6ea1f7417528ae896a24e2a8b9c9c86f111f6ba",
 		);
@@ -378,7 +378,7 @@ describe("protocol identity invariants", () => {
 
 describe("agent snapshot protocol", () => {
 	const observedAt = "2026-08-11T12:34:56.789Z";
-	const legacySnapshot = () => ({
+	const omittedActivitySnapshot = () => ({
 		paneId: "pane-worker-17",
 		workspaceId: "workspace-alpha",
 		name: "worker-alpha",
@@ -389,7 +389,7 @@ describe("agent snapshot protocol", () => {
 
 	test("accepts bounded task metadata and an explicit activity timestamp", () => {
 		const snapshot = {
-			...legacySnapshot(),
+			...omittedActivitySnapshot(),
 			taskTitle: "Implement snapshot activity metadata",
 			lastActivityAt: "2026-08-11T12:30:00.000Z",
 		};
@@ -399,10 +399,10 @@ describe("agent snapshot protocol", () => {
 		expect(snapshot.lastActivityAt).toBe("2026-08-11T12:30:00.000Z");
 	});
 
-	test("normalizes legacy snapshots in direct state and event parses", () => {
-		const direct = legacySnapshot();
-		const stateAgent = legacySnapshot();
-		const eventAgent = legacySnapshot();
+	test("defaults an omitted activity timestamp to observedAt in direct state and event parses", () => {
+		const direct = omittedActivitySnapshot();
+		const stateAgent = omittedActivitySnapshot();
+		const eventAgent = omittedActivitySnapshot();
 
 		expect(parseAgentSnapshot(direct).lastActivityAt).toBe(observedAt);
 		expect(
@@ -438,7 +438,7 @@ describe("agent snapshot protocol", () => {
 		]) {
 			expect(() =>
 				parseAgentSnapshot({
-					...legacySnapshot(),
+					...omittedActivitySnapshot(),
 					taskTitle,
 				}),
 			).toThrow(/agent\.taskTitle/);
@@ -447,7 +447,7 @@ describe("agent snapshot protocol", () => {
 		for (const lastActivityAt of ["", "not-a-timestamp", 42]) {
 			expect(() =>
 				parseAgentSnapshot({
-					...legacySnapshot(),
+					...omittedActivitySnapshot(),
 					lastActivityAt,
 				}),
 			).toThrow(/agent\.lastActivityAt/);

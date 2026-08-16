@@ -55,10 +55,10 @@ the plugin-native `omp-fleet-supervision` skill installed with Fleet below.
 
 ## Install the plugin and skill
 
-Install the immutable v0.2.6 Git tag directly over HTTPS:
+Install the immutable v0.2.7 Git tag directly over HTTPS:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.2.6'
+omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.2.7'
 ```
 
 This single command installs both the Fleet extension and its packaged
@@ -245,10 +245,11 @@ files live in a private root container, not in protocol run directories:
 - `notice-cursor.json` records which metadata events OMP has reconciled.
 - `reports/*.txt` starts with a visible untrusted-data warning and canonical metadata, followed by control-sanitized plain terminal text.
 
-JSON state writes and report publication are atomic. The private
-`.manifest-lock.sqlite/` container is `0700`, and each run's SQLite lock file is
-`0600`. A legacy file, symlink, or non-private object at the container path fails
-closed instead of allowing old and new lock domains to split. Manifest, state,
+JSON state writes and report publication are atomic. The
+`.manifest-lock.sqlite/` mutex container must be a private, real, directory-shaped
+object (`0700`); each run's SQLite lock file is `0600`. A file, symlink,
+non-directory, non-owner, or non-private object at the container path fails
+closed. Manifest, state,
 event, and report transactions for a run share that bounded OS-backed per-run
 lock, so same-run operations serialize across processes while unrelated runs
 proceed independently.
@@ -259,27 +260,6 @@ remain provenance only. Fleet does not copy the process environment. Reports
 can contain sensitive terminal text: they are private (`0600`), are not
 automatically redacted, are capped at 262144 UTF-8 bytes each, and are limited
 to 64 files per run.
-
-### Legacy v0.1 lock-file migration
-
-v0.1 used `.manifest-lock.sqlite` as a regular SQLite file. v0.2 requires that
-same path to be a private `0700` directory. Do not rename the mutex path or
-create a second lock domain.
-
-The operator command is `bun run migrate:legacy-lock` (optional
-`--state-root`). It queries live sidecar PIDs (`pgrep`), lock holders
-(`lsof`), and recorded supervisor panes (`herdr pane process-info`). Missing
-probes fail closed. Caller-supplied booleans are not proof.
-
-1. Query live sidecar PIDs, lock holders, and supervisor panes.
-2. Refuse if any of those lists is non-empty.
-3. Atomically archive the file to
-   `.manifest-lock.sqlite.v0.1-file-<UTC>` and `mkdir 0700` the container.
-4. No-op if the container is already a private directory. Refuse a symlink.
-
-This host already archived one leftover file to
-`.manifest-lock.sqlite.v0.1-file-20260814T142317Z`. Leave leftover run
-directories in place.
 
 ## Operational example
 
@@ -353,7 +333,7 @@ This lets a restarted OMP session catch up with an independently running sidecar
 
 ## Polling backend limitation
 
-The 0.2.0 supervisor still polls Herdr agent JSON and terminal output at the configured interval. It does not consume native Herdr events. The supervisor boundary keeps a backend seam so polling can be replaced by a future Herdr event backend without changing the durable run protocol.
+The supervisor polls Herdr agent JSON and terminal output at the configured interval. It does not consume native Herdr events. The supervisor boundary keeps a backend seam so polling can be replaced by a future Herdr event backend without changing the durable run protocol.
 
 ## Development
 

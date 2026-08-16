@@ -1218,8 +1218,8 @@ describe("fleet extension", () => {
 		expect(() =>
 			createFleetExtension({
 				control: controlDependencies(
-					"/tmp/omp-fleet-legacy-registration-repo",
-					"/tmp/omp-fleet-legacy-registration-state",
+					"/tmp/omp-fleet-registration-repo",
+					"/tmp/omp-fleet-registration-state",
 					store,
 					herdr,
 				),

@@ -68,7 +68,7 @@ const MANIFEST_MUTEX_BUSY_TIMEOUT_MS = 2_000;
 const CONTROL_MUTEX_ATTEMPT_TIMEOUT_MS = 0;
 const CONTROL_MUTEX_RETRY_DELAY_MS = 25;
 const CONTROL_MUTEX_QUEUE_TIMEOUT_MS = 60_000;
-const LEGACY_REPORT_TEMP_NAME =
+const STAGING_REPORT_TEMP_NAME =
 	/^\.agent-[a-f0-9]{12}-report-[a-f0-9]{64}\.txt\.[a-f0-9]{32}\.tmp$/;
 const REPORT_DIRECTORY_ENTRY_SCAN_LIMIT = REPORT_LIMIT * 2;
 
@@ -87,12 +87,6 @@ interface StoredReportEnvelope {
 export interface LifecycleTransition {
 	allowedFrom: readonly RunLifecycle[];
 	next: RunManifest;
-}
-
-export interface LegacyManifestLockMigrationEvidence {
-	readonly noSidecarPids: boolean;
-	readonly noLockHolders: boolean;
-	readonly missingSupervisorPanes: boolean;
 }
 
 function isForbiddenReportCodePoint(codePoint: number): boolean {
@@ -398,85 +392,6 @@ async function ensureManifestMutexDirectory(root: string): Promise<string> {
 		root,
 		"manifest mutex container",
 	);
-}
-
-function legacyManifestLockArchiveSuffix(now: Date): string {
-	if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
-		throw new ProtocolStoreError("legacy lock migration timestamp is invalid");
-	}
-	const iso = new Date(now.getTime()).toISOString();
-	return `${iso.slice(0, 19).replaceAll("-", "").replaceAll(":", "")}Z`;
-}
-
-/**
- * Replace the v0.1 single-file manifest mutex with the v0.2 private container.
- * The legacy file is retained under a timestamped sibling path.
- */
-export async function migrateLegacyManifestLockFile(
-	storeRoot: string,
-	evidence: LegacyManifestLockMigrationEvidence,
-	now = new Date(),
-): Promise<string | undefined> {
-	const root = new RunStore(storeRoot).root;
-	const rootEntry = await lstatIfPresent(root);
-	if (
-		rootEntry === undefined ||
-		!rootEntry.isDirectory() ||
-		rootEntry.isSymbolicLink()
-	) {
-		throw new ProtocolStoreError("store root is not a real directory");
-	}
-	const currentUserId =
-		typeof process.getuid === "function" ? process.getuid() : undefined;
-	if (currentUserId !== undefined && rootEntry.uid !== currentUserId) {
-		throw new ProtocolStoreError("store root is not owned by the current user");
-	}
-	if ((rootEntry.mode & 0o022) !== 0) {
-		throw new ProtocolStoreError(
-			"store root must not be group or other writable",
-		);
-	}
-
-	const mutexPath = resolve(root, MANIFEST_MUTEX_DIRECTORY);
-	assertContained(root, mutexPath, "manifest mutex container");
-	const entry = await lstatIfPresent(mutexPath);
-	if (entry?.isDirectory() === true && !entry.isSymbolicLink()) {
-		await ensureManifestMutexDirectory(root);
-		return undefined;
-	}
-	if (entry === undefined) {
-		throw new ProtocolStoreError("legacy manifest mutex file does not exist");
-	}
-	if (!entry.isFile() || entry.isSymbolicLink()) {
-		throw new ProtocolStoreError(
-			"legacy manifest mutex path is not a regular file",
-		);
-	}
-	if (
-		!isUnknownRecord(evidence) ||
-		evidence["noSidecarPids"] !== true ||
-		evidence["noLockHolders"] !== true ||
-		evidence["missingSupervisorPanes"] !== true
-	) {
-		throw new ProtocolStoreError(
-			"legacy manifest mutex migration requires no sidecar PIDs, no lock holders, and missing supervisor panes",
-		);
-	}
-
-	const archivePath = resolve(
-		root,
-		`${MANIFEST_MUTEX_DIRECTORY}.v0.1-file-${legacyManifestLockArchiveSuffix(now)}`,
-	);
-	assertContained(root, archivePath, "legacy manifest mutex archive");
-	if ((await lstatIfPresent(archivePath)) !== undefined) {
-		throw new ProtocolStoreError(
-			"legacy manifest mutex archive path already exists",
-		);
-	}
-	await rename(mutexPath, archivePath);
-	await mkdir(mutexPath, { mode: 0o700 });
-	await ensureManifestMutexDirectory(root);
-	return archivePath;
 }
 
 async function ensureControlMutexDirectory(root: string): Promise<string> {
@@ -1456,13 +1371,13 @@ export class RunStore {
 				);
 			}
 			if (
-				LEGACY_REPORT_TEMP_NAME.test(entry.name) &&
+				STAGING_REPORT_TEMP_NAME.test(entry.name) &&
 				entry.isFile() &&
 				!entry.isSymbolicLink()
 			) {
 				continue;
 			}
-			if (LEGACY_REPORT_TEMP_NAME.test(entry.name)) {
+			if (STAGING_REPORT_TEMP_NAME.test(entry.name)) {
 				throw new ProtocolStoreError("report artifact is not a regular file");
 			}
 			if (entries.length >= REPORT_LIMIT) {

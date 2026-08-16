@@ -540,34 +540,33 @@ async function startFleet(
 		reports: [],
 	};
 	const store = createFleetStore(stateRoot, dependencies);
-	let runCreated = false;
 	try {
 		await store.createRun(manifest, state);
-		runCreated = true;
-		manifest = await store.ensureLifecycle(runId);
 	} catch (error) {
-		if (runCreated) {
-			const failure = await persistFailedLifecycle(
-				store,
-				manifest,
-				"Fleet could not initialize its external run event log.",
-				dependencies,
-			);
-			throw conciseFailure(
-				failure.persisted
-					? `Fleet run ${runId} could not initialize and is marked failed.`
-					: "Fleet could not initialize or persist failure for its external run state.",
-			);
-		}
 		if (
 			error instanceof ProtocolStoreError &&
 			error.message === "manifest mutex container is not a regular directory"
 		) {
 			throw conciseFailure(
-				`Fleet found the leftover v0.1 SQLite lock file at ${join(stateRoot, ".manifest-lock.sqlite")}. Archive that legacy file only after proving no Fleet sidecar PID, lock holder, or supervisor pane is active.`,
+				`Fleet state lock container at ${join(stateRoot, ".manifest-lock.sqlite")} must be a private directory.`,
 			);
 		}
 		throw conciseFailure("Fleet could not initialize its external run state.");
+	}
+	try {
+		manifest = await store.ensureLifecycle(runId);
+	} catch {
+		const failure = await persistFailedLifecycle(
+			store,
+			manifest,
+			"Fleet could not initialize its external run event log.",
+			dependencies,
+		);
+		throw conciseFailure(
+			failure.persisted
+				? `Fleet run ${runId} could not initialize and is marked failed.`
+				: "Fleet could not initialize or persist failure for its external run state.",
+		);
 	}
 
 	let ownership:

@@ -23,9 +23,8 @@ exact-prefix Fleet observation. **observe** — Fleet's bounded role.
 capture.
 
 Use the installed OMP Fleet extension as the only supervisor implementation.
-Never invoke legacy `start-herdr-supervisor.sh` or
-`run-herdr-supervisor.sh` scripts. Do not add a second or overlapping
-supervisor, automatic worker launch as Fleet, automatic Fleet renewal,
+Do not add a second or overlapping supervisor, unmanaged supervision,
+automatic worker launch as Fleet, automatic Fleet renewal,
 grading, deployment, or background cleanup.
 
 Human `/fleet` commands: `README.md`. Detailed evaluation procedure:
@@ -158,7 +157,7 @@ Run this algorithm whenever case 3 or the handoff branch of case 4 applies:
 8. **Fail closed.** If layout, agent start, prompt delivery, coordinator
    identity, or result recovery fails, report that exact failure and that live
    coverage or stop completion is unproven. Do not call Herdr-only actions from
-   an ineligible parent, fall back to legacy scripts, infer success, auto-create
+   an ineligible parent, fall back to unmanaged supervision, infer success, auto-create
    another supervisor, or overlap a replacement. Inspect the known coordinator
    and durable status before deciding a retry is safe.
 

@@ -623,14 +623,13 @@ describe("fleet control", () => {
 		});
 	}
 
-	test("start names the leftover v0.1 SQLite manifest lock file", async () => {
+	test("start fails closed when the mutex container is not a private directory", async () => {
 		const { repoPath, stateRoot } = await fixturePaths();
 		const store = new MemoryFleetStore();
 		const herdr = new FakeHerdr();
 		store.createRunError = new ProtocolStoreError(
 			"manifest mutex container is not a regular directory",
 		);
-		const lockPath = join(await realpath(stateRoot), ".manifest-lock.sqlite");
 
 		await expect(
 			executeFleetAction(
@@ -639,7 +638,7 @@ describe("fleet control", () => {
 				controlDependencies(repoPath, stateRoot, store, herdr),
 			),
 		).rejects.toThrow(
-			`Fleet found the leftover v0.1 SQLite lock file at ${lockPath}. Archive that legacy file only after proving no Fleet sidecar PID, lock holder, or supervisor pane is active.`,
+			`Fleet state lock container at ${join(await realpath(stateRoot), ".manifest-lock.sqlite")} must be a private directory.`,
 		);
 		expect(herdr.createSupervisorTabCalls).toEqual([]);
 		expect(herdr.runInPaneCalls).toEqual([]);

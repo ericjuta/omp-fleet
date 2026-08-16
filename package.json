@@ -1,6 +1,6 @@
 {
 	"name": "@ericjuta/omp-fleet",
-	"version": "0.2.6",
+	"version": "0.2.7",
 	"description": "Bounded Herdr supervisor sidecar control for Oh My Pi",
 	"license": "MIT",
 	"type": "module",
@@ -35,7 +35,6 @@
 		"biome:check": "biome check .",
 		"biome:format": "biome format --write .",
 		"format": "bun run biome:format",
-		"migrate:legacy-lock": "bun src/migrate-lock-cli.ts",
 		"test": "bun test"
 	},
 	"devDependencies": {

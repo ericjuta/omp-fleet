@@ -116,9 +116,11 @@ function indexedReport(index: number): ReportRecord {
 	};
 }
 
-function legacyReportTempName(reportPath: string, hex: string): string {
+function stagingResidueTempName(reportPath: string, hex: string): string {
 	if (!/^[a-f0-9]{32}$/.test(hex)) {
-		throw new Error("legacy temp hex must be 32 lowercase hex characters");
+		throw new Error(
+			"staging residue temp hex must be 32 lowercase hex characters",
+		);
 	}
 	return `.${basename(reportPath)}.${hex}.tmp`;
 }
@@ -577,7 +579,7 @@ describe("RunStore", () => {
 		});
 	});
 
-	test("rejects legacy files and symlinks at the mutex container path", async () => {
+	test("rejects files and symlinks at the mutex container path", async () => {
 		await withStore(async ({ store, repoPath }) => {
 			const runId = "invalid-manifest-mutex-container";
 			const initial = makeManifest({ runId, repoPath });
@@ -595,7 +597,7 @@ describe("RunStore", () => {
 			expect(await readFile(sentinelPath, "utf8")).toBe("unchanged\n");
 
 			await rm(mutexDirectory);
-			await writeFile(mutexDirectory, "legacy sqlite file", {
+			await writeFile(mutexDirectory, "unsuitable mutex file", {
 				mode: 0o600,
 			});
 			await expect(store.writeManifest(initial)).rejects.toBeInstanceOf(
@@ -1139,12 +1141,12 @@ describe("RunStore", () => {
 		});
 	});
 
-	test("ignores bounded legacy pre-link residue without listing it as inventory", async () => {
+	test("ignores bounded staging pre-link residue without listing it as inventory", async () => {
 		await withStore(async ({ store, storeRoot, repoPath }) => {
-			const runId = "legacy-pre-link-residue";
+			const runId = "staging-pre-link-residue";
 			await store.createRun(makeManifest({ runId, repoPath }));
 			const reportsDirectory = join(storeRoot, runId, "reports");
-			const residueName = legacyReportTempName(
+			const residueName = stagingResidueTempName(
 				FIXED_REPORT.path,
 				"ab".repeat(16),
 			);
@@ -1173,15 +1175,15 @@ describe("RunStore", () => {
 		});
 	});
 
-	test("ignores bounded legacy post-link residue beside a published report", async () => {
+	test("ignores bounded staging post-link residue beside a published report", async () => {
 		await withStore(async ({ store, storeRoot, repoPath }) => {
-			const runId = "legacy-post-link-residue";
+			const runId = "staging-post-link-residue";
 			await store.createRun(makeManifest({ runId, repoPath }));
 			expect(
 				await store.writeReport(runId, FIXED_REPORT, "published\n"),
 			).toEqual(FIXED_REPORT);
 			const reportsDirectory = join(storeRoot, runId, "reports");
-			const residueName = legacyReportTempName(
+			const residueName = stagingResidueTempName(
 				FIXED_REPORT.path,
 				"cd".repeat(16),
 			);
@@ -1231,12 +1233,12 @@ describe("RunStore", () => {
 		});
 	});
 
-	test("rejects a legacy-named directory or symlink instead of skipping it", async () => {
+	test("rejects a staging-residue directory or symlink instead of skipping it", async () => {
 		await withStore(async ({ store, storeRoot, repoPath }) => {
-			const runId = "legacy-named-nonfile";
+			const runId = "staging-named-nonfile";
 			await store.createRun(makeManifest({ runId, repoPath }));
 			const reportsDirectory = join(storeRoot, runId, "reports");
-			const residueName = legacyReportTempName(
+			const residueName = stagingResidueTempName(
 				FIXED_REPORT.path,
 				"ef".repeat(16),
 			);
