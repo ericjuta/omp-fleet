@@ -474,12 +474,6 @@ function renderActionResult(result: FleetActionResult): string {
 	return `${metadataText}\n${FALSE_SUCCESS_WARNING}`;
 }
 
-interface NoticeCategory {
-	label: string;
-	details: string[];
-	actionable: boolean;
-}
-
 interface PendingRunNotice extends PendingCursor {
 	line: string;
 	eventCount: number;
@@ -540,20 +534,11 @@ function aggregateRunEvents(
 			reportForAgent.set(index, reportIndex);
 		}
 	}
-	const categories = new Map<string, NoticeCategory>();
-	const add = (
-		key: string,
-		label: string,
-		detail: string,
-		actionable: boolean,
-	): void => {
-		const category = categories.get(key);
-		if (category === undefined) {
-			categories.set(key, { label, details: [detail], actionable });
-		} else {
-			category.details.push(detail);
-			category.actionable ||= actionable;
-		}
+	const details: string[] = [];
+	let actionable = false;
+	const add = (detail: string, isActionable: boolean): void => {
+		details.push(detail);
+		actionable ||= isActionable;
 	};
 	for (let index = 0; index < events.length; index += 1) {
 		const event = events[index];
@@ -565,8 +550,6 @@ function aggregateRunEvents(
 			if (report === undefined || report.type !== "report")
 				throw new FleetControlError("Fleet event aggregation is invalid.");
 			add(
-				`worker-report:${event.agent.status}`,
-				`${event.agent.status} worker and report pairs`,
 				`${agentHandle(event.agent.paneId)} ${event.agent.status.toUpperCase()} observed${taskTitleSuffix(event)}; report ${report.report.path}`,
 				true,
 			);
@@ -574,16 +557,13 @@ function aggregateRunEvents(
 		}
 		switch (event.type) {
 			case "lifecycle": {
-				const actionable =
+				if (event.lifecycle === "starting" || event.lifecycle === "running")
+					break;
+				const isActionable =
 					event.lifecycle === "stopped" ||
 					event.lifecycle === "completed" ||
 					event.lifecycle === "failed";
-				add(
-					`lifecycle:${event.lifecycle}`,
-					`lifecycle ${event.lifecycle}`,
-					`lifecycle ${event.lifecycle}`,
-					actionable,
-				);
+				add(`lifecycle ${event.lifecycle}`, isActionable);
 				break;
 			}
 			case "agent": {
@@ -591,53 +571,44 @@ function aggregateRunEvents(
 				const suffix = taskTitleSuffix(event);
 				if (event.outcome === "readFailed") {
 					add(
-						`read-failed:${event.agent.status}`,
-						`read failures (last ${event.agent.status})`,
 						`${handle} read failed; last observed ${event.agent.status}${suffix}`,
 						true,
 					);
 					break;
 				}
-				const emphasized =
+				if (
+					event.agent.status !== "blocked" &&
+					event.agent.status !== "done" &&
+					event.agent.status !== "exited"
+				)
+					break;
+				const terminal =
 					event.agent.status === "blocked" || event.agent.status === "done";
-				const detail = `${handle} ${emphasized ? `${event.agent.status.toUpperCase()} observed` : `observed ${event.agent.status}`}${suffix}`;
-				const actionable =
-					event.agent.status === "blocked" ||
-					event.agent.status === "done" ||
-					event.agent.status === "exited";
 				add(
-					`agent:${event.agent.status}`,
-					`${event.agent.status} worker observations`,
-					detail,
-					actionable,
+					`${handle} ${terminal ? `${event.agent.status.toUpperCase()} observed` : `observed ${event.agent.status}`}${suffix}`,
+					true,
 				);
 				break;
 			}
 			case "report":
 				add(
-					`report:${event.report.status}`,
-					`${event.report.status} reports`,
 					`${agentHandle(event.report.paneId)} ${event.report.status.toUpperCase()} observed; report ${event.report.path}`,
 					true,
 				);
 		}
 	}
-	const values = [...categories.values()];
-	const fragments = values.map((category) =>
-		category.details.length === 1
-			? category.details[0]
-			: `${category.label} ×${category.details.length}`,
-	);
-	const recovery =
-		events.length > 1
-			? `; recovery: /fleet status ${runId}; /fleet reports ${runId}`
-			: "";
+	const verification = actionable
+		? `; Verify independently: /fleet status ${runId}; /fleet reports ${runId}`
+		: "";
 	return {
 		runId,
 		cursor,
 		eventCount: events.length,
-		actionable: values.some((category) => category.actionable),
-		line: `run ${runId}: ${events.length} event${events.length === 1 ? "" : "s"} across ${values.length} categor${values.length === 1 ? "y" : "ies"} — ${fragments.join("; ")}${recovery}`,
+		actionable,
+		line:
+			details.length === 0
+				? ""
+				: `run ${runId}: ${details.join("; ")}${verification}`,
 	};
 }
 
@@ -682,14 +653,14 @@ async function collectPendingNotice(
 				throw new FleetControlError(
 					"Fleet notice cursor is inconsistent with its event log.",
 				);
-			if (cursor < events.length)
-				candidates.push(
-					aggregateRunEvents(
-						manifest.runId,
-						events.slice(cursor),
-						events.length,
-					),
+			if (cursor < events.length) {
+				const candidate = aggregateRunEvents(
+					manifest.runId,
+					events.slice(cursor),
+					events.length,
 				);
+				if (candidate.line !== "") candidates.push(candidate);
+			}
 		} catch {
 			// A corrupt run is isolated so healthy run metadata can still reconcile.
 		}
@@ -717,7 +688,7 @@ async function collectPendingNotice(
 function noticeText(pending: PendingNotice): string {
 	return [
 		UNTRUSTED_METADATA_WARNING,
-		`Fleet supervisor metadata update (${pending.eventCount} new event${pending.eventCount === 1 ? "" : "s"}):`,
+		"Fleet supervisor observations:",
 		...pending.lines.map((line) => `- ${line}`),
 		FALSE_SUCCESS_WARNING,
 	].join("\n");

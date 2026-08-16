@@ -790,7 +790,7 @@ function isStaleWorker(
 	staleAfterMs: number,
 ): boolean {
 	return (
-		(agent.status === "working" || agent.status === "unknown") &&
+		agent.status === "unknown" &&
 		nowMs - Date.parse(agent.lastActivityAt) > staleAfterMs
 	);
 }

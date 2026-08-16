@@ -1576,8 +1576,8 @@ describe("fleet extension", () => {
 					customType: "omp-fleet-notice",
 					content: [
 						METADATA_WARNING,
-						"Fleet supervisor metadata update (1 new event):",
-						`- run run-match: 1 event across 1 category — ${agentHandle(matchingPaneId)} DONE observed; report ${matchingPath}`,
+						"Fleet supervisor observations:",
+						`- run run-match: ${agentHandle(matchingPaneId)} DONE observed; report ${matchingPath}; Verify independently: /fleet status run-match; /fleet reports run-match`,
 						FALSE_SUCCESS_WARNING,
 					].join("\n"),
 					display: true,
@@ -1728,9 +1728,7 @@ describe("fleet extension", () => {
 		expect(api.sentNotices).toHaveLength(1);
 		const firstNotice = api.sentNotices[0]?.message.content;
 		expect(firstNotice?.split("\n")[0]).toBe(METADATA_WARNING);
-		expect(firstNotice).toContain(
-			"Fleet supervisor metadata update (2 new events):",
-		);
+		expect(firstNotice).toContain("Fleet supervisor observations:");
 		expect(firstNotice).toContain(
 			`${agentHandle("worker-durable-blocked-pane")} BLOCKED observed; taskTitle="Investigate \\u002ftmp durable blocked transition"`,
 		);
@@ -1910,8 +1908,8 @@ describe("fleet extension", () => {
 		expect(content).toBe(
 			[
 				METADATA_WARNING,
-				"Fleet supervisor metadata update (3 new events):",
-				`- run ${runId}: 3 events across 3 categories — lifecycle stopping; ${agentHandle(paneId)} BLOCKED observed; ${agentHandle(paneId)} DONE observed; report ${path}; recovery: /fleet status ${runId}; /fleet reports ${runId}`,
+				"Fleet supervisor observations:",
+				`- run ${runId}: lifecycle stopping; ${agentHandle(paneId)} BLOCKED observed; ${agentHandle(paneId)} DONE observed; report ${path}; Verify independently: /fleet status ${runId}; /fleet reports ${runId}`,
 				FALSE_SUCCESS_WARNING,
 			].join("\n"),
 		);
@@ -2002,8 +2000,8 @@ describe("fleet extension", () => {
 		expect(firstContent).toBe(
 			[
 				METADATA_WARNING,
-				"Fleet supervisor metadata update (2 new events):",
-				`- run ${runId}: 2 events across 2 categories — lifecycle running; ${agentHandle(paneId)} DONE observed; report ${report.path}; recovery: /fleet status ${runId}; /fleet reports ${runId}`,
+				"Fleet supervisor observations:",
+				`- run ${runId}: ${agentHandle(paneId)} DONE observed; report ${report.path}; Verify independently: /fleet status ${runId}; /fleet reports ${runId}`,
 				FALSE_SUCCESS_WARNING,
 			].join("\n"),
 		);
@@ -2103,6 +2101,15 @@ describe("fleet extension", () => {
 				},
 			});
 		}
+		const healthyManifest = await store.readManifest(healthyRunId);
+		await store.ensureLifecycle(healthyRunId, {
+			allowedFrom: ["running"],
+			next: {
+				...healthyManifest,
+				lifecycle: "stopping",
+				updatedAt: "2030-01-02T04:01:00.000Z",
+			},
+		});
 		await writeFile(
 			join(stateRoot, corruptRunId, "notice-cursor.json"),
 			`${JSON.stringify({
@@ -2122,8 +2129,8 @@ describe("fleet extension", () => {
 		expect(api.sentNotices).toEqual([]);
 		const healthyContent = [
 			METADATA_WARNING,
-			"Fleet supervisor metadata update (1 new event):",
-			`- run ${healthyRunId}: 1 event across 1 category — lifecycle running`,
+			"Fleet supervisor observations:",
+			`- run ${healthyRunId}: lifecycle stopping`,
 			FALSE_SUCCESS_WARNING,
 		].join("\n");
 		const injected = requireNoticeMessage(
@@ -2170,7 +2177,7 @@ describe("fleet extension", () => {
 					"utf8",
 				),
 			),
-		).toEqual({ schemaVersion: 1, runId: healthyRunId, cursor: 1 });
+		).toEqual({ schemaVersion: 1, runId: healthyRunId, cursor: 2 });
 		await redeliveredApi.requireSessionShutdown()();
 
 		const restartedApi = installExtension({
@@ -2267,6 +2274,13 @@ describe("fleet extension", () => {
 			{
 				schemaVersion: 1,
 				runId,
+				timestamp: "2030-01-02T03:59:00.000Z",
+				type: "lifecycle",
+				lifecycle: "starting",
+			},
+			{
+				schemaVersion: 1,
+				runId,
 				timestamp: "2030-01-02T04:00:00.000Z",
 				type: "lifecycle",
 				lifecycle: "running",
@@ -2297,28 +2311,11 @@ describe("fleet extension", () => {
 		await api.requireSessionStart()({}, context.value);
 		expect(api.sentNotices).toEqual([]);
 		expect(cursorStore.writes).toEqual([]);
-		const passiveNotice = requireNoticeMessage(
-			await api.invokeBeforeAgentStart(context),
-		);
-		expect(passiveNotice.customType).toBe("omp-fleet-notice");
-		expect(passiveNotice.display).toBe(true);
-		expect(passiveNotice.attribution).toBe("agent");
-		expect(passiveNotice.details).toEqual({ deliveryId: opaqueDeliveryId() });
-		expect(passiveNotice.content).toContain("lifecycle running");
-		expect(passiveNotice.content).toContain("observed working");
+		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
 		expect(api.sentNotices).toEqual([]);
-		const replayedPassive = requireNoticeMessage(
-			await api.invokeBeforeAgentStart(context),
-		);
-		expect(replayedPassive.details?.deliveryId).toBe(
-			passiveNotice.details?.deliveryId,
-		);
 		await context.runInterval();
 		expect(api.sentNotices).toEqual([]);
 		expect(cursorStore.writes).toEqual([]);
-
-		await api.acknowledgeNotice(passiveNotice, context);
-		expect(cursorStore.writes).toEqual([{ runId, cursor: 2 }]);
 
 		store.events
 			.get(runId)
@@ -2338,19 +2335,22 @@ describe("fleet extension", () => {
 			triggerTurn: true,
 		});
 		expect(api.sentNotices[0]?.message.content).toContain("BLOCKED observed");
+		expect(api.sentNotices[0]?.message.content).not.toContain(
+			"lifecycle starting",
+		);
+		expect(api.sentNotices[0]?.message.content).not.toContain(
+			"lifecycle running",
+		);
 		expect(api.sentNotices[0]?.message.details).toEqual({
 			deliveryId: opaqueDeliveryId(),
 		});
-		expect(cursorStore.writes).toEqual([{ runId, cursor: 2 }]);
+		expect(cursorStore.writes).toEqual([]);
 
 		await api.acknowledgeNotice(
 			requireNoticeMessage(api.sentNotices[0]),
 			context,
 		);
-		expect(cursorStore.writes).toEqual([
-			{ runId, cursor: 2 },
-			{ runId, cursor: 3 },
-		]);
+		expect(cursorStore.writes).toEqual([{ runId, cursor: 4 }]);
 	});
 
 	test("a later actionable event carries an older deferred event before cursor advance", async () => {
@@ -2399,8 +2399,8 @@ describe("fleet extension", () => {
 
 		expect(api.sentNotices).toHaveLength(1);
 		const sent = requireNoticeMessage(api.sentNotices[0]);
-		expect(sent.content).toContain("2 new events");
-		expect(sent.content).toContain("lifecycle running");
+		expect(sent.content).toContain("Fleet supervisor observations:");
+		expect(sent.content).not.toContain("lifecycle running");
 		expect(sent.content).toContain("BLOCKED observed");
 		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
 		await api.acknowledgeNotice(sent, context);
@@ -2513,7 +2513,7 @@ describe("fleet extension", () => {
 				runId: passiveRunId,
 				timestamp: "2030-01-02T04:00:00.000Z",
 				type: "lifecycle",
-				lifecycle: "running",
+				lifecycle: "stopping",
 			},
 		]);
 		const cursorStore = new MemoryCursorStore();
@@ -2529,7 +2529,7 @@ describe("fleet extension", () => {
 			await api.invokeBeforeAgentStart(context),
 		);
 		expect(passiveNotice.content).toContain(`run ${passiveRunId}`);
-		expect(passiveNotice.content).toContain("lifecycle running");
+		expect(passiveNotice.content).toContain("lifecycle stopping");
 		expect(existsSync(context.sessionFile)).toBe(false);
 		expect(cursorStore.writes).toEqual([]);
 
@@ -2663,7 +2663,7 @@ describe("fleet extension", () => {
 			{ runId: "run-passive-mixed", cursor: 1 },
 		]);
 	});
-	test("matching done observation and report collapse within one bounded category line", async () => {
+	test("matching done observation and report collapse into one observation", async () => {
 		const { repoPath, stateRoot } = await fixturePaths();
 		const canonicalRepo = await realpath(repoPath);
 		const runId = "run-done-report-collapse";
@@ -2718,14 +2718,15 @@ describe("fleet extension", () => {
 		await api.requireSessionStart()({}, context.value);
 		const content = api.sentNotices[0]?.message.content ?? "";
 		expect(content.split("\n")).toHaveLength(4);
-		expect(content).toContain("3 events across 2 categories");
-		expect(content).toContain("lifecycle running");
+		expect(content).toContain("Fleet supervisor observations:");
+		expect(content).not.toContain("lifecycle running");
 		expect(content).toContain(
 			`${agentHandle(paneId)} DONE observed; taskTitle="Safe title"; report ${path}`,
 		);
 		expect(content.match(new RegExp(path, "g"))).toHaveLength(1);
-		expect(content).toContain(`/fleet status ${runId}`);
-		expect(content).toContain(`/fleet reports ${runId}`);
+		expect(content).toContain(
+			`Verify independently: /fleet status ${runId}; /fleet reports ${runId}`,
+		);
 		expect(content).not.toContain(RAW_REPORT_SENTINEL);
 		expect(content).not.toContain(workerName);
 		expect(content).not.toContain(revision);

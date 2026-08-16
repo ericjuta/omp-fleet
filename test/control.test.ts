@@ -1820,7 +1820,7 @@ describe("fleet control", () => {
 		expect(result.text).not.toContain("diff: not observed");
 	});
 
-	test("status marks only working or unknown agents beyond the cadence-aware stale boundary", async () => {
+	test("status marks only unknown agents beyond the cadence-aware stale boundary", async () => {
 		const { repoPath, stateRoot } = await fixturePaths();
 		const canonicalRepo = await realpath(repoPath);
 		const store = new MemoryFleetStore();
@@ -1841,9 +1841,10 @@ describe("fleet control", () => {
 				runId: lowerClampRunId,
 				agents: [
 					agentSnapshot({
-						paneId: "worker-boundary",
-						taskTitle: "at five minutes",
-						lastActivityAt: "2030-01-02T02:59:05.000Z",
+						paneId: "worker-working-old",
+						status: "working",
+						taskTitle: "old but working",
+						lastActivityAt: "2030-01-02T02:59:04.999Z",
 					}),
 					agentSnapshot({
 						paneId: "worker-stale",
@@ -1880,6 +1881,7 @@ describe("fleet control", () => {
 		expect(lowerRows[1]).toContain("observed state: unknown (possibly stale)");
 		expect(lowerRows[2]).toContain("observed state: done");
 		expect(lowerRows[3]).toContain("observed state: working");
+		expect(lowerRows[3]).not.toContain("possibly stale");
 		expect(lowerClamp.text).not.toMatch(/\b(?:restart|resume|stop|cleanup)\b/i);
 
 		const cadenceRunId = "run-stale-cadence";
@@ -1898,13 +1900,14 @@ describe("fleet control", () => {
 				runId: cadenceRunId,
 				agents: [
 					agentSnapshot({
-						paneId: "worker-cadence-boundary",
-						status: "unknown",
-						taskTitle: "at eight minutes",
-						lastActivityAt: "2030-01-02T02:56:05.000Z",
+						paneId: "worker-cadence-working",
+						status: "working",
+						taskTitle: "old but working",
+						lastActivityAt: "2030-01-02T02:56:04.999Z",
 					}),
 					agentSnapshot({
 						paneId: "worker-cadence-stale",
+						status: "unknown",
 						taskTitle: "over eight minutes",
 						lastActivityAt: "2030-01-02T02:56:04.999Z",
 					}),
@@ -1921,7 +1924,10 @@ describe("fleet control", () => {
 			.split("\n")
 			.filter((line) => line.startsWith("- worker:"));
 		expect(cadenceRows).toHaveLength(2);
-		expect(cadenceRows[0]).toContain("possibly stale");
+		expect(cadenceRows[0]).toContain(
+			"observed state: unknown (possibly stale)",
+		);
+		expect(cadenceRows[1]).toContain("observed state: working");
 		expect(cadenceRows[1]).not.toContain("possibly stale");
 	});
 
