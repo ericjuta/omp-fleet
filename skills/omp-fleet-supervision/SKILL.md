@@ -243,6 +243,15 @@ for direct operation; models use the tool. See `README.md`.
   to **6**.
 - `pollSeconds`: integer 15–600; default **30**
 
+### Status, reports, and stop parameters
+
+- Only `action` and optional `runId`. Omitting `runId` is implicit selection
+  (sole active, else newest terminal in scope), not every run.
+- Do not send `prefix`, `hours`, or `pollSeconds`. Those are start-only; the
+  control plane rejects them (`Fleet stop accepts only an optional runId.`,
+  same wording for `status` and `reports`).
+- Bounded stop still prefers the explicit run ID when one is known.
+
 After any resolution (reuse or start), record and reuse the **explicit run ID**
 for every later `status`, `reports`, and `stop`.
 
