@@ -1,6 +1,6 @@
 {
 	"name": "@ericjuta/omp-fleet",
-	"version": "0.2.7",
+	"version": "0.2.8",
 	"description": "Bounded Herdr supervisor sidecar control for Oh My Pi",
 	"license": "MIT",
 	"type": "module",

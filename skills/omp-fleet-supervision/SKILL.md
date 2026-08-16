@@ -1,6 +1,6 @@
 ---
 name: omp-fleet-supervision
-description:
+description: >-
   Use OMP Fleet to start, inspect, stop, or review reports for a bounded
   read-only Herdr worker supervisor. Use when asked to keep tabs on delegated
   agents, monitor a Herdr worker cohort, supervise a swarm, collect done or
