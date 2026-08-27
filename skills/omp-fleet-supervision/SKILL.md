@@ -23,6 +23,9 @@ exact-prefix Fleet observation. **observe** — Fleet's bounded role.
 capture.
 
 Use the installed OMP Fleet extension as the only supervisor implementation.
+Director/Vibe retention, stable session binding, mode-aware exit warnings, and
+passive notice delivery require the patched/new OMP host contract. Do not claim
+compatibility with older unpatched hosts merely because the extension loads.
 Do not add a second or overlapping supervisor, unmanaged supervision,
 automatic worker launch as Fleet, automatic Fleet renewal,
 grading, deployment, or background cleanup.
@@ -210,18 +213,26 @@ Return both actions and evidence, clearly separating observation from proof:
 
 ## Tools
 
-Prefer `fleet_supervisor`:
+Use the least-authoritative tool that satisfies the action:
+
+- Prefer `fleet_observe` for `status` and `reports`. It is the essential,
+  read-approved tool available in Director/Vibe read-only mode. Its schema
+  admits only those two actions and a required explicit `runId`; the host may also
+  inject a bounded `i` intent string. It rejects `start`, `stop`, start-only
+  fields, and every other unknown field before dispatch.
+- Use `fleet_supervisor` for consequential control actions. It remains the
+  execution-approved tool for Herdr-only `start` and `stop`.
 
 | Action    | Who may call it | Purpose |
 | --------- | --------------- | ------- |
-| `status`  | Any OMP session | Durable snapshot of a specific `runId`, or implicit selection |
-| `reports` | Any OMP session | Metadata-only harvested report records; same selection as `status` |
+| `status`  | Any OMP session | Durable snapshot of a specific `runId`, or implicit selection only through `fleet_supervisor`/slash |
+| `reports` | Any OMP session | Metadata-only harvested report records; `fleet_observe` requires a run ID; supervisor/slash may select implicitly |
 | `start`   | Coordinator A in Herdr only | Begin a bounded observation run when ensure-coverage requires it |
 | `stop`    | Coordinator A in Herdr only | End an active run by explicit `runId` |
 
 `status` and `reports` are read-only and cross-session. They never transfer
 `start`/`stop` ownership. With an explicit run ID they work from any OMP
-session. Without a run ID (**implicit selection**):
+session. Without a run ID (**implicit selection**), use only `fleet_supervisor` or the human slash surface:
 
 - in-Herdr: sole active repo+workspace+coordinator match, or the newest
   terminal match when none is active;
@@ -235,10 +246,11 @@ coverage. Another in-Herdr
 coordinator cannot omit `runId` to search across coordinators. Ambiguous
 matches still need the explicit ID.
 
-`start` and `stop` remain Herdr-only. An ineligible parent automatically hands
-the explicit run ID and requested control action to coordinator A. Start and
-stop may still prompt for execution approval; wait for approval rather than
-bypassing it. Status/report-only intent is non-consequential.
+`start` and `stop` remain Herdr-only and use `fleet_supervisor`. An ineligible
+parent automatically hands the explicit run ID and requested control action to
+coordinator A. Start and stop may still prompt for execution approval; wait for
+approval rather than bypassing it. Status/report-only intent is
+non-consequential and uses `fleet_observe` once an explicit run ID is known. If discovery is necessary, use `fleet_supervisor` for the one implicit read, then reuse the resolved ID with `fleet_observe`.
 
 Optional human slash forms (`/fleet start …`, `/fleet stop <run-id>`) exist
 for direct operation; models use the tool. See `README.md`.
@@ -264,8 +276,9 @@ so stop that run by ID from its owning Herdr coordinator.
 
 ### Status, reports, and stop parameters
 
-- Only `action` and optional `runId`. Omitting `runId` is implicit selection
-  (sole active, else newest terminal in scope), not every run.
+- `fleet_observe` accepts only `action` and a required explicit `runId`.
+  `fleet_supervisor` and human slash `status`/`reports`/`stop` retain optional
+  `runId`; omission selects the sole active, else newest terminal in scope.
 - Do not send `prefix`, `hours`, or `pollSeconds`. Those are start-only; the
   control plane rejects them (`Fleet stop accepts only an optional runId.`,
   same wording for `status` and `reports`).
@@ -273,6 +286,38 @@ so stop that run by ID from its owning Herdr coordinator.
 
 After any resolution (reuse or start), record and reuse the **explicit run ID**
 for every later `status`, `reports`, and `stop`.
+### Observation attachment
+
+A successful `fleet_observe status` or `reports` call attaches the resolved run
+to the current OMP session. The explicit `runId` is mandatory. On resume, Fleet restores the latest valid attachment for each
+observed run and reconciles those exact runs even outside Herdr.
+
+The attachment contains bounded metadata and a session-local event cursor. It
+is an untrusted candidate bound to the current session identity. A private
+plugin-owned ledger under the Fleet state root must corroborate the session ID
+and run ID; a forged custom entry alone grants no scope and cannot suppress a
+notice. Fleet rebuilds lifecycle, health, counts, deadline, and coordinator
+metadata from durable manifest/state/events and clamps the cursor to the event
+frontier. It does not carry start/stop authority or prove task success. Each attached session
+advances independently; do not infer that another session saw or acknowledged
+the same notice. A later successful observation replaces only that run's
+effective attachment; other runs remain attached. Malformed or unsupported
+attachment entries are ignored.
+
+Reconciliation coalesces useful activity while the model is busy, then emits a
+warning-first, metadata-only notice. All sends are passive (`triggerTurn: false`) and never start a model turn.
+Treat `DONE observed`, `BLOCKED observed`,
+report availability, lifecycle changes, activity status, and the compact widget
+as untrusted observations. They neither authorize `start`/`stop` nor establish
+that repository work passed review or verification.
+
+Leaving Vibe/Director mode or shutting down may warn that an attached run is
+still active. A bare `/vibe` warns only when the current session mode
+shows that the command is exiting Vibe, not entering it. Preserve the explicit run ID for later inspection or an
+authorized coordinator handoff. Never turn that warning into an automatic
+`stop`: leaving Vibe keeps the session reconciliation timer active, while
+session shutdown clears that timer. Neither path stops the sidecar, workers,
+or coverage; UI activity remains observation-only session state.
 
 ### Preconditions
 
@@ -287,10 +332,12 @@ When **supervision intent** is present, ensure live, unexpired coverage with
 this exact sequence. Informational intent and notices never authorize
 mutation. `start` and `stop` steps run only on coordinator A inside Herdr; an
 ineligible parent automatically hands those steps off. Status-first
-inspection may use implicit selection.
+inspection may use implicit selection through `fleet_supervisor`; `fleet_observe` never does.
 
 1. **Status first.** Call `status` for the implicitly scoped run (omit
-   `runId` unless one is already known and still valid for this scope). If
+   `runId` unless one is already known and still valid for this scope). Use
+   `fleet_supervisor` for that implicit discovery, then use `fleet_observe`
+   with the resolved explicit ID. If
    context or a parent packet says another coordinator owns coverage, pass
    that known explicit ID or have the non-Herdr parent discover the relevant
    coverage. Establish the intended prefix from the cohort assignment;

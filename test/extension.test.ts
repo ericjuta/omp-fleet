@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 import {
 	type FleetAction,
@@ -21,9 +21,14 @@ import {
 } from "../src/control.ts";
 import {
 	agentHandle,
+	createFileAttachmentLedger,
 	createFleetExtension,
+	createSessionNoticeCursorStore,
+	type FleetAttachmentLedger,
 	type FleetExtensionDeps,
 	type FleetNoticeCursorStore,
+	readSessionAttachments,
+	updateFleetActivity,
 } from "../src/extension.ts";
 import type {
 	CreatedSupervisorTab,
@@ -33,6 +38,8 @@ import type {
 import { RunStore } from "../src/store.ts";
 import {
 	type AgentSnapshot,
+	ATTACHMENT_CUSTOM_TYPE,
+	type FleetAttachment,
 	type ReportRecord,
 	type RunEvent,
 	type RunLifecycle,
@@ -42,6 +49,7 @@ import {
 	reportRelativePath,
 } from "../src/types.ts";
 import {
+	makeAttachment,
 	makeManifest,
 	makeState,
 	makeTempDirectory,
@@ -295,6 +303,48 @@ class MemoryCursorStore implements FleetNoticeCursorStore {
 		this.values.set(runId, cursor);
 	}
 }
+class MemoryAttachmentLedger implements FleetAttachmentLedger {
+	readonly values = new Map<string, Map<string, number>>();
+
+	async read(sessionId: string): Promise<Map<string, number>> {
+		return new Map(this.values.get(sessionId) ?? []);
+	}
+
+	async write(
+		sessionId: string,
+		runId: string,
+		cursor: number,
+		mode: "advance" | "replace" = "advance",
+	): Promise<number> {
+		const cursors = this.values.get(sessionId) ?? new Map<string, number>();
+		const nextCursor =
+			mode === "replace" ? cursor : Math.max(cursors.get(runId) ?? 0, cursor);
+		cursors.set(runId, nextCursor);
+		this.values.set(sessionId, cursors);
+		return nextCursor;
+	}
+	async writeAndCommit(
+		sessionId: string,
+		runId: string,
+		cursor: number,
+		commit: (persistedCursor: number) => void,
+	): Promise<number> {
+		const cursors = this.values.get(sessionId) ?? new Map<string, number>();
+		const hadPreviousCursor = cursors.has(runId);
+		const previousCursor = cursors.get(runId);
+		const persistedCursor = Math.max(previousCursor ?? 0, cursor);
+		cursors.set(runId, persistedCursor);
+		this.values.set(sessionId, cursors);
+		try {
+			commit(persistedCursor);
+			return persistedCursor;
+		} catch (error) {
+			if (hadPreviousCursor) cursors.set(runId, previousCursor as number);
+			else cursors.delete(runId);
+			throw error;
+		}
+	}
+}
 
 class FakeSchema {
 	description: string | undefined;
@@ -356,6 +406,8 @@ class FakeZod {
 	}
 }
 
+const FAKE_CONTEXT_OWNER = Symbol("fake-context-owner");
+
 interface TestNotification {
 	text: string;
 	level: string;
@@ -377,6 +429,7 @@ interface ToolRegistration {
 	description: string;
 	parameters: unknown;
 	approval: string;
+	directorMode?: string;
 	strict: boolean;
 	loadMode: string;
 	execute(
@@ -435,11 +488,23 @@ interface AgentEndEvent {
 	willContinue?: boolean;
 }
 
+interface InputEvent {
+	type: "input";
+	text: string;
+}
+
 type SessionStartHandler = (
 	event: unknown,
 	context: unknown,
 ) => void | Promise<void>;
-type SessionShutdownHandler = () => void | Promise<void>;
+type SessionShutdownHandler = (
+	event: unknown,
+	context: unknown,
+) => void | Promise<void>;
+type InputHandler = (
+	event: InputEvent,
+	context: unknown,
+) => void | Promise<void>;
 type BeforeAgentStartHandler = (
 	event: BeforeAgentStartEvent,
 	context: unknown,
@@ -507,8 +572,14 @@ class FakeExtensionApi {
 	};
 	commandName: string | undefined;
 	command: CommandRegistration | undefined;
-	tool: ToolRegistration | undefined;
+	readonly tools = new Map<string, ToolRegistration>();
 	readonly inputKeywords: string[] = [];
+	#entryContext: FakeExtensionContext | undefined;
+	constructor(private readonly directorTools = true) {}
+
+	supportsFeature(feature: string): boolean {
+		return this.directorTools && feature === "director-tools";
+	}
 
 	registerCommand(name: string, registration: unknown): void {
 		this.commandName = name;
@@ -516,7 +587,29 @@ class FakeExtensionApi {
 	}
 
 	registerTool(registration: unknown): void {
-		this.tool = registration as ToolRegistration;
+		const tool = registration as ToolRegistration;
+		const execute = tool.execute.bind(tool);
+		tool.execute = async (
+			toolCallId,
+			parameters,
+			signal,
+			onUpdate,
+			context,
+		) => {
+			const owner = (context as Record<PropertyKey, unknown>)[
+				FAKE_CONTEXT_OWNER
+			];
+			if (!(owner instanceof FakeExtensionContext))
+				throw new Error("fake tool context is unavailable");
+			const previous = this.#entryContext;
+			this.#entryContext = owner;
+			try {
+				return await execute(toolCallId, parameters, signal, onUpdate, context);
+			} finally {
+				this.#entryContext = previous;
+			}
+		};
+		this.tools.set(tool.name, tool);
 	}
 
 	registerInputKeyword(keyword: string): void {
@@ -534,15 +627,22 @@ class FakeExtensionApi {
 		});
 	}
 
+	appendEntry(customType: string, data: unknown): void {
+		if (this.#entryContext === undefined)
+			throw new Error("fake appendEntry context is unavailable");
+		this.#entryContext.entries.push({ type: "custom", customType, data });
+	}
+
 	requireCommand(): CommandRegistration {
 		if (this.command === undefined)
 			throw new Error("fleet command not registered");
 		return this.command;
 	}
 
-	requireTool(): ToolRegistration {
-		if (this.tool === undefined) throw new Error("fleet tool not registered");
-		return this.tool;
+	requireTool(name = "fleet_supervisor"): ToolRegistration {
+		const tool = this.tools.get(name);
+		if (tool === undefined) throw new Error(`${name} tool not registered`);
+		return tool;
 	}
 
 	requireSessionStart(): SessionStartHandler {
@@ -557,6 +657,11 @@ class FakeExtensionApi {
 		if (typeof handler !== "function")
 			throw new Error("session_shutdown not registered");
 		return handler as SessionShutdownHandler;
+	}
+	requireInput(): InputHandler {
+		const handler = this.handlers.get("input");
+		if (typeof handler !== "function") throw new Error("input not registered");
+		return handler as InputHandler;
 	}
 
 	requireBeforeAgentStart(): BeforeAgentStartHandler {
@@ -590,6 +695,28 @@ class FakeExtensionApi {
 	): Promise<NoticeMessage | undefined> {
 		const result = await this.requireBeforeAgentStart()(event, context.value);
 		return result?.message;
+	}
+	async invokeInput(
+		text: string,
+		context: FakeExtensionContext,
+	): Promise<void> {
+		await this.requireInput()({ type: "input", text }, context.value);
+	}
+
+	async invokeSessionShutdown(context: FakeExtensionContext): Promise<void> {
+		await this.requireSessionShutdown()(
+			{ type: "session_shutdown" },
+			context.value,
+		);
+	}
+	async invokeSessionTransition(
+		event: "session_switch" | "session_branch" | "session_tree",
+		context: FakeExtensionContext,
+	): Promise<void> {
+		const handler = this.handlers.get(event);
+		if (typeof handler !== "function")
+			throw new Error(`${event} not registered`);
+		await (handler as SessionStartHandler)({ type: event }, context.value);
 	}
 
 	async invokeMessageEnd(
@@ -635,29 +762,79 @@ interface SessionCustomMessageEntry {
 	attribution?: string;
 	details?: NoticeMessageDetails;
 }
+interface SessionCustomEntry {
+	type: "custom";
+	customType: string;
+	data: unknown;
+}
+interface SessionModeChangeEntry {
+	type: "mode_change";
+	mode: string;
+}
+
+interface StatusUpdate {
+	id: string;
+	text: string | undefined;
+}
+
+interface WidgetUpdate {
+	id: string;
+	content: readonly string[] | undefined;
+	options?: Readonly<Record<string, unknown>>;
+}
 
 class FakeExtensionContext {
 	readonly notifications: TestNotification[] = [];
 	readonly intervals: IntervalRegistration[] = [];
 	readonly clearedTimers: unknown[] = [];
-	readonly entries: SessionCustomMessageEntry[] = [];
+	readonly entries: Array<
+		SessionCustomMessageEntry | SessionCustomEntry | SessionModeChangeEntry
+	> = [];
+	readonly statusUpdates: StatusUpdate[] = [];
+	readonly widgetUpdates: WidgetUpdate[] = [];
 	readonly sessionFile: string;
 	idle = true;
 	pendingMessages = false;
 	journalError: Error | undefined;
+	sessionId = "session-test";
 	readonly value: Readonly<Record<string, unknown>>;
 
 	constructor(readonly cwd: string) {
 		this.sessionFile = join(cwd, "omp-fleet-test-session.jsonl");
 		this.value = {
+			[FAKE_CONTEXT_OWNER]: this,
 			cwd,
 			ui: {
 				notify: (text: string, level: string): void => {
 					this.notifications.push({ text, level });
 				},
+				setStatus: (id: string, text: string | undefined): void => {
+					this.statusUpdates.push({ id, text });
+				},
+				setWidget: (
+					id: string,
+					content: readonly string[] | undefined,
+					options?: Readonly<Record<string, unknown>>,
+				): void => {
+					this.widgetUpdates.push({
+						id,
+						content,
+						...(options === undefined ? {} : { options }),
+					});
+				},
 			},
 			sessionManager: {
-				getEntries: (): SessionCustomMessageEntry[] => [...this.entries],
+				getSessionId: (): string => this.sessionId,
+				getEntries: (): Array<
+					| SessionCustomMessageEntry
+					| SessionCustomEntry
+					| SessionModeChangeEntry
+				> => [...this.entries],
+				getBranch: (): Array<
+					| SessionCustomMessageEntry
+					| SessionCustomEntry
+					| SessionModeChangeEntry
+				> => [...this.entries],
 				getSessionFile: (): string => {
 					if (this.journalError !== undefined) throw this.journalError;
 					return this.sessionFile;
@@ -930,6 +1107,16 @@ function agentEvent(
 }
 
 describe("fleet extension", () => {
+	test("refuses hosts without Director tool retention before registration", () => {
+		const api = new FakeExtensionApi(false);
+		expect(() =>
+			createFleetExtension({})(api as unknown as ExtensionAPI),
+		).toThrow("OMP Fleet requires a host with Director tool retention.");
+		expect(api.commandName).toBeUndefined();
+		expect(api.tools.size).toBe(0);
+		expect(api.handlers.size).toBe(0);
+	});
+
 	test("registration uses the keyword API when the host exposes it", () => {
 		const store = new MemoryFleetStore();
 		const herdr = new FakeHerdr();
@@ -944,9 +1131,20 @@ describe("fleet extension", () => {
 
 		expect(api.commandName).toBe("fleet");
 		expect(api.requireTool().name).toBe("fleet_supervisor");
+		expect(api.requireTool("fleet_observe")).toMatchObject({
+			name: "fleet_observe",
+			approval: "read",
+			directorMode: "read-only",
+			strict: false,
+			loadMode: "essential",
+		});
 		expect(api.inputKeywords).toEqual(["fleet"]);
-		expect(api.zod.enumCalls).toEqual([["start", "status", "stop", "reports"]]);
+		expect(api.zod.enumCalls).toEqual([
+			["status", "reports"],
+			["start", "status", "stop", "reports"],
+		]);
 		expect(api.zod.objectFieldCalls).toEqual([
+			["action", "runId"],
 			["action", "hours", "pollSeconds", "prefix", "runId"],
 		]);
 		expect(api.requireTool()).toMatchObject({
@@ -957,8 +1155,12 @@ describe("fleet extension", () => {
 		expect([...api.handlers.keys()].sort()).toEqual([
 			"agent_end",
 			"before_agent_start",
+			"input",
+			"session_branch",
 			"session_shutdown",
 			"session_start",
+			"session_switch",
+			"session_tree",
 		]);
 		expect(store.runtimeCalls).toEqual([]);
 		expect(herdr.assertAvailableCalls).toEqual([]);
@@ -967,6 +1169,508 @@ describe("fleet extension", () => {
 		expect(herdr.inspectPaneCalls).toEqual([]);
 		expect(herdr.runInPaneCalls).toEqual([]);
 		expect(api.sentNotices).toEqual([]);
+	});
+
+	test("file attachment ledger serializes concurrent run updates and preserves monotonic cursors", async () => {
+		const stateRoot = await trackedTempDirectory(
+			"omp-fleet-attachment-ledger-",
+		);
+		const ledger = createFileAttachmentLedger(stateRoot);
+
+		const [firstCursor, secondCursor, retainedCursor] = await Promise.all([
+			ledger.write("session-race", "run-a", 3),
+			ledger.write("session-race", "run-b", 4),
+			ledger.write("session-race", "run-a", 2),
+		]);
+
+		expect({ firstCursor, secondCursor, retainedCursor }).toEqual({
+			firstCursor: 3,
+			secondCursor: 4,
+			retainedCursor: 3,
+		});
+		expect(Object.fromEntries(await ledger.read("session-race"))).toEqual({
+			"run-a": 3,
+			"run-b": 4,
+		});
+		expect(await ledger.write("session-race", "run-a", 1, "replace")).toBe(1);
+		expect(Object.fromEntries(await ledger.read("session-race"))).toEqual({
+			"run-a": 1,
+			"run-b": 4,
+		});
+		let concurrentWrite: Promise<number> | undefined;
+		await expect(
+			ledger.writeAndCommit("session-race", "run-a", 5, () => {
+				concurrentWrite = ledger.write("session-race", "run-a", 5);
+				throw new Error("cancelled commit");
+			}),
+		).rejects.toThrow("cancelled commit");
+		if (concurrentWrite === undefined)
+			throw new Error("write was not dispatched");
+		expect(await concurrentWrite).toBe(5);
+		expect(Object.fromEntries(await ledger.read("session-race"))).toEqual({
+			"run-a": 5,
+			"run-b": 4,
+		});
+	});
+
+	test("fleet_observe executes status and reports and persists the selected attachment", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const store = new MemoryFleetStore();
+		const herdr = new FakeHerdr();
+		const calls: Array<{
+			action: FleetAction;
+			input: FleetActionInput | undefined;
+		}> = [];
+		store.manifests.set(
+			"run-observe",
+			makeManifest({
+				runId: "run-observe",
+				repoPath,
+				workerPrefix: "worker-observe-",
+				coordinatorPaneId: "pane-observe",
+				lifecycle: "running",
+				createdAt: "2030-01-02T03:00:00.000Z",
+				deadlineAt: "2030-01-02T09:00:00.000Z",
+			}),
+		);
+		store.states.set(
+			"run-observe",
+			makeState({ runId: "run-observe", updatedAt: FIXED_NOW.toISOString() }),
+		);
+		store.events.set("run-observe", [
+			{
+				schemaVersion: 1,
+				runId: "run-observe",
+				timestamp: "2030-01-02T03:00:00.000Z",
+				type: "lifecycle",
+				lifecycle: "running",
+			},
+		]);
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, herdr),
+			executeAction: async (action, input) => {
+				calls.push({ action, input });
+				return {
+					action,
+					text: `Fleet ${action} observation.`,
+					runId: "run-observe",
+					lifecycle: "running",
+					workerPrefix: "worker-observe-",
+					coordinatorHandle: "agent-abcdef012345",
+					deadlineAt: "2030-01-02T09:00:00.000Z",
+					observationHealth: "current",
+					workerCount: 2,
+					reportCount: 1,
+				};
+			},
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+		const observe = api.requireTool("fleet_observe");
+
+		const status = await observe.execute(
+			"observe-status",
+			{ action: "status", runId: "run-observe", i: "Observing Fleet Status" },
+			new AbortController().signal,
+			() => {},
+			context.value,
+		);
+		await observe.execute(
+			"observe-reports",
+			{ action: "reports", runId: "run-observe", i: "Reading Fleet Reports" },
+			new AbortController().signal,
+			() => {},
+			context.value,
+		);
+
+		expect(calls).toStrictEqual([
+			{ action: "status", input: { runId: "run-observe" } },
+			{ action: "reports", input: { runId: "run-observe" } },
+		]);
+		expect(status.content[0]?.text).toContain(FALSE_SUCCESS_WARNING);
+		expect(context.entries).toEqual([
+			{
+				type: "custom",
+				customType: ATTACHMENT_CUSTOM_TYPE,
+				data: makeAttachment({
+					sessionId: "session-test",
+					runId: "run-observe",
+					workerPrefix: "worker-observe-",
+					coordinatorHandle: agentHandle("pane-observe"),
+					deadlineAt: "2030-01-02T09:00:00.000Z",
+					workerCount: 0,
+					reportCount: 0,
+					cursor: 1,
+				}),
+			},
+		]);
+		expect(context.statusUpdates.at(-1)).toEqual({
+			id: "fleet",
+			text: "fleet: 1 current coverage · observations only",
+		});
+		const shutdownContext = new FakeExtensionContext(repoPath);
+		await api.invokeSessionShutdown(shutdownContext);
+		expect(shutdownContext.notifications).toEqual([
+			{
+				level: "warning",
+				text: expect.stringContaining("run-observe"),
+			},
+		]);
+	});
+	test("fleet_observe does not attach a run after cancellation", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const store = new MemoryFleetStore();
+		const ledger = new MemoryAttachmentLedger();
+		store.manifests.set(
+			"run-cancelled-observe",
+			makeManifest({
+				runId: "run-cancelled-observe",
+				repoPath,
+				lifecycle: "running",
+			}),
+		);
+		store.states.set(
+			"run-cancelled-observe",
+			makeState({
+				runId: "run-cancelled-observe",
+				updatedAt: FIXED_NOW.toISOString(),
+			}),
+		);
+		store.events.set("run-cancelled-observe", []);
+
+		let releaseAction: (result: FleetActionResult) => void = () => {};
+		let markStarted: () => void = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const delayedResult = new Promise<FleetActionResult>((resolve) => {
+			releaseAction = resolve;
+		});
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			attachmentLedger: ledger,
+			executeAction: async () => {
+				markStarted();
+				return delayedResult;
+			},
+		});
+		const context = new FakeExtensionContext(repoPath);
+		const controller = new AbortController();
+		const pending = api
+			.requireTool("fleet_observe")
+			.execute(
+				"observe-cancelled",
+				{ action: "status", runId: "run-cancelled-observe" },
+				controller.signal,
+				() => {},
+				context.value,
+			);
+		await started;
+		controller.abort();
+		releaseAction({
+			action: "status",
+			text: "Cancelled observation result.",
+			runId: "run-cancelled-observe",
+			lifecycle: "running",
+		});
+
+		await expect(pending).rejects.toThrow("Fleet observation was cancelled.");
+		expect(context.entries).toEqual([]);
+		expect(await ledger.read("session-test")).toEqual(new Map());
+	});
+	test("fleet_observe restores the prior ledger cursor when cancelled during its write", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const runId = "run-ledger-write-cancelled";
+		const store = new MemoryFleetStore();
+		let releaseWrite: () => void = () => {};
+		let markWriteStarted: () => void = () => {};
+		const writeStarted = new Promise<void>((resolve) => {
+			markWriteStarted = resolve;
+		});
+		const writeReleased = new Promise<void>((resolve) => {
+			releaseWrite = resolve;
+		});
+		class DelayedAttachmentLedger extends MemoryAttachmentLedger {
+			override async writeAndCommit(
+				sessionId: string,
+				observedRunId: string,
+				cursor: number,
+				commit: (persistedCursor: number) => void,
+			): Promise<number> {
+				const cursors = this.values.get(sessionId) ?? new Map<string, number>();
+				const hadPreviousCursor = cursors.has(observedRunId);
+				const previousCursor = cursors.get(observedRunId);
+				const persistedCursor = await super.write(
+					sessionId,
+					observedRunId,
+					cursor,
+				);
+				markWriteStarted();
+				await writeReleased;
+				try {
+					commit(persistedCursor);
+					return persistedCursor;
+				} catch (error) {
+					if (hadPreviousCursor) {
+						cursors.set(observedRunId, previousCursor as number);
+					} else {
+						cursors.delete(observedRunId);
+					}
+					throw error;
+				}
+			}
+		}
+		const ledger = new DelayedAttachmentLedger();
+		ledger.values.set("session-test", new Map([[runId, 2]]));
+		store.manifests.set(
+			runId,
+			makeManifest({ runId, repoPath, lifecycle: "running" }),
+		);
+		store.states.set(
+			runId,
+			makeState({ runId, updatedAt: FIXED_NOW.toISOString() }),
+		);
+		store.events.set(
+			runId,
+			Array.from({ length: 5 }, (_, index) =>
+				agentEvent(
+					runId,
+					`worker-ledger-cancel-${index}`,
+					"done",
+					FIXED_NOW.toISOString(),
+				),
+			),
+		);
+		const api = installExtension({
+			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
+			attachmentLedger: ledger,
+			executeAction: async () => ({
+				action: "status",
+				text: "Observation whose ledger write is delayed.",
+				runId,
+				lifecycle: "running",
+			}),
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+		const controller = new AbortController();
+		const pending = api
+			.requireTool("fleet_observe")
+			.execute(
+				"observe-ledger-write-cancelled",
+				{ action: "status", runId },
+				controller.signal,
+				() => {},
+				context.value,
+			);
+		await writeStarted;
+		expect((await ledger.read("session-test")).get(runId)).toBe(5);
+		controller.abort();
+		releaseWrite();
+
+		await expect(pending).rejects.toThrow("Fleet observation was cancelled.");
+		expect((await ledger.read("session-test")).get(runId)).toBe(2);
+		expect(context.entries).toEqual([]);
+		const shutdownContext = new FakeExtensionContext(repoPath);
+		await api.invokeSessionShutdown(shutdownContext);
+		expect(shutdownContext.notifications).toEqual([]);
+	});
+
+	test("fleet_observe rejects control actions and extra fields before dispatch", async () => {
+		const calls: FleetAction[] = [];
+		const api = installExtension({
+			executeAction: async (action) => {
+				calls.push(action);
+				throw new Error("must not dispatch");
+			},
+		});
+		const context = new FakeExtensionContext(
+			"/tmp/omp-fleet-observe-rejection",
+		);
+		const execute = async (parameters: Record<string, unknown>) =>
+			api
+				.requireTool("fleet_observe")
+				.execute(
+					"observe-rejection",
+					parameters,
+					new AbortController().signal,
+					() => {},
+					context.value,
+				);
+
+		await expect(execute({ action: "start" })).rejects.toThrow(
+			"Fleet observe action must be status or reports.",
+		);
+		await expect(execute({ action: "stop" })).rejects.toThrow(
+			"Fleet observe action must be status or reports.",
+		);
+		await expect(execute({ action: "status" })).rejects.toThrow(
+			"Fleet observe runId must be a string.",
+		);
+		await expect(
+			execute({ action: "status", prefix: "worker-" }),
+		).rejects.toThrow("Fleet observe parameters contain an unknown field.");
+		await expect(
+			execute({ action: "reports", surprise: true }),
+		).rejects.toThrow("Fleet observe parameters contain an unknown field.");
+		expect(calls).toEqual([]);
+		expect(context.entries).toEqual([]);
+	});
+
+	test("attachment restore rejects forged scope, binds sessions, and clamps poisoned cursors", async () => {
+		const context = new FakeExtensionContext(
+			"/tmp/omp-fleet-attachment-resume",
+		);
+		const store = new MemoryFleetStore();
+		const ledger = new MemoryAttachmentLedger();
+		store.manifests.set(
+			"run-resume",
+			makeManifest({
+				runId: "run-resume",
+				repoPath: context.cwd,
+				coordinatorPaneId: "pane-resume",
+				lifecycle: "running",
+			}),
+		);
+		store.states.set("run-resume", makeState({ runId: "run-resume" }));
+		store.events.set("run-resume", [
+			{
+				schemaVersion: 1,
+				runId: "run-resume",
+				timestamp: FIXED_NOW.toISOString(),
+				type: "lifecycle",
+				lifecycle: "running",
+			},
+		]);
+		await ledger.write("session-test", "run-resume", 99);
+		context.entries.push(
+			{
+				type: "custom",
+				customType: ATTACHMENT_CUSTOM_TYPE,
+				data: makeAttachment({ runId: "run-forged", cursor: 0 }),
+			},
+			{
+				type: "custom",
+				customType: ATTACHMENT_CUSTOM_TYPE,
+				data: makeAttachment({
+					sessionId: "session-other",
+					runId: "run-resume",
+					cursor: 0,
+				}),
+			},
+			{
+				type: "custom",
+				customType: ATTACHMENT_CUSTOM_TYPE,
+				data: makeAttachment({ runId: "run-resume", cursor: 999 }),
+			},
+		);
+
+		const restored = await readSessionAttachments(
+			context.value as unknown as ExtensionContext,
+			ledger,
+			store,
+			FIXED_NOW,
+		);
+
+		expect([...restored.keys()]).toEqual(["run-resume"]);
+		expect(restored.get("run-resume")).toMatchObject({
+			sessionId: "session-test",
+			runId: "run-resume",
+			coordinatorHandle: agentHandle("pane-resume"),
+			lifecycle: "running",
+			cursor: 1,
+		});
+		expect((await ledger.read("session-test")).get("run-resume")).toBe(1);
+	});
+
+	test("attached sessions advance independent reconciliation cursors", async () => {
+		const firstContext = new FakeExtensionContext("/tmp/omp-fleet-session-one");
+		const secondContext = new FakeExtensionContext(
+			"/tmp/omp-fleet-session-two",
+		);
+		const firstAttachments = new Map<string, FleetAttachment>([
+			["run-shared", makeAttachment({ runId: "run-shared", cursor: 1 })],
+		]);
+		const secondAttachments = new Map<string, FleetAttachment>([
+			["run-shared", makeAttachment({ runId: "run-shared", cursor: 6 })],
+		]);
+		const firstLedger = new MemoryAttachmentLedger();
+		const secondLedger = new MemoryAttachmentLedger();
+		await firstLedger.write("session-test", "run-shared", 1);
+		await secondLedger.write("session-test", "run-shared", 6);
+		const firstStore = createSessionNoticeCursorStore(
+			firstAttachments,
+			firstLedger,
+		);
+		const secondStore = createSessionNoticeCursorStore(
+			secondAttachments,
+			secondLedger,
+		);
+
+		await firstStore.write("run-shared", 4);
+
+		expect(await firstStore.read("run-shared")).toBe(4);
+		expect(await secondStore.read("run-shared")).toBe(6);
+		expect(firstContext.entries).toEqual([]);
+		expect(secondContext.entries).toEqual([]);
+	});
+
+	test("activity status and widget expose only bounded observation metadata", () => {
+		const context = new FakeExtensionContext("/tmp/omp-fleet-activity");
+		const attachments = new Map<string, FleetAttachment>([
+			[
+				"run-activity",
+				makeAttachment({
+					runId: "run-activity",
+					workerPrefix: "worker-sensitive-",
+					coordinatorHandle: "agent-fedcba987654",
+					workerCount: 7,
+					reportCount: 3,
+				}),
+			],
+		]);
+
+		updateFleetActivity(
+			context.value as unknown as ExtensionContext,
+			attachments,
+		);
+
+		const visible = JSON.stringify({
+			status: context.statusUpdates,
+			widgets: context.widgetUpdates,
+		});
+		expect(visible).toContain("observations only");
+		expect(visible).toContain("not proof");
+		expect(visible).toContain("workers 7");
+		expect(visible).not.toContain("worker-sensitive-");
+		expect(visible).not.toContain("pane-sensitive-1234");
+		expect(visible).not.toContain("workspace");
+		expect(visible).not.toContain(RAW_REPORT_SENTINEL);
+	});
+	test("activity labels stale and overdue attachments as no current coverage", () => {
+		const context = new FakeExtensionContext("/tmp/omp-fleet-health-labels");
+		updateFleetActivity(
+			context.value as unknown as ExtensionContext,
+			new Map([
+				[
+					"run-stale",
+					makeAttachment({ runId: "run-stale", observationHealth: "stale" }),
+				],
+				[
+					"run-overdue",
+					makeAttachment({
+						runId: "run-overdue",
+						observationHealth: "overdue",
+					}),
+				],
+			]),
+		);
+
+		const status = context.statusUpdates.at(-1)?.text ?? "";
+		expect(status).toContain("no current coverage");
+		expect(status).toContain("stale");
+		expect(status).toContain("overdue");
+		expect(status).not.toContain("live");
 	});
 
 	test("tool execution accepts action-only payloads and rejects invalid optional fields", async () => {
@@ -993,7 +1697,7 @@ describe("fleet extension", () => {
 			.requireTool()
 			.execute(
 				"action-only-call",
-				{ action: "status" },
+				{ action: "status", i: "Observing Fleet Status" },
 				new AbortController().signal,
 				() => {},
 				context.value,
@@ -1086,11 +1790,20 @@ describe("fleet extension", () => {
 				"Use status/reports for read-only cross-session inspection. Without runId, an in-Herdr caller selects within the current repository, Herdr workspace, and coordinator; a non-Herdr caller selects repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active. Pass an explicit run ID when more than one active run matches the applicable scope, whenever the ID is known, or when context identifies a run owned by another coordinator. An in-Herdr no-match is only coordinator-scoped, not proof that no repository-wide run exists; use a known explicit ID or non-Herdr parent discovery. start requires a Herdr coordinator; stop requires the owning Herdr coordinator; outer sessions must hand off the run ID and requested control action. Worker states are observations, never proof of success.",
 			strict: false,
 		});
-		expect(api.zod.enumCalls).toEqual([["start", "status", "stop", "reports"]]);
+		expect(api.zod.enumCalls).toEqual([
+			["status", "reports"],
+			["start", "status", "stop", "reports"],
+		]);
 		expect(api.zod.objectFieldCalls).toEqual([
+			["action", "runId"],
 			["action", "hours", "pollSeconds", "prefix", "runId"],
 		]);
 		expect(api.zod.objectFieldDescriptions).toEqual([
+			{
+				action: "Read-only Fleet observation action.",
+				runId:
+					"Required explicit run ID to observe; fleet_observe never performs implicit selection.",
+			},
 			{
 				action:
 					"Read-only cross-session action (status/reports) or Herdr-only control action (start/stop).",
@@ -1446,30 +2159,220 @@ describe("fleet extension", () => {
 		expect(notification?.text.length).toBeLessThan(32_768);
 	});
 
-	test("managed reconciliation installs only in a valid Herdr session and shutdown clears its timer", async () => {
+	test("a verified explicit attachment takes precedence over Herdr coordinator scope", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const store = new MemoryFleetStore();
+		const attachedRunId = "run-attached-outside-herdr";
+		const unrelatedRunId = "run-unrelated-outside-herdr";
+		store.manifests.set(
+			attachedRunId,
+			makeManifest({
+				runId: attachedRunId,
+				repoPath: "/different/coordinator/repository",
+				workspaceId: "workspace-other",
+				coordinatorPaneId: "coordinator-other",
+				lifecycle: "running",
+			}),
+		);
+		store.manifests.set(
+			unrelatedRunId,
+			makeManifest({
+				runId: unrelatedRunId,
+				repoPath,
+				workspaceId: "workspace-current",
+				coordinatorPaneId: "coordinator-current",
+				lifecycle: "running",
+			}),
+		);
+		for (const runId of [attachedRunId, unrelatedRunId]) {
+			store.states.set(
+				runId,
+				makeState({ runId, updatedAt: FIXED_NOW.toISOString() }),
+			);
+		}
+		store.events.set(attachedRunId, [
+			agentEvent(
+				attachedRunId,
+				"worker-attached-sensitive-name",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		store.events.set(unrelatedRunId, [
+			agentEvent(
+				unrelatedRunId,
+				"worker-unrelated",
+				"done",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		const attachmentLedger = new MemoryAttachmentLedger();
+		await attachmentLedger.write("session-test", attachedRunId, 0);
+		const api = installExtension({
+			control: controlDependencies(
+				repoPath,
+				stateRoot,
+				store,
+				new FakeHerdr(),
+				{
+					env: {
+						HERDR_ENV: "1",
+						HERDR_WORKSPACE_ID: "workspace-current",
+						HERDR_PANE_ID: "coordinator-current",
+					},
+				},
+			),
+			attachmentLedger,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		context.entries.push({
+			type: "custom",
+			customType: ATTACHMENT_CUSTOM_TYPE,
+			data: makeAttachment({ runId: attachedRunId, cursor: 0 }),
+		});
+
+		await api.requireSessionStart()({}, context.value);
+
+		expect(context.intervals).toHaveLength(1);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(api.sentNotices[0]?.delivery).toEqual({
+			deliverAs: "nextTurn",
+			triggerTurn: false,
+		});
+		const notice = requireNoticeMessage(api.sentNotices[0]);
+		expect(notice.content).toContain(`run ${attachedRunId}`);
+		expect(notice.content).toContain("BLOCKED observed");
+		expect(notice.content).not.toContain(unrelatedRunId);
+		expect(notice.content).not.toContain("worker-attached-sensitive-name");
+		expect(notice.content).toContain(FALSE_SUCCESS_WARNING);
+	});
+
+	test("bare Vibe warns only on exit and shutdown remains non-destructive", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const actions: FleetAction[] = [];
+		const store = new MemoryFleetStore();
+		const ledger = new MemoryAttachmentLedger();
+		store.manifests.set(
+			"run-still-active",
+			makeManifest({
+				runId: "run-still-active",
+				repoPath,
+				lifecycle: "running",
+			}),
+		);
+		store.states.set(
+			"run-still-active",
+			makeState({
+				runId: "run-still-active",
+				updatedAt: FIXED_NOW.toISOString(),
+			}),
+		);
+		store.events.set("run-still-active", []);
+		await ledger.write("session-test", "run-still-active", 0);
+		const api = installExtension({
+			control: controlDependencies(
+				repoPath,
+				stateRoot,
+				store,
+				new FakeHerdr(),
+				{
+					env: {},
+				},
+			),
+			attachmentLedger: ledger,
+			executeAction: async (action) => {
+				actions.push(action);
+				throw new Error("control dispatch was not expected");
+			},
+		});
+		const context = new FakeExtensionContext(repoPath);
+		context.entries.push({
+			type: "custom",
+			customType: ATTACHMENT_CUSTOM_TYPE,
+			data: makeAttachment({ runId: "run-still-active" }),
+		});
+		await api.requireSessionStart()({}, context.value);
+
+		const entryContext = new FakeExtensionContext(repoPath);
+		entryContext.entries.push({ type: "mode_change", mode: "none" });
+		await api.invokeInput("/vibe", entryContext);
+		expect(entryContext.notifications).toHaveLength(0);
+
+		const exitContext = new FakeExtensionContext(repoPath);
+		exitContext.entries.push({ type: "mode_change", mode: "vibe" });
+		await api.invokeInput("  /vibe  ", exitContext);
+		const shutdownContext = new FakeExtensionContext(repoPath);
+		await api.invokeSessionShutdown(shutdownContext);
+
+		expect(actions).toEqual([]);
+		const notifications = [
+			...exitContext.notifications,
+			...shutdownContext.notifications,
+		];
+		expect(notifications).toHaveLength(2);
+		for (const notification of notifications) {
+			expect(notification.level).toBe("warning");
+			expect(notification.text).toContain("run-still-active");
+			expect(notification.text).toContain("were not stopped");
+		}
+	});
+	test("session switch branch and tree reinitialize timers, delivery state, scope, and UI", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const api = installExtension({
+			control: controlDependencies(
+				repoPath,
+				stateRoot,
+				new MemoryFleetStore(),
+				new FakeHerdr(),
+				{ env: {} },
+			),
+			attachmentLedger: new MemoryAttachmentLedger(),
+		});
+		const contexts = [
+			new FakeExtensionContext(repoPath),
+			new FakeExtensionContext(repoPath),
+			new FakeExtensionContext(repoPath),
+			new FakeExtensionContext(repoPath),
+		];
+		await api.requireSessionStart()({}, contexts[0]!.value);
+		await api.invokeSessionTransition("session_switch", contexts[1]!);
+		await api.invokeSessionTransition("session_branch", contexts[2]!);
+		await api.invokeSessionTransition("session_tree", contexts[3]!);
+
+		for (let index = 0; index < contexts.length - 1; index += 1) {
+			const context = contexts[index]!;
+			expect(context.clearedTimers).toEqual([context.intervals[0]!.handle]);
+			expect(context.statusUpdates.at(-1)).toEqual({
+				id: "fleet",
+				text: undefined,
+			});
+			expect(context.widgetUpdates.at(-1)).toEqual({
+				id: "fleet",
+				content: undefined,
+			});
+		}
+		expect(contexts[3]!.intervals).toHaveLength(1);
+		expect(api.sentNotices).toEqual([]);
+	});
+
+	test("managed reconciliation rejects malformed Herdr scope and shutdown clears its timer", async () => {
 		const { repoPath, stateRoot } = await fixturePaths();
 
-		for (const env of [
-			{
-				HERDR_ENV: "0",
-				HERDR_PANE_ID: "coordinator-main",
-				HERDR_WORKSPACE_ID: "workspace-main",
-			},
-			{ HERDR_ENV: "1", HERDR_PANE_ID: "coordinator-main" },
-		]) {
-			const store = new MemoryFleetStore();
-			const herdr = new FakeHerdr();
-			const api = installExtension({
-				control: controlDependencies(repoPath, stateRoot, store, herdr, {
-					env,
-				}),
-				cursorStore: new MemoryCursorStore(),
-			});
-			const context = new FakeExtensionContext(repoPath);
-			await api.requireSessionStart()({}, context.value);
-			expect(context.intervals).toEqual([]);
-			expect(store.runtimeCalls).toEqual([]);
-		}
+		const invalidStore = new MemoryFleetStore();
+		const invalidApi = installExtension({
+			control: controlDependencies(
+				repoPath,
+				stateRoot,
+				invalidStore,
+				new FakeHerdr(),
+				{ env: { HERDR_ENV: "1", HERDR_PANE_ID: "coordinator-main" } },
+			),
+			cursorStore: new MemoryCursorStore(),
+		});
+		const invalidContext = new FakeExtensionContext(repoPath);
+		await invalidApi.requireSessionStart()({}, invalidContext.value);
+		expect(invalidContext.intervals).toEqual([]);
+		expect(invalidStore.runtimeCalls).toEqual([]);
 
 		const store = new MemoryFleetStore();
 		const herdr = new FakeHerdr();
@@ -1485,9 +2388,9 @@ describe("fleet extension", () => {
 		expect(store.runtimeCalls).toEqual(["store.listRuns"]);
 		expect(api.sentNotices).toEqual([]);
 		const timerHandle = context.intervals[0]?.handle;
-		await api.requireSessionShutdown()();
+		await api.invokeSessionShutdown(context);
 		expect(context.clearedTimers).toEqual([timerHandle]);
-		await api.requireSessionShutdown()();
+		await api.invokeSessionShutdown(context);
 		expect(context.clearedTimers).toEqual([timerHandle]);
 	});
 
@@ -1589,7 +2492,7 @@ describe("fleet extension", () => {
 					attribution: "agent",
 					details: { deliveryId: opaqueDeliveryId() },
 				},
-				delivery: { deliverAs: "nextTurn", triggerTurn: true },
+				delivery: { deliverAs: "nextTurn", triggerTurn: false },
 			},
 		]);
 		const sentNotice = requireNoticeMessage(api.sentNotices[0]);
@@ -1626,9 +2529,13 @@ describe("fleet extension", () => {
 		expect(api.messageEndInvocations).toEqual([
 			exactNoticeMessageEndEvent(sentNotice),
 		]);
-		expect(context.entries.at(-1)?.details?.deliveryId).toBe(
-			"not-the-sent-delivery",
-		);
+		const lastEntry = context.entries.at(-1);
+		expect(lastEntry?.type).toBe("custom_message");
+		expect(
+			lastEntry?.type === "custom_message"
+				? lastEntry.details?.deliveryId
+				: undefined,
+		).toBe("not-the-sent-delivery");
 		expect(cursorStore.writes).toEqual([]);
 
 		const persisted = context.persistNotice(sentNotice);
@@ -1743,7 +2650,7 @@ describe("fleet extension", () => {
 		expect(firstNotice).toContain(`/fleet reports ${runId}`);
 		expect(api.sentNotices[0]?.delivery).toEqual({
 			deliverAs: "nextTurn",
-			triggerTurn: true,
+			triggerTurn: false,
 		});
 		expect(api.sentNotices[0]?.message.details).toEqual({
 			deliveryId: opaqueDeliveryId(),
@@ -1800,7 +2707,7 @@ describe("fleet extension", () => {
 		);
 		expect(api.sentNotices[1]?.delivery).toEqual({
 			deliverAs: "nextTurn",
-			triggerTurn: true,
+			triggerTurn: false,
 		});
 		expect(api.sentNotices[1]?.message.details).toEqual({
 			deliveryId: opaqueDeliveryId(),
@@ -1816,7 +2723,7 @@ describe("fleet extension", () => {
 			{ runId, cursor: 4 },
 		]);
 
-		await api.requireSessionShutdown()();
+		await api.invokeSessionShutdown(context);
 		expect(context.clearedTimers).toEqual([context.intervals[0]?.handle]);
 
 		const restartedApi = installExtension({
@@ -1828,7 +2735,7 @@ describe("fleet extension", () => {
 		await restartedApi.requireSessionStart()({}, restartedContext.value);
 		expect(restartedApi.sentNotices).toEqual([]);
 		expect(cursorStore.values.get(runId)).toBe(4);
-		await restartedApi.requireSessionShutdown()();
+		await restartedApi.invokeSessionShutdown(restartedContext);
 		expect(restartedContext.clearedTimers).toEqual([
 			restartedContext.intervals[0]?.handle,
 		]);
@@ -2026,7 +2933,7 @@ describe("fleet extension", () => {
 		expect(existsSync(join(stateRoot, runId, "notice-cursor.json"))).toBe(
 			false,
 		);
-		await firstApi.requireSessionShutdown()();
+		await firstApi.invokeSessionShutdown(firstContext);
 
 		const redeliveredApi = installExtension({
 			control: controlDependencies(
@@ -2042,7 +2949,7 @@ describe("fleet extension", () => {
 		expect(redeliveredApi.sentNotices[0]?.message.content).toBe(firstContent);
 		expect(redeliveredApi.sentNotices[0]?.delivery).toEqual({
 			deliverAs: "nextTurn",
-			triggerTurn: true,
+			triggerTurn: false,
 		});
 		expect(existsSync(join(stateRoot, runId, "notice-cursor.json"))).toBe(
 			false,
@@ -2061,7 +2968,7 @@ describe("fleet extension", () => {
 			runId: "run-file-backed-cursor",
 			cursor: 2,
 		});
-		await redeliveredApi.requireSessionShutdown()();
+		await redeliveredApi.invokeSessionShutdown(redeliveredContext);
 
 		const restartedApi = installExtension({
 			control: controlDependencies(
@@ -2077,7 +2984,7 @@ describe("fleet extension", () => {
 		expect(
 			await restartedApi.invokeBeforeAgentStart(restartedContext),
 		).toBeUndefined();
-		await restartedApi.requireSessionShutdown()();
+		await restartedApi.invokeSessionShutdown(restartedContext);
 	});
 
 	test("a malformed sibling file cursor cannot suppress or duplicate healthy run metadata", async () => {
@@ -2152,7 +3059,7 @@ describe("fleet extension", () => {
 		expect(
 			existsSync(join(stateRoot, healthyRunId, "notice-cursor.json")),
 		).toBe(false);
-		await api.requireSessionShutdown()();
+		await api.invokeSessionShutdown(context);
 
 		const redeliveredApi = installExtension({
 			control: controlDependencies(
@@ -2183,7 +3090,7 @@ describe("fleet extension", () => {
 				),
 			),
 		).toEqual({ schemaVersion: 1, runId: healthyRunId, cursor: 2 });
-		await redeliveredApi.requireSessionShutdown()();
+		await redeliveredApi.invokeSessionShutdown(redeliveredContext);
 
 		const restartedApi = installExtension({
 			control: controlDependencies(
@@ -2199,7 +3106,7 @@ describe("fleet extension", () => {
 		expect(
 			await restartedApi.invokeBeforeAgentStart(restartedContext),
 		).toBeUndefined();
-		await restartedApi.requireSessionShutdown()();
+		await restartedApi.invokeSessionShutdown(restartedContext);
 	});
 	test("tool details include every defined structured result field and reject malformed values", async () => {
 		const valid: FleetActionResult = {
@@ -2261,7 +3168,7 @@ describe("fleet extension", () => {
 		}
 	});
 
-	test("passive lifecycle and activity batches do not trigger turns but blocked updates do", async () => {
+	test("useful notice coalescing defers passive activity and triggers one turn for blocked work", async () => {
 		const { repoPath, stateRoot } = await fixturePaths();
 		const canonicalRepo = await realpath(repoPath);
 		const runId = "run-passive-signal";
@@ -2337,7 +3244,7 @@ describe("fleet extension", () => {
 		expect(api.sentNotices).toHaveLength(1);
 		expect(api.sentNotices[0]?.delivery).toEqual({
 			deliverAs: "nextTurn",
-			triggerTurn: true,
+			triggerTurn: false,
 		});
 		expect(api.sentNotices[0]?.message.content).toContain("BLOCKED observed");
 		expect(api.sentNotices[0]?.message.content).not.toContain(
@@ -2410,7 +3317,7 @@ describe("fleet extension", () => {
 		expect(await api.invokeBeforeAgentStart(context)).toBeUndefined();
 		await api.acknowledgeNotice(sent, context);
 		expect(cursorStore.writes).toEqual([{ runId, cursor: 2 }]);
-		await api.requireSessionShutdown()();
+		await api.invokeSessionShutdown(context);
 
 		const restartedApi = installExtension({
 			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
@@ -2568,7 +3475,7 @@ describe("fleet extension", () => {
 		expect(actionableNotice.content).not.toContain(`run ${passiveRunId}`);
 		expect(api.sentNotices[0]?.delivery).toEqual({
 			deliverAs: "nextTurn",
-			triggerTurn: true,
+			triggerTurn: false,
 		});
 		expect(cursorStore.writes).toEqual([]);
 
@@ -2634,7 +3541,7 @@ describe("fleet extension", () => {
 		);
 		expect(api.sentNotices[0]?.delivery).toEqual({
 			deliverAs: "nextTurn",
-			triggerTurn: true,
+			triggerTurn: false,
 		});
 		expect(api.sentNotices[0]?.message.details).toEqual({
 			deliveryId: opaqueDeliveryId(),
@@ -2738,7 +3645,7 @@ describe("fleet extension", () => {
 		expect(content).not.toContain(paneId);
 		expect(api.sentNotices[0]?.delivery).toEqual({
 			deliverAs: "nextTurn",
-			triggerTurn: true,
+			triggerTurn: false,
 		});
 		expect(api.sentNotices[0]?.message.details).toEqual({
 			deliveryId: opaqueDeliveryId(),
@@ -2785,7 +3692,7 @@ describe("fleet extension", () => {
 		expect(api.sentNotices).toHaveLength(1);
 		expect(api.sentNotices[0]?.delivery).toEqual({
 			deliverAs: "nextTurn",
-			triggerTurn: true,
+			triggerTurn: false,
 		});
 		const sent = requireNoticeMessage(api.sentNotices[0]);
 		expect(sent.content).toContain("BLOCKED observed");
@@ -2806,7 +3713,7 @@ describe("fleet extension", () => {
 		await context.runInterval();
 		expect(cursorStore.writes).toEqual([]);
 		expect(cursorStore.values.get(runId) ?? 0).toBe(0);
-		await api.requireSessionShutdown()();
+		await api.invokeSessionShutdown(context);
 
 		const restartedApi = installExtension({
 			control: controlDependencies(repoPath, stateRoot, store, new FakeHerdr()),
@@ -2818,14 +3725,14 @@ describe("fleet extension", () => {
 		expect(restartedApi.sentNotices[0]?.message.content).toBe(sent.content);
 		expect(restartedApi.sentNotices[0]?.delivery).toEqual({
 			deliverAs: "nextTurn",
-			triggerTurn: true,
+			triggerTurn: false,
 		});
 		expect(requireNoticeMessage(restartedApi.sentNotices[0]).details).toEqual({
 			deliveryId: opaqueDeliveryId(),
 		});
 		expect(cursorStore.writes).toEqual([]);
 		expect(cursorStore.values.get(runId) ?? 0).toBe(0);
-		await restartedApi.requireSessionShutdown()();
+		await restartedApi.invokeSessionShutdown(restartedContext);
 	});
 
 	test("an indeterminate send without a journal entry is recovered once without a second send", async () => {
@@ -3027,7 +3934,7 @@ describe("fleet extension", () => {
 		expect(next.details.deliveryId).not.toBe(sent.details.deliveryId);
 		expect(api.sentNotices[1]?.delivery).toEqual({
 			deliverAs: "nextTurn",
-			triggerTurn: true,
+			triggerTurn: false,
 		});
 		expect(next.content).toContain("BLOCKED observed");
 		expect(next.content).not.toBe(sent.content);

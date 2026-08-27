@@ -13,6 +13,7 @@ import {
 	PLUGIN_VERSION,
 	ProtocolValidationError,
 	parseAgentSnapshot,
+	parseFleetAttachment,
 	parseRunEvent,
 	parseRunState,
 	REPORT_LIMIT,
@@ -22,6 +23,7 @@ import {
 	type StartOptions,
 } from "../src/types.ts";
 import {
+	makeAttachment,
 	makeManifest,
 	makeTempDirectory,
 	removeTempDirectory,
@@ -373,6 +375,32 @@ describe("protocol identity invariants", () => {
 				reports,
 			}),
 		).toThrow(/at most 64 records/);
+	});
+});
+
+describe("Fleet session attachment protocol", () => {
+	test("accepts the bounded opaque observation snapshot", () => {
+		const attachment = makeAttachment({
+			runId: "run-attached",
+			coordinatorHandle: "agent-abc123def456",
+			observationHealth: "stale",
+			workerCount: 3,
+			reportCount: 2,
+			cursor: 17,
+		});
+
+		expect(parseFleetAttachment(attachment)).toBe(attachment);
+	});
+
+	test("rejects unsafe, unbounded, and authority-expanding attachment data", () => {
+		for (const attachment of [
+			makeAttachment({ cursor: -1 }),
+			makeAttachment({ reportCount: 65 }),
+			makeAttachment({ observationHealth: "verified" as "current" }),
+			{ ...makeAttachment(), workspaceId: "workspace-secret" },
+		]) {
+			expect(() => parseFleetAttachment(attachment)).toThrow();
+		}
 	});
 });
 

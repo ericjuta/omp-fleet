@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RunManifest, RunState } from "../src/types.ts";
+import type { FleetAttachment, RunManifest, RunState } from "../src/types.ts";
 
 const DEFAULT_RUN_ID = "20260811T000000000Z-0123456789abcdef0123456789abcdef";
 const DEFAULT_CREATED_AT = "2026-08-11T00:00:00.000Z";
@@ -60,6 +60,24 @@ export function makeState(overrides: Partial<RunState> = {}): RunState {
 		updatedAt: DEFAULT_CREATED_AT,
 		agents: [],
 		reports: [],
+		...overrides,
+	};
+}
+export function makeAttachment(
+	overrides: Partial<FleetAttachment> = {},
+): FleetAttachment {
+	return {
+		schemaVersion: 1,
+		sessionId: "session-test",
+		runId: DEFAULT_RUN_ID,
+		workerPrefix: "worker-",
+		coordinatorHandle: "agent-0123456789ab",
+		deadlineAt: "2026-08-11T06:00:00.000Z",
+		lifecycle: "running",
+		observationHealth: "current",
+		workerCount: 2,
+		reportCount: 1,
+		cursor: 0,
 		...overrides,
 	};
 }

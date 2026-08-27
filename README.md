@@ -9,7 +9,13 @@ Shared auto-handoff is parent-session composition through Herdr tooling, not a F
 Shared for every caller:
 
 - Bun 1.3.0 or newer
-- OMP 17.2.12 or newer
+- a patched/new OMP host exposing stable session identity, session mode, passive
+  `sendMessage(..., { triggerTurn: false })`, and Director essential-tool retention.
+  Fleet's Director retention and secure attachment restoration require this host
+  contract; compatibility with older unpatched OMP releases is not claimed.
+  The extension checks the `director-tools` host feature before registering and
+  fails closed when the behavior is unavailable.
+- a patched/new OMP build implementing the host contract above; a numeric legacy version floor alone is insufficient
 - an existing Git worktree as the current directory; its root must be an absolute path other than `/` or the user's home directory
 
 `start` and `stop` are Herdr-only. Those mutating actions also require:
@@ -115,17 +121,20 @@ Without `run-id`, `status` and `reports` use the implicit-selection split: an in
 
 ### Model tool
 
-The extension also registers `fleet_supervisor`, backed by the same implementation as `/fleet`. Its fields are:
+The extension registers two model tools backed by the same control-plane implementation but with separate authority:
+
+- `fleet_observe` is the essential, read-only inspection surface. It is available in Director/Vibe read-only tool sets and accepts only `status` or `reports` plus a required explicit `runId`.
+- `fleet_supervisor` remains the execution-approved control surface for Herdr-only `start`/`stop` as well as explicit control-plane inspection. Keep using it for consequential control actions.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `action` | `"start" | "status" | "stop" | "reports"` | Required action |
-| `runId` | string | Optional for `status`, `stop`, and `reports`; rejected for `start` |
+| `runId` | string | Required by `fleet_observe`; optional for `fleet_supervisor` `status`/`stop`/`reports`; rejected by `fleet_supervisor start` |
 | `prefix` | string | Optional worker-name prefix for `start` |
 | `hours` | integer | Optional bounded duration for `start`; raw omission defaults to 6 hours, while open-ended skill policy sends 24 explicitly |
 | `pollSeconds` | integer | Optional polling interval for `start` |
 
-The tool requires execution approval. Start-only fields are rejected for all other actions. `start` and `stop` remain Herdr-only. `status` and `reports` may use an explicit `runId` from any session. Without `runId`, an in-Herdr caller selects within the current repository, Herdr workspace, and coordinator; a non-Herdr caller selects repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active; they still need an explicit `runId` when more than one active run matches that scope, and should use a known ID when another coordinator owns coverage.
+`fleet_supervisor` requires execution approval. `fleet_observe` requires only read approval and rejects `start`, `stop`, start-only fields, and unknown fields before action dispatch. Both parsers accept the host-injected bounded `i` intent string but do not use it for action selection. `start` and `stop` remain Herdr-only. `fleet_observe` always requires an explicit `runId`. Only `fleet_supervisor` and the human slash surface retain implicit `status`/`reports` selection. Explicit `runId` inspection works from any session.
 
 ### Model skill (recommended)
 
@@ -182,6 +191,33 @@ notice alone is not authorization for a consequential start or stop.
 Natural-language intent does not bypass safety controls: `start` and `stop` may
 still present an execution-approval prompt. Status/report-only inspection is
 read-only and never mutates **coverage**.
+### Session attachment lifecycle
+
+A successful `fleet_observe status` or `fleet_observe reports` call attaches
+that run to the current OMP session by appending a private schema-1 custom
+entry. The custom entry is an untrusted candidate bound to the current session ID. Fleet also writes a private plugin-owned ledger under the Fleet state root; scope is restored only when the entry and ledger agree. The effective snapshot is rebuilt from durable manifest, state, and event data. The entry stores only bounded Fleet metadata: explicit run ID, worker
+prefix, opaque coordinator handle, deadline, lifecycle, observation health,
+worker/report counts, and that session's event cursor. It does not contain
+workspace or pane IDs, raw worker names, revisions, report paths or bodies,
+terminal text, prompts, or any claim that the work succeeded.
+
+On resume, Fleet restores the latest valid attachment for each observed run
+from the session journal. A forged custom entry alone grants no scope and cannot suppress notices. Cursor values are taken from the private ledger and clamped to the durable event frontier. A later successful observation replaces only that
+run's effective attachment; other runs remain attached. Malformed or
+unsupported entries are ignored. The attachment is inspection
+state, not control authority: it never starts, renews, stops, or transfers
+ownership of a run.
+
+An attached session reconciles its exact run even when the session is outside
+Herdr. This avoids repository-wide ambiguity and lets a Director/Vibe session
+continue read-only observation after restart. Use an explicit `runId` to attach
+the intended run whenever it is known, especially when another coordinator
+owns coverage. Each attached session advances its own private session-bound cursor; it does
+not consume another OMP session's notices or the coordinator-scoped cursor.
+
+Fleet may present a compact activity status and widget for the attachment.
+Those surfaces contain sanitized, bounded metadata only. They never expose raw
+Herdr identity, report content, or untrusted worker text.
 
 Restarting OMP in the same coordinator A pane and repository keeps the same run
 scope: reconciliation catches up with the independently running sidecar rather
@@ -348,9 +384,16 @@ workers, see the
 
 ## Restart reconciliation
 
-On `session_start` inside Herdr, the extension installs a managed 30-second reconciliation timer. That notice path scans durable events for runs matching the current repository and coordinator pane; it is not the read-only `status`/`reports` sole-active-else-newest-terminal path. If OMP is busy or has pending messages, notices remain queued and are coalesced. Automatic reconciliation delivery runs only when OMP is idle: it then sends one warning-first, metadata-only `nextTurn` notice and advances the durable cursor. A malformed run or cursor is isolated from healthy runs. Session shutdown clears the timer.
+On `session_start`, the extension installs a managed 30-second reconciliation timer. `session_switch`, `session_branch`, and `session_tree` clear the old UI, timer, pending deliveries, cursor binding, and attachment scope before binding the new session. A verified attached session follows its exact run, including outside Herdr, and advances the attachment's session-local cursor. An unattached in-Herdr session uses the coordinator-scoped durable cursor and scans runs matching the current repository and coordinator pane. This notice path is distinct from implicit `status`/`reports` selection. If OMP is busy or has pending messages, observations remain queued. When OMP is idle, reconciliation coalesces useful changes into one warning-first, metadata-only notice rather than emitting one turn per event. A malformed run, attachment, or cursor is isolated from healthy runs.
 
-Idle notices stay warning-first and observation-only. Lines retain opaque handles; agent events may include a task title when Herdr supplied one; report events label observed status explicitly without a task title field. Terminal worker transitions use `BLOCKED observed` / `DONE observed`. Notices never claim verified success, never embed report bodies, and never authorize start/stop by themselves.
+Idle notices stay warning-first and observation-only. Every notice send is passive (`triggerTurn: false`) and cannot autonomously start a model turn. Lines retain opaque handles; agent events may include a task title when Herdr supplied one; report events label observed status explicitly without a task title field. Terminal worker transitions use `BLOCKED observed` / `DONE observed`. Notices never claim verified success, never embed report bodies, and never authorize start/stop by themselves.
+Leaving Vibe/Director mode warns when an attached run may still be active; the
+session-scoped reconciliation timer remains active. Session shutdown emits the
+same warning and clears that local timer. UI activity is observation-only
+session state. Both warnings name the explicit run ID needed for later
+inspection or coordinator-owned stop. Exit and shutdown do
+not call `stop`, terminate the sidecar, renew the deadline, or touch workers.
+The warning is informational and does not itself authorize a control action.
 
 This lets a restarted OMP session catch up with an independently running sidecar without replaying raw names, revisions, absolute paths, or report contents, and without launching another supervisor. Reconciliation reports observations only and does not verify worker success.
 

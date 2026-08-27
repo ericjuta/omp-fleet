@@ -29,6 +29,31 @@ export const AGENT_STATUSES = [
 export type AgentStatus = (typeof AGENT_STATUSES)[number];
 export type HarvestStatus = Extract<AgentStatus, "blocked" | "done">;
 
+export const OBSERVATION_HEALTHS = [
+	"current",
+	"stale",
+	"overdue",
+	"terminal",
+] as const;
+
+export type ObservationHealth = (typeof OBSERVATION_HEALTHS)[number];
+
+export const ATTACHMENT_CUSTOM_TYPE = "omp-fleet-attachment" as const;
+
+export interface FleetAttachment {
+	schemaVersion: typeof SCHEMA_VERSION;
+	sessionId: string;
+	runId: string;
+	workerPrefix: string;
+	coordinatorHandle: string;
+	deadlineAt: string;
+	lifecycle: RunLifecycle;
+	observationHealth: ObservationHealth;
+	workerCount: number;
+	reportCount: number;
+	cursor: number;
+}
+
 export interface StartOptions {
 	workspaceId: string;
 	repoPath: string;
@@ -120,6 +145,7 @@ export type UnknownRecord = Record<string, unknown>;
 const ISO_TIMESTAMP =
 	/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const AGENT_HANDLE = /^agent-[a-f0-9]{12}$/;
 const REPORT_PATH = /^reports\/agent-[a-f0-9]{12}-report-[a-f0-9]{64}\.txt$/;
 export function containsControlCharacter(value: string): boolean {
 	for (let index = 0; index < value.length; index += 1) {
@@ -202,7 +228,19 @@ const EVENT_BASE_FIELDS = [
 	"timestamp",
 	"type",
 ] as const;
-
+const ATTACHMENT_REQUIRED_FIELDS = [
+	"schemaVersion",
+	"sessionId",
+	"runId",
+	"workerPrefix",
+	"coordinatorHandle",
+	"deadlineAt",
+	"lifecycle",
+	"observationHealth",
+	"workerCount",
+	"reportCount",
+	"cursor",
+] as const;
 export function isUnknownRecord(value: unknown): value is UnknownRecord {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -355,6 +393,19 @@ export function assertAgentStatus(
 			throw new ProtocolValidationError("invalid agent status");
 	}
 }
+export function assertObservationHealth(
+	value: unknown,
+): asserts value is ObservationHealth {
+	switch (value) {
+		case "current":
+		case "stale":
+		case "overdue":
+		case "terminal":
+			return;
+		default:
+			throw new ProtocolValidationError("invalid observation health");
+	}
+}
 
 export function normalizeAgentStatus(value: unknown): AgentStatus {
 	if (typeof value !== "string") {
@@ -407,6 +458,14 @@ export function assertOpaqueId(
 		throw new ProtocolValidationError(
 			`${label} must not have surrounding whitespace`,
 		);
+	}
+}
+export function assertAgentHandle(
+	value: unknown,
+	label = "agentHandle",
+): asserts value is string {
+	if (typeof value !== "string" || !AGENT_HANDLE.test(value)) {
+		throw new ProtocolValidationError(`${label} is not a safe opaque handle`);
 	}
 }
 
@@ -772,6 +831,45 @@ export function assertRunEvent(value: unknown): asserts value is RunEvent {
 
 export function parseRunEvent(value: unknown): RunEvent {
 	assertRunEvent(value);
+	return value;
+}
+export function assertFleetAttachment(
+	value: unknown,
+): asserts value is FleetAttachment {
+	const record = readRecord(value, "attachment", ATTACHMENT_REQUIRED_FIELDS);
+	assertSchemaVersion(record["schemaVersion"]);
+	assertOpaqueId(record["sessionId"], "attachment.sessionId");
+	assertRunId(record["runId"]);
+	assertWorkerPrefix(record["workerPrefix"]);
+	assertAgentHandle(
+		record["coordinatorHandle"],
+		"attachment.coordinatorHandle",
+	);
+	assertIsoTimestamp(record["deadlineAt"], "attachment.deadlineAt");
+	assertRunLifecycle(record["lifecycle"]);
+	assertObservationHealth(record["observationHealth"]);
+	assertIntegerInRange(
+		record["workerCount"],
+		"attachment.workerCount",
+		0,
+		Number.MAX_SAFE_INTEGER,
+	);
+	assertIntegerInRange(
+		record["reportCount"],
+		"attachment.reportCount",
+		0,
+		REPORT_LIMIT,
+	);
+	assertIntegerInRange(
+		record["cursor"],
+		"attachment.cursor",
+		0,
+		Number.MAX_SAFE_INTEGER,
+	);
+}
+
+export function parseFleetAttachment(value: unknown): FleetAttachment {
+	assertFleetAttachment(value);
 	return value;
 }
 

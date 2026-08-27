@@ -37,6 +37,8 @@ import {
 	formatTaskTitleForDisplay,
 	generateRunId,
 	isTerminalLifecycle,
+	OBSERVATION_HEALTHS,
+	type ObservationHealth,
 	PLUGIN_VERSION,
 	REPORT_LIMIT,
 	type RunLifecycle,
@@ -45,6 +47,9 @@ import {
 	SCHEMA_VERSION,
 	type StartOptions,
 } from "./types.ts";
+
+export type { ObservationHealth };
+export { OBSERVATION_HEALTHS };
 
 const DEFAULT_WORKER_PREFIX = "worker-";
 const DEFAULT_DURATION_SECONDS = 6 * 60 * 60;
@@ -77,19 +82,12 @@ export interface FleetActionResult {
 	runId: string;
 	lifecycle: RunLifecycle;
 	workerPrefix?: string;
+	coordinatorHandle?: string;
 	deadlineAt?: string;
 	observationHealth?: ObservationHealth;
 	workerCount?: number;
 	reportCount?: number;
 }
-
-export const OBSERVATION_HEALTHS = [
-	"current",
-	"stale",
-	"overdue",
-	"terminal",
-] as const;
-export type ObservationHealth = (typeof OBSERVATION_HEALTHS)[number];
 
 export type FleetStore = Pick<
 	RunStore,
@@ -798,7 +796,7 @@ function observationStaleAfterMs(pollSeconds: number): number {
 	return Math.min(20 * 60, Math.max(5 * 60, pollSeconds * 2)) * 1_000;
 }
 
-function deriveObservationHealth(
+export function deriveObservationHealth(
 	manifest: RunManifest,
 	state: RunState,
 	now: Date,
@@ -931,6 +929,7 @@ function manifestActionResult(
 		runId: manifest.runId,
 		lifecycle: manifest.lifecycle,
 		workerPrefix: manifest.workerPrefix,
+		coordinatorHandle: agentHandle(manifest.coordinatorPaneId),
 		deadlineAt: manifest.deadlineAt,
 		...extras,
 	};

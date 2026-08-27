@@ -1,6 +1,13 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat, readFile, rename, rm, writeFile } from "node:fs/promises";
+import {
+	lstat,
+	mkdir,
+	readFile,
+	rename,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -12,6 +19,7 @@ import type {
 
 import {
 	createFleetStore,
+	deriveObservationHealth,
 	executeFleetAction,
 	FLEET_ACTIONS,
 	type FleetAction,
@@ -25,21 +33,29 @@ import {
 	resolveFleetStateRoot,
 } from "./control.ts";
 import {
+	ATTACHMENT_CUSTOM_TYPE,
 	agentHandle,
+	assertAgentHandle,
+	assertFleetAttachment,
 	assertIsoTimestamp,
 	assertOpaqueId,
 	assertRunEvent,
 	assertRunId,
 	assertRunLifecycle,
+	assertRunManifest,
+	assertRunState,
 	assertWorkerPrefix,
+	type FleetAttachment,
 	formatTaskTitleForDisplay,
+	isTerminalLifecycle,
 	isUnknownRecord,
 	REPORT_LIMIT,
 	type RunEvent,
+	type RunManifest,
 	SCHEMA_VERSION,
 } from "./types.ts";
 
-export { agentHandle };
+export { ATTACHMENT_CUSTOM_TYPE, agentHandle };
 
 const COMMAND_USAGE =
 	"Usage: /fleet start [--prefix worker-] [--hours 6] [--poll-seconds 30] | /fleet status|stop|reports [run-id]. start requires a Herdr coordinator; stop requires the owning Herdr coordinator. status/reports are read-only across sessions. Without run-id, an in-Herdr caller selects within the current repository, Herdr workspace, and coordinator; a non-Herdr caller selects repository-wide across coordinators. Each scope selects its sole active run, or its newest terminal run when none is active. Multiple active matches in the applicable scope require an explicit run ID. An in-Herdr no-match is only coordinator-scoped, not proof that no repository-wide run exists; use a known explicit ID or non-Herdr parent discovery when another coordinator owns coverage. From another session, hand off start/stop to the appropriate Herdr coordinator.";
@@ -57,10 +73,16 @@ const COMMAND_LINE_BREAK = /[\0\r\n]/;
 const POSITIVE_INTEGER = /^(?:0|[1-9]\d*)$/;
 const TOOL_PARAMETER_FIELDS: Record<string, true> = {
 	action: true,
+	i: true,
 	runId: true,
 	prefix: true,
 	hours: true,
 	pollSeconds: true,
+};
+const OBSERVE_TOOL_PARAMETER_FIELDS: Record<string, true> = {
+	action: true,
+	i: true,
+	runId: true,
 };
 const NOTICE_CURSOR_FIELDS: Record<string, true> = {
 	schemaVersion: true,
@@ -68,6 +90,8 @@ const NOTICE_CURSOR_FIELDS: Record<string, true> = {
 	cursor: true,
 };
 const NOTICE_CURSOR_FILE = "notice-cursor.json";
+const ATTACHMENT_LEDGER_DIRECTORY = ".attachment-ledger";
+const attachmentLedgerMutationTails = new Map<string, Promise<void>>();
 const NOTICE_CUSTOM_TYPE = "omp-fleet-notice";
 const NOTICE_DELIVERY_ID_FIELD = "deliveryId";
 const OBSERVATION_HEALTH_VALUES = new Set(OBSERVATION_HEALTHS);
@@ -84,10 +108,52 @@ export interface FleetToolParameters {
 	hours?: number;
 	pollSeconds?: number;
 }
+export interface FleetObserveToolParameters {
+	action: Extract<FleetAction, "status" | "reports">;
+	runId: string;
+}
+
+type DirectorToolDefinition = Parameters<ExtensionAPI["registerTool"]>[0] & {
+	directorMode: "read-only";
+};
+type DirectorToolHostApi = ExtensionAPI & {
+	supportsFeature?(feature: string): boolean;
+};
+
+function assertDirectorToolHost(api: ExtensionAPI): void {
+	if (
+		(api as DirectorToolHostApi).supportsFeature?.("director-tools") !== true
+	) {
+		throw new FleetControlError(
+			"OMP Fleet requires a host with Director tool retention.",
+		);
+	}
+}
+
+function throwIfObservationCancelled(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) {
+		throw new FleetControlError("Fleet observation was cancelled.");
+	}
+}
 
 export interface FleetNoticeCursorStore {
 	read(runId: string): Promise<number>;
 	write(runId: string, cursor: number): Promise<void>;
+}
+export interface FleetAttachmentLedger {
+	read(sessionId: string): Promise<Map<string, number>>;
+	write(
+		sessionId: string,
+		runId: string,
+		cursor: number,
+		mode?: "advance" | "replace",
+	): Promise<number>;
+	writeAndCommit(
+		sessionId: string,
+		runId: string,
+		cursor: number,
+		commit: (persistedCursor: number) => void,
+	): Promise<number>;
 }
 
 export interface FleetExtensionDeps {
@@ -95,6 +161,7 @@ export interface FleetExtensionDeps {
 	reconcileIntervalMs?: number;
 	noticeLineLimit?: number;
 	cursorStore?: FleetNoticeCursorStore;
+	attachmentLedger?: FleetAttachmentLedger;
 	executeAction?: typeof executeFleetAction;
 }
 
@@ -128,13 +195,29 @@ interface NoticeDelivery {
 
 interface ReconciliationSession {
 	context: ExtensionContext;
+	sessionId: string;
 	cursorStore: FleetNoticeCursorStore;
+	attachments: Map<string, FleetAttachment>;
+	ledger: FleetAttachmentLedger;
+	store: FleetStore;
 	deliveries: Map<string, NoticeDelivery>;
 	deferredDeliveryId?: string;
 	sentDeliveryId?: string;
 	acknowledging: boolean;
 	proofFailed: boolean;
 }
+type PersistedAttachmentListener = (
+	context: ExtensionContext,
+	attachment: FleetAttachment,
+) => void;
+type ReconciliationScope =
+	| {
+			kind: "coordinator";
+			repository: string;
+			workspaceId: string;
+			coordinatorPaneId: string;
+	  }
+	| { kind: "attached"; runIds: readonly string[] };
 
 /** Persist reconciliation progress separately from sidecar-owned sampled state. */
 export function createFileNoticeCursorStore(
@@ -215,6 +298,322 @@ export function createFileNoticeCursorStore(
 		},
 	};
 }
+function currentSessionId(context: ExtensionContext): string {
+	const sessionId = context.sessionManager.getSessionId();
+	assertOpaqueId(sessionId, "Fleet session ID");
+	return sessionId;
+}
+
+function sessionMode(context: ExtensionContext): string | undefined {
+	let mode: string | undefined;
+	for (const entry of context.sessionManager.getBranch()) {
+		if (
+			!isUnknownRecord(entry) ||
+			entry["type"] !== "mode_change" ||
+			typeof entry["mode"] !== "string"
+		)
+			continue;
+		mode = entry["mode"];
+	}
+	return mode;
+}
+
+async function withAttachmentLedgerMutation<T>(
+	path: string,
+	action: () => Promise<T>,
+): Promise<T> {
+	const previous = attachmentLedgerMutationTails.get(path) ?? Promise.resolve();
+	let releaseCurrent: (() => void) | undefined;
+	const current = new Promise<void>((resolve) => {
+		releaseCurrent = resolve;
+	});
+	const tail = previous.then(
+		() => current,
+		() => current,
+	);
+	attachmentLedgerMutationTails.set(path, tail);
+	try {
+		await previous;
+		return await action();
+	} finally {
+		releaseCurrent?.();
+		if (attachmentLedgerMutationTails.get(path) === tail)
+			attachmentLedgerMutationTails.delete(path);
+	}
+}
+
+export function createFileAttachmentLedger(
+	stateRoot: string,
+): FleetAttachmentLedger {
+	if (!isAbsolute(stateRoot)) {
+		throw new FleetControlError(
+			"Fleet attachment ledger root must be absolute.",
+		);
+	}
+	const directory = join(stateRoot, ATTACHMENT_LEDGER_DIRECTORY);
+	const pathFor = (sessionId: string): string => {
+		assertOpaqueId(sessionId, "Fleet session ID");
+		return join(
+			directory,
+			`${createHash("sha256").update(sessionId).digest("hex")}.json`,
+		);
+	};
+	const ensureDirectory = async (): Promise<void> => {
+		await mkdir(directory, { recursive: true, mode: 0o700 });
+		const entry = await lstat(directory);
+		if (
+			!entry.isDirectory() ||
+			entry.isSymbolicLink() ||
+			(entry.mode & 0o777) !== 0o700
+		) {
+			throw new FleetControlError("Fleet attachment ledger is not private.");
+		}
+	};
+	const read = async (sessionId: string): Promise<Map<string, number>> => {
+		await ensureDirectory();
+		const path = pathFor(sessionId);
+		let value: unknown;
+		try {
+			const entry = await lstat(path);
+			if (
+				!entry.isFile() ||
+				entry.isSymbolicLink() ||
+				(entry.mode & 0o777) !== 0o600
+			) {
+				throw new FleetControlError("Fleet attachment ledger is invalid.");
+			}
+			value = JSON.parse(await readFile(path, "utf8"));
+		} catch (error) {
+			if (isUnknownRecord(error) && error["code"] === "ENOENT")
+				return new Map();
+			if (error instanceof FleetControlError) throw error;
+			throw new FleetControlError("Fleet attachment ledger is invalid.");
+		}
+		if (
+			!isUnknownRecord(value) ||
+			value["schemaVersion"] !== SCHEMA_VERSION ||
+			value["sessionId"] !== sessionId ||
+			!isUnknownRecord(value["cursors"]) ||
+			Object.keys(value).some(
+				(key) =>
+					key !== "schemaVersion" && key !== "sessionId" && key !== "cursors",
+			)
+		) {
+			throw new FleetControlError("Fleet attachment ledger is invalid.");
+		}
+		const cursors = new Map<string, number>();
+		for (const [runId, cursor] of Object.entries(value["cursors"])) {
+			assertRunId(runId);
+			if (!Number.isSafeInteger(cursor) || (cursor as number) < 0) {
+				throw new FleetControlError("Fleet attachment ledger is invalid.");
+			}
+			cursors.set(runId, cursor as number);
+		}
+		return cursors;
+	};
+	const persist = async (
+		sessionId: string,
+		path: string,
+		cursors: ReadonlyMap<string, number>,
+	): Promise<void> => {
+		const temporary = `${path}.${randomBytes(16).toString("hex")}.tmp`;
+		try {
+			await writeFile(
+				temporary,
+				`${JSON.stringify({ schemaVersion: SCHEMA_VERSION, sessionId, cursors: Object.fromEntries(cursors) })}\n`,
+				{ encoding: "utf8", flag: "wx", mode: 0o600 },
+			);
+			await rename(temporary, path);
+		} finally {
+			await rm(temporary, { force: true });
+		}
+	};
+	return {
+		read,
+		async write(sessionId, runId, cursor, mode = "advance") {
+			assertOpaqueId(sessionId, "Fleet session ID");
+			assertRunId(runId);
+			if (!Number.isSafeInteger(cursor) || cursor < 0) {
+				throw new FleetControlError(
+					"Fleet attachment ledger cursor is invalid.",
+				);
+			}
+			if (mode !== "advance" && mode !== "replace") {
+				throw new FleetControlError(
+					"Fleet attachment ledger write mode is invalid.",
+				);
+			}
+			const path = pathFor(sessionId);
+			return await withAttachmentLedgerMutation(path, async () => {
+				const cursors = await read(sessionId);
+				const nextCursor =
+					mode === "replace"
+						? cursor
+						: Math.max(cursors.get(runId) ?? 0, cursor);
+				cursors.set(runId, nextCursor);
+				await persist(sessionId, path, cursors);
+				return nextCursor;
+			});
+		},
+		async writeAndCommit(sessionId, runId, cursor, commit) {
+			assertOpaqueId(sessionId, "Fleet session ID");
+			assertRunId(runId);
+			if (!Number.isSafeInteger(cursor) || cursor < 0) {
+				throw new FleetControlError(
+					"Fleet attachment ledger cursor is invalid.",
+				);
+			}
+			const path = pathFor(sessionId);
+			return await withAttachmentLedgerMutation(path, async () => {
+				const cursors = await read(sessionId);
+				const hadPreviousCursor = cursors.has(runId);
+				const previousCursor = cursors.get(runId);
+				const persistedCursor = Math.max(previousCursor ?? 0, cursor);
+				cursors.set(runId, persistedCursor);
+				await persist(sessionId, path, cursors);
+				try {
+					commit(persistedCursor);
+					return persistedCursor;
+				} catch (error) {
+					if (hadPreviousCursor) cursors.set(runId, previousCursor as number);
+					else cursors.delete(runId);
+					await persist(sessionId, path, cursors);
+					throw error;
+				}
+			});
+		},
+	};
+}
+/** Restore only session entries corroborated by the private ledger and durable run state. */
+export async function readSessionAttachments(
+	context: ExtensionContext,
+	ledger?: FleetAttachmentLedger,
+	store?: FleetStore,
+	now = new Date(),
+): Promise<Map<string, FleetAttachment>> {
+	const attachments = new Map<string, FleetAttachment>();
+	if (ledger === undefined || store === undefined) return attachments;
+	const sessionId = currentSessionId(context);
+	const candidates = new Map<string, FleetAttachment>();
+	let entries: readonly unknown[];
+	try {
+		entries = context.sessionManager.getBranch();
+	} catch {
+		return attachments;
+	}
+	for (const entry of entries) {
+		if (
+			!isUnknownRecord(entry) ||
+			entry["type"] !== "custom" ||
+			entry["customType"] !== ATTACHMENT_CUSTOM_TYPE
+		) {
+			continue;
+		}
+		try {
+			const data: unknown = entry["data"];
+			assertFleetAttachment(data);
+			if (data.sessionId === sessionId) candidates.set(data.runId, { ...data });
+		} catch {
+			// Journal entries are untrusted candidates, never authority.
+		}
+	}
+	const cursors = await ledger.read(sessionId);
+	for (const [runId] of candidates) {
+		const ledgerCursor = cursors.get(runId);
+		if (ledgerCursor === undefined) continue;
+		try {
+			const [manifest, state, events] = await Promise.all([
+				store.readManifest(runId),
+				store.readState(runId),
+				store.readEvents(runId),
+			]);
+			assertRunManifest(manifest);
+			assertRunState(state);
+			if (manifest.runId !== runId || state.runId !== runId) continue;
+			for (const event of events) {
+				assertRunEvent(event);
+				if (event.runId !== runId)
+					throw new FleetControlError("Fleet event run mismatch.");
+			}
+			const cursor = Math.min(ledgerCursor, events.length);
+			if (cursor !== ledgerCursor)
+				await ledger.write(sessionId, runId, cursor, "replace");
+			const restored: FleetAttachment = {
+				schemaVersion: SCHEMA_VERSION,
+				sessionId,
+				runId,
+				workerPrefix: manifest.workerPrefix,
+				coordinatorHandle: agentHandle(manifest.coordinatorPaneId),
+				deadlineAt: manifest.deadlineAt,
+				lifecycle: manifest.lifecycle,
+				observationHealth: deriveObservationHealth(manifest, state, now),
+				workerCount: state.agents.length,
+				reportCount: state.reports.length,
+				cursor,
+			};
+			assertFleetAttachment(restored);
+			attachments.set(runId, restored);
+		} catch {
+			// A corrupt target is isolated and cannot widen attachment scope.
+		}
+	}
+	return attachments;
+}
+
+/** Append one validated, private session attachment entry. */
+export function appendSessionAttachment(
+	context: ExtensionContext,
+	attachment: FleetAttachment,
+	appendEntry: (customType: string, data: unknown) => void,
+): void {
+	assertFleetAttachment(attachment);
+	if (attachment.sessionId !== currentSessionId(context)) {
+		throw new FleetControlError("Fleet attachment session does not match.");
+	}
+	appendEntry(ATTACHMENT_CUSTOM_TYPE, attachment);
+}
+
+export function createSessionNoticeCursorStore(
+	attachments: Map<string, FleetAttachment>,
+	ledger?: FleetAttachmentLedger,
+): FleetNoticeCursorStore {
+	return {
+		async read(runId) {
+			assertRunId(runId);
+			const attachment = attachments.get(runId);
+			if (attachment === undefined) {
+				throw new FleetControlError(
+					"Fleet run is not attached to this session.",
+				);
+			}
+			assertFleetAttachment(attachment);
+			return attachment.cursor;
+		},
+		async write(runId, cursor) {
+			assertRunId(runId);
+			if (!Number.isSafeInteger(cursor) || cursor < 0) {
+				throw new FleetControlError("Fleet notice cursor value is invalid.");
+			}
+			const current = attachments.get(runId);
+			if (current === undefined) {
+				throw new FleetControlError(
+					"Fleet run is not attached to this session.",
+				);
+			}
+			assertFleetAttachment(current);
+			if (cursor <= current.cursor) return;
+			if (ledger === undefined) {
+				throw new FleetControlError("Fleet attachment ledger is unavailable.");
+			}
+			const persistedCursor = await ledger.write(
+				current.sessionId,
+				runId,
+				cursor,
+			);
+			attachments.set(runId, { ...current, cursor: persistedCursor });
+		},
+	};
+}
 
 function commandError(message: string): FleetControlError {
 	return new FleetControlError(`${message} ${COMMAND_USAGE}`);
@@ -235,6 +634,20 @@ function isFleetAction(value: unknown): value is FleetAction {
 		typeof value === "string" &&
 		FLEET_ACTIONS.some((candidate) => candidate === value)
 	);
+}
+function assertOptionalToolIntent(value: unknown, label: string): void {
+	if (value === undefined) return;
+	if (
+		typeof value !== "string" ||
+		value.length === 0 ||
+		value.length > 120 ||
+		value.trim() !== value ||
+		COMMAND_LINE_BREAK.test(value)
+	) {
+		throw new FleetControlError(
+			`${label} must be a bounded single-line string.`,
+		);
+	}
 }
 
 /** Parse the fixed slash-command grammar directly; no shell is invoked. */
@@ -309,6 +722,7 @@ function parseToolRequest(value: unknown): ParsedFleetCommand {
 			"Fleet tool action must be start, status, stop, or reports.",
 		);
 	}
+	assertOptionalToolIntent(value["i"], "Fleet intent");
 	const runId = value["runId"];
 	const prefix = value["prefix"];
 	const hours = value["hours"];
@@ -358,6 +772,36 @@ function parseToolRequest(value: unknown): ParsedFleetCommand {
 		? { action, input: {} }
 		: { action, input: { runId } };
 }
+/** Parse the observation-only model surface independently of supervisor input. */
+export function parseObserveToolRequest(value: unknown): ParsedFleetCommand {
+	if (!isUnknownRecord(value)) {
+		throw new FleetControlError("Fleet observe parameters must be an object.");
+	}
+	if (
+		Object.keys(value).some(
+			(key) => OBSERVE_TOOL_PARAMETER_FIELDS[key] !== true,
+		)
+	) {
+		throw new FleetControlError(
+			"Fleet observe parameters contain an unknown field.",
+		);
+	}
+	const action = value["action"];
+	if (action !== "status" && action !== "reports") {
+		throw new FleetControlError(
+			"Fleet observe action must be status or reports.",
+		);
+	}
+	assertOptionalToolIntent(value["i"], "Fleet observe intent");
+	const runId = value["runId"];
+	if (typeof runId !== "string") {
+		throw new FleetControlError("Fleet observe runId must be a string.");
+	}
+	if (runId.length === 0) {
+		throw new FleetControlError("Fleet observe requires an explicit runId.");
+	}
+	return { action, input: { runId } };
+}
 
 function publicErrorMessage(error: unknown): string {
 	return error instanceof FleetControlError
@@ -380,6 +824,169 @@ async function runSharedAction(
 	}
 	return result;
 }
+async function observationFrontier(
+	runId: string,
+	context: ExtensionContext,
+	dependencies: FleetExtensionDeps,
+): Promise<number> {
+	assertRunId(runId);
+	const control: FleetControlDeps = {
+		...dependencies.control,
+		cwd: context.cwd,
+	};
+	const repository = await resolveFleetRepository(context.cwd, control);
+	const stateRoot = await resolveFleetStateRoot(undefined, control, repository);
+	const store = createFleetStore(stateRoot, control);
+	const events = await store.readEvents(runId);
+	for (const event of events) {
+		assertRunEvent(event);
+		if (event.runId !== runId) {
+			throw new FleetControlError("Fleet event does not belong to its run.");
+		}
+	}
+	return events.length;
+}
+function nonterminalAttachments(
+	attachments: ReadonlyMap<string, FleetAttachment>,
+): FleetAttachment[] {
+	return [...attachments.values()].filter(
+		(attachment) => !isTerminalLifecycle(attachment.lifecycle),
+	);
+}
+
+export function updateFleetActivity(
+	context: ExtensionContext,
+	attachments: ReadonlyMap<string, FleetAttachment>,
+): void {
+	const values = [...attachments.values()].sort((left, right) =>
+		left.runId.localeCompare(right.runId),
+	);
+	if (values.length === 0) {
+		context.ui.setStatus("fleet", undefined);
+		context.ui.setWidget("fleet", undefined);
+		return;
+	}
+	const nonterminal = nonterminalAttachments(attachments);
+	const current = nonterminal.filter(
+		(attachment) => attachment.observationHealth === "current",
+	);
+	const stale = nonterminal.filter(
+		(attachment) => attachment.observationHealth === "stale",
+	).length;
+	const overdue = nonterminal.filter(
+		(attachment) => attachment.observationHealth === "overdue",
+	).length;
+	const health = [
+		...(stale === 0 ? [] : [`${stale} stale`]),
+		...(overdue === 0 ? [] : [`${overdue} overdue`]),
+	].join(" · ");
+	const status =
+		nonterminal.length === 0
+			? `fleet: ${values.length} attached · terminal · observations only`
+			: current.length > 0
+				? `fleet: ${current.length} current coverage${health === "" ? "" : ` · ${health}`} · observations only`
+				: `fleet: no current coverage${health === "" ? "" : ` · ${health}`} · observations only`;
+	context.ui.setStatus("fleet", status);
+	const visible = values.slice(0, 3);
+	const lines = [
+		"Fleet activity · observations only · not proof",
+		...visible.map(
+			(attachment) =>
+				`${attachment.runId} · ${attachment.lifecycle}/${attachment.observationHealth} · workers ${attachment.workerCount} · reports ${attachment.reportCount}`,
+		),
+	];
+	if (values.length > visible.length) {
+		lines.push(`${values.length - visible.length} more attached runs`);
+	}
+	context.ui.setWidget("fleet", lines, { placement: "belowEditor" });
+}
+
+export async function persistObservedAttachment(
+	result: FleetActionResult,
+	context: ExtensionContext,
+	dependencies: FleetExtensionDeps,
+	frontier: number,
+	appendEntry: (customType: string, data: unknown) => void,
+	signal: AbortSignal | undefined,
+	onPersisted?: PersistedAttachmentListener,
+): Promise<FleetAttachment> {
+	if (result.action !== "status" && result.action !== "reports") {
+		throw new FleetControlError("Fleet observation result is invalid.");
+	}
+	const control: FleetControlDeps = {
+		...dependencies.control,
+		cwd: context.cwd,
+	};
+	const repository = await resolveFleetRepository(context.cwd, control);
+	const stateRoot = await resolveFleetStateRoot(undefined, control, repository);
+	const store = createFleetStore(stateRoot, control);
+	const ledger =
+		dependencies.attachmentLedger ?? createFileAttachmentLedger(stateRoot);
+	const sessionId = currentSessionId(context);
+	const existing = await readSessionAttachments(context, ledger, store);
+	throwIfObservationCancelled(signal);
+	const [manifest, state, events] = await Promise.all([
+		store.readManifest(result.runId),
+		store.readState(result.runId),
+		store.readEvents(result.runId),
+	]);
+	throwIfObservationCancelled(signal);
+	assertRunManifest(manifest);
+	assertRunState(state);
+	if (manifest.runId !== result.runId || state.runId !== result.runId) {
+		throw new FleetControlError(
+			"Fleet observation does not match durable state.",
+		);
+	}
+	for (const event of events) {
+		assertRunEvent(event);
+		if (event.runId !== result.runId) {
+			throw new FleetControlError("Fleet event does not belong to its run.");
+		}
+	}
+	const cursor = Math.min(
+		events.length,
+		Math.max(existing.get(result.runId)?.cursor ?? 0, frontier),
+	);
+	const attachment: FleetAttachment = {
+		schemaVersion: SCHEMA_VERSION,
+		sessionId,
+		runId: result.runId,
+		workerPrefix: manifest.workerPrefix,
+		coordinatorHandle: agentHandle(manifest.coordinatorPaneId),
+		deadlineAt: manifest.deadlineAt,
+		lifecycle: manifest.lifecycle,
+		observationHealth: deriveObservationHealth(
+			manifest,
+			state,
+			dependencies.control?.now?.() ?? new Date(),
+		),
+		workerCount: state.agents.length,
+		reportCount: state.reports.length,
+		cursor,
+	};
+	assertFleetAttachment(attachment);
+	throwIfObservationCancelled(signal);
+	await ledger.writeAndCommit(
+		sessionId,
+		result.runId,
+		cursor,
+		(persistedCursor) => {
+			attachment.cursor = persistedCursor;
+			throwIfObservationCancelled(signal);
+			if (
+				JSON.stringify(existing.get(attachment.runId)) !==
+				JSON.stringify(attachment)
+			) {
+				appendSessionAttachment(context, attachment, appendEntry);
+			}
+			existing.set(attachment.runId, attachment);
+			updateFleetActivity(context, existing);
+			onPersisted?.(context, attachment);
+		},
+	);
+	return attachment;
+}
 
 function definedActionDetails(
 	result: FleetActionResult,
@@ -391,6 +998,9 @@ function definedActionDetails(
 		...(result.workerPrefix === undefined
 			? {}
 			: { workerPrefix: result.workerPrefix }),
+		...(result.coordinatorHandle === undefined
+			? {}
+			: { coordinatorHandle: result.coordinatorHandle }),
 		...(result.deadlineAt === undefined
 			? {}
 			: { deadlineAt: result.deadlineAt }),
@@ -414,6 +1024,9 @@ function renderActionResult(result: FleetActionResult): string {
 	assertRunLifecycle(result.lifecycle);
 	if (result.workerPrefix !== undefined) {
 		assertWorkerPrefix(result.workerPrefix);
+	}
+	if (result.coordinatorHandle !== undefined) {
+		assertAgentHandle(result.coordinatorHandle, "coordinatorHandle");
 	}
 	if (result.deadlineAt !== undefined) {
 		assertIsoTimestamp(result.deadlineAt, "deadlineAt");
@@ -616,26 +1229,47 @@ async function collectPendingNotice(
 	store: FleetStore,
 	cursorStore: FleetNoticeCursorStore,
 	stagedCursors: ReadonlyMap<string, number>,
-	repository: string,
-	workspaceId: string,
-	coordinatorPaneId: string,
+	scope: ReconciliationScope,
 	lineLimit: number,
 	actionableOnly: boolean,
 ): Promise<PendingNotice> {
-	const manifests = (await store.listRuns())
-		.filter((manifest) => {
+	const manifests: RunManifest[] = [];
+	if (scope.kind === "coordinator") {
+		for (const manifest of await store.listRuns()) {
 			try {
-				assertRunId(manifest.runId);
-				return (
-					manifest.repoPath === repository &&
-					manifest.workspaceId === workspaceId &&
-					manifest.coordinatorPaneId === coordinatorPaneId
-				);
+				assertRunManifest(manifest);
+				if (
+					manifest.repoPath === scope.repository &&
+					manifest.workspaceId === scope.workspaceId &&
+					manifest.coordinatorPaneId === scope.coordinatorPaneId
+				) {
+					manifests.push(manifest);
+				}
 			} catch {
-				return false;
+				// Invalid runs confer no reconciliation scope.
 			}
-		})
-		.sort((left, right) => left.runId.localeCompare(right.runId));
+		}
+	} else {
+		const requested = [...new Set(scope.runIds)].sort((left, right) =>
+			left.localeCompare(right),
+		);
+		for (const runId of requested) {
+			try {
+				assertRunId(runId);
+				const manifest = await store.readManifest(runId);
+				assertRunManifest(manifest);
+				if (manifest.runId !== runId) {
+					throw new FleetControlError(
+						"Fleet attachment does not match its run manifest.",
+					);
+				}
+				manifests.push(manifest);
+			} catch {
+				// A missing or corrupt attachment target is isolated and never widened.
+			}
+		}
+	}
+	manifests.sort((left, right) => left.runId.localeCompare(right.runId));
 	const candidates: PendingRunNotice[] = [];
 	for (const manifest of manifests) {
 		try {
@@ -913,7 +1547,32 @@ async function advanceNoticeCursor(
 function registerReconciliation(
 	pi: ExtensionAPI,
 	dependencies: FleetExtensionDeps,
-): void {
+): PersistedAttachmentListener {
+	const sessionIsInVibeMode = (context: ExtensionContext): boolean => {
+		try {
+			return sessionMode(context) === "vibe";
+		} catch {
+			return false;
+		}
+	};
+	const warnAboutLiveAttachments = (context: ExtensionContext): void => {
+		let live: FleetAttachment[] = [];
+		try {
+			if (activeSession?.sessionId === currentSessionId(context)) {
+				live = nonterminalAttachments(activeSession.attachments);
+			}
+		} catch {
+			return;
+		}
+		if (live.length === 0) return;
+		const visible = live.slice(0, 3).map((attachment) => attachment.runId);
+		const omitted = live.length - visible.length;
+		context.ui.notify(
+			`Fleet supervisor runs are still active: ${visible.join(", ")}${omitted > 0 ? ` (+${omitted} more)` : ""}. They continue independently and were not stopped. Observations are not proof of success.`,
+			"warning",
+		);
+	};
+
 	let timer: Timer | undefined;
 	let timerOwner: ExtensionContext | undefined;
 	let generation = 0;
@@ -921,6 +1580,10 @@ function registerReconciliation(
 
 	const clearManagedTimer = (): void => {
 		generation += 1;
+		if (activeSession !== undefined) {
+			activeSession.context.ui.setStatus("fleet", undefined);
+			activeSession.context.ui.setWidget("fleet", undefined);
+		}
 		activeSession = undefined;
 		if (timer !== undefined && timerOwner !== undefined)
 			timerOwner.clearTimer(timer);
@@ -1132,21 +1795,12 @@ function registerReconciliation(
 		demoteSentIfSafe(session);
 	});
 
-	pi.on("session_start", async (_event, context) => {
+	const bindSession = async (
+		_event: unknown,
+		context: ExtensionContext,
+	): Promise<void> => {
 		clearManagedTimer();
 		const sessionGeneration = generation;
-		const environment = dependencies.control?.env ?? process.env;
-		if (environment.HERDR_ENV !== "1") return;
-		const workspaceId = environment.HERDR_WORKSPACE_ID;
-		const currentPaneId = environment.HERDR_PANE_ID;
-		try {
-			assertOpaqueId(workspaceId, "Workspace ID");
-			assertOpaqueId(currentPaneId, "Coordinator pane ID");
-		} catch {
-			return;
-		}
-		const coordinatorPaneId = currentPaneId;
-
 		const control: FleetControlDeps = {
 			...dependencies.control,
 			cwd: context.cwd,
@@ -1160,15 +1814,51 @@ function registerReconciliation(
 			return;
 		}
 		const store = createFleetStore(stateRoot, control);
+		const ledger =
+			dependencies.attachmentLedger ?? createFileAttachmentLedger(stateRoot);
+		let attachments: Map<string, FleetAttachment>;
+		try {
+			attachments = await readSessionAttachments(context, ledger, store);
+		} catch {
+			return;
+		}
+		updateFleetActivity(context, attachments);
+		const environment = dependencies.control?.env ?? process.env;
+		let coordinatorScope:
+			| Extract<ReconciliationScope, { kind: "coordinator" }>
+			| undefined;
+		if (attachments.size === 0 && environment.HERDR_ENV === "1") {
+			const workspaceId = environment.HERDR_WORKSPACE_ID;
+			const coordinatorPaneId = environment.HERDR_PANE_ID;
+			try {
+				assertOpaqueId(workspaceId, "Workspace ID");
+				assertOpaqueId(coordinatorPaneId, "Coordinator pane ID");
+			} catch {
+				return;
+			}
+			coordinatorScope = {
+				kind: "coordinator",
+				repository,
+				workspaceId,
+				coordinatorPaneId,
+			};
+		}
 		const cursorStore =
-			dependencies.cursorStore ?? createFileNoticeCursorStore(stateRoot);
+			attachments.size > 0
+				? createSessionNoticeCursorStore(attachments, ledger)
+				: (dependencies.cursorStore ?? createFileNoticeCursorStore(stateRoot));
 		const session: ReconciliationSession = {
 			context,
+			sessionId: currentSessionId(context),
 			cursorStore,
+			attachments,
+			ledger,
+			store,
 			deliveries: new Map<string, NoticeDelivery>(),
 			acknowledging: false,
 			proofFailed: false,
 		};
+		if (sessionGeneration !== generation) return;
 		activeSession = session;
 		let reconciling = false;
 		const sendAutonomously = (delivery: NoticeDelivery): void => {
@@ -1178,7 +1868,7 @@ function registerReconciliation(
 			try {
 				pi.sendMessage(noticeMessage(delivery), {
 					deliverAs: "nextTurn",
-					triggerTurn: true,
+					triggerTurn: false,
 				});
 			} catch (error) {
 				delivery.sentAutonomously = false;
@@ -1191,6 +1881,23 @@ function registerReconciliation(
 			if (sessionGeneration !== generation || reconciling) return;
 			reconciling = true;
 			try {
+				const hadAttachments = session.attachments.size > 0;
+				const restored = await readSessionAttachments(
+					session.context,
+					session.ledger,
+					session.store,
+				);
+				session.attachments.clear();
+				for (const [runId, attachment] of restored) {
+					session.attachments.set(runId, attachment);
+				}
+				if (!hadAttachments && session.attachments.size > 0) {
+					session.cursorStore = createSessionNoticeCursorStore(
+						session.attachments,
+						session.ledger,
+					);
+				}
+				updateFleetActivity(session.context, session.attachments);
 				await proveNoticeDeliveries(session);
 				demoteSentIfSafe(session);
 				if (hasUnackedAutonomousSend(session)) return;
@@ -1206,6 +1913,13 @@ function registerReconciliation(
 						: session.deliveries.get(deferredId);
 				const canSubsume =
 					deferred !== undefined && !deliveryMayHaveBeenObserved(deferred);
+				const scope: ReconciliationScope =
+					session.attachments.size > 0
+						? {
+								kind: "attached",
+								runIds: [...session.attachments.keys()],
+							}
+						: (coordinatorScope ?? { kind: "attached", runIds: [] });
 				const pending = await collectPendingNotice(
 					store,
 					session.cursorStore,
@@ -1213,9 +1927,7 @@ function registerReconciliation(
 						session.deliveries,
 						canSubsume ? deferredId : undefined,
 					),
-					repository,
-					workspaceId,
-					coordinatorPaneId,
+					scope,
 					lineLimit,
 					deferredId !== undefined,
 				);
@@ -1260,11 +1972,42 @@ function registerReconciliation(
 		timerOwner = context;
 		timer = context.setInterval(reconcile, interval);
 		await reconcile();
+	};
+	pi.on("session_start", bindSession);
+	pi.on("session_switch", bindSession);
+	pi.on("session_branch", bindSession);
+	pi.on("session_tree", bindSession);
+
+	pi.on("input", (event, context) => {
+		if (event.text.trim() === "/vibe" && sessionIsInVibeMode(context)) {
+			warnAboutLiveAttachments(context);
+		}
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, context) => {
+		warnAboutLiveAttachments(context);
 		clearManagedTimer();
 	});
+	return (context, attachment): void => {
+		const session = activeSession;
+		if (session === undefined || session.sessionId !== attachment.sessionId) {
+			return;
+		}
+		try {
+			if (session.sessionId !== currentSessionId(context)) return;
+		} catch {
+			return;
+		}
+		const hadAttachments = session.attachments.size > 0;
+		session.attachments.set(attachment.runId, attachment);
+		if (!hadAttachments) {
+			session.cursorStore = createSessionNoticeCursorStore(
+				session.attachments,
+				session.ledger,
+			);
+		}
+		updateFleetActivity(session.context, session.attachments);
+	};
 }
 
 /** Create an injectable OMP extension factory for focused control-plane tests. */
@@ -1272,6 +2015,8 @@ export function createFleetExtension(
 	dependencies: FleetExtensionDeps = {},
 ): ExtensionFactory {
 	return (pi: ExtensionAPI): void => {
+		assertDirectorToolHost(pi);
+		const notePersistedAttachment = registerReconciliation(pi, dependencies);
 		pi.registerCommand("fleet", {
 			description:
 				"Read Fleet status/reports across sessions; without a run ID, in-Herdr selection is repository+workspace+coordinator and non-Herdr selection is repository-wide across coordinators, using sole-active then newest-terminal precedence; start requires a Herdr coordinator; stop requires the owning Herdr coordinator",
@@ -1295,6 +2040,71 @@ export function createFleetExtension(
 		keywordApi.registerInputKeyword?.("fleet");
 
 		const z = pi.zod;
+		const observeTool: DirectorToolDefinition = {
+			name: "fleet_observe",
+			label: "Fleet Observe",
+			description:
+				"Observation-only Fleet status and report metadata. Accepts only status or reports with an explicit run ID. Successful observations attach that exact run to this session for read-only reconciliation. Observed states and reports are not proof of success.",
+			parameters: z
+				.object({
+					action: z
+						.enum(["status", "reports"])
+						.describe("Read-only Fleet observation action."),
+					runId: z
+						.string()
+						.describe(
+							"Required explicit run ID to observe; fleet_observe never performs implicit selection.",
+						),
+				})
+				.strict(),
+			approval: "read",
+			directorMode: "read-only",
+			strict: false,
+			loadMode: "essential",
+			async execute(_toolCallId, parameters, signal, _onUpdate, context) {
+				try {
+					throwIfObservationCancelled(signal);
+					const request = parseObserveToolRequest(parameters);
+					const requestedRunId = request.input.runId;
+					if (requestedRunId === undefined) {
+						throw new FleetControlError(
+							"Fleet observe requires an explicit runId.",
+						);
+					}
+					const frontier = await observationFrontier(
+						requestedRunId,
+						context,
+						dependencies,
+					);
+					throwIfObservationCancelled(signal);
+					const result = await runSharedAction(request, context, dependencies);
+					throwIfObservationCancelled(signal);
+					if (result.runId !== requestedRunId) {
+						throw new FleetControlError(
+							"Fleet observe result does not match requested runId.",
+						);
+					}
+					throwIfObservationCancelled(signal);
+					await persistObservedAttachment(
+						result,
+						context,
+						dependencies,
+						frontier,
+						(customType, data) => pi.appendEntry(customType, data),
+						signal,
+						notePersistedAttachment,
+					);
+					return {
+						content: [{ type: "text", text: renderActionResult(result) }],
+						details: definedActionDetails(result),
+					};
+				} catch (error) {
+					throw new FleetControlError(publicErrorMessage(error));
+				}
+			},
+		};
+		pi.registerTool(observeTool);
+
 		pi.registerTool({
 			name: "fleet_supervisor",
 			label: "Fleet Supervisor",
@@ -1355,8 +2165,6 @@ export function createFleetExtension(
 				}
 			},
 		});
-
-		registerReconciliation(pi, dependencies);
 	};
 }
 

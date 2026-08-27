@@ -783,6 +783,7 @@ describe("fleet control", () => {
 			runId: "run-fixed-001",
 			lifecycle: "starting",
 			workerPrefix: "worker-",
+			coordinatorHandle: "agent-a1bf11c153a1",
 			deadlineAt: "2030-01-02T09:04:05.000Z",
 			text: [
 				"Fleet run run-fixed-001 launch dispatched.",
@@ -1644,6 +1645,7 @@ describe("fleet control", () => {
 			runId,
 			lifecycle: "running",
 			workerPrefix: "eval-",
+			coordinatorHandle: "agent-a1bf11c153a1",
 			deadlineAt: "2030-01-02T09:04:05.000Z",
 			observationHealth: "current",
 			workerCount: 2,
@@ -2361,6 +2363,7 @@ describe("fleet control", () => {
 			runId,
 			lifecycle: "completed",
 			workerPrefix: "worker-",
+			coordinatorHandle: "agent-86eb91ef1de0",
 			deadlineAt: "2026-08-11T06:00:00.000Z",
 			observationHealth: "terminal",
 			workerCount: 0,
@@ -2547,6 +2550,7 @@ describe("fleet control", () => {
 			runId,
 			lifecycle: "stopping",
 			workerPrefix: "worker-",
+			coordinatorHandle: "agent-bcfe381e0918",
 			deadlineAt: "2026-08-11T06:00:00.000Z",
 			text: "Fleet run run-to-stop stop requested; supervisor agent-38a0bd0c1129 remains stopping pending sidecar confirmation.",
 		});
