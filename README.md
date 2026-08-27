@@ -11,6 +11,7 @@ Shared for every caller:
 - Bun 1.3.0 or newer
 - a patched/new OMP host exposing stable session identity, session mode, passive
   `sendMessage(..., { triggerTurn: false })`, and Director essential-tool retention.
+  OMP 18.0.8 is the minimum supported release.
   Fleet's Director retention and secure attachment restoration require this host
   contract; compatibility with older unpatched OMP releases is not claimed.
   The extension checks the `director-tools` host feature before registering and
@@ -61,10 +62,10 @@ the plugin-native `omp-fleet-supervision` skill installed with Fleet below.
 
 ## Install the plugin and skill
 
-Install the immutable v0.2.11 Git tag directly over HTTPS:
+Install the immutable v0.2.12 Git tag directly over HTTPS:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.2.11'
+omp plugin install 'git+https://github.com/ericjuta/omp-fleet.git#v0.2.12'
 ```
 
 This single command installs both the Fleet extension and its packaged
