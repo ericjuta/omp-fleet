@@ -1317,6 +1317,212 @@ describe("fleet extension", () => {
 			},
 		]);
 	});
+	test("fleet_observe rejects malformed results before attachment side effects", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const runId = "run-malformed-observe";
+		const base: FleetActionResult = {
+			action: "status",
+			text: "Fleet status observation.",
+			runId,
+			lifecycle: "running",
+			workerPrefix: "worker-",
+			coordinatorHandle: "agent-abcdef012345",
+			deadlineAt: "2030-01-02T09:00:00.000Z",
+			observationHealth: "current",
+			workerCount: 0,
+			reportCount: 0,
+		};
+		const cases: Array<{
+			name: string;
+			action: "status" | "reports";
+			result: unknown;
+		}> = [
+			{
+				name: "action",
+				action: "status",
+				result: { ...base, action: "resume" },
+			},
+			{
+				name: "requested action",
+				action: "status",
+				result: { ...base, action: "reports" },
+			},
+			{
+				name: "runId",
+				action: "status",
+				result: { ...base, runId: "unsafe run id" },
+			},
+			{
+				name: "requested runId",
+				action: "status",
+				result: { ...base, runId: "run-other-observe" },
+			},
+			{
+				name: "lifecycle",
+				action: "status",
+				result: { ...base, lifecycle: "unknown" },
+			},
+			{ name: "text", action: "status", result: { ...base, text: "" } },
+			{
+				name: "workerCount",
+				action: "status",
+				result: { ...base, workerCount: -1 },
+			},
+			{
+				name: "reports fields",
+				action: "reports",
+				result: { ...base, action: "reports", reportCount: undefined },
+			},
+		];
+
+		for (const candidate of cases) {
+			const store = new MemoryFleetStore();
+			store.manifests.set(
+				runId,
+				makeManifest({ runId, repoPath, lifecycle: "running" }),
+			);
+			store.states.set(
+				runId,
+				makeState({ runId, updatedAt: FIXED_NOW.toISOString() }),
+			);
+			store.events.set(runId, []);
+			const ledger = new MemoryAttachmentLedger();
+			const api = installExtension({
+				control: controlDependencies(
+					repoPath,
+					stateRoot,
+					store,
+					new FakeHerdr(),
+					{ env: {} },
+				),
+				attachmentLedger: ledger,
+				executeAction: async () => candidate.result as FleetActionResult,
+			});
+			const context = new FakeExtensionContext(repoPath);
+			await api.requireSessionStart()({}, context.value);
+			const statusUpdates = context.statusUpdates.length;
+			const widgetUpdates = context.widgetUpdates.length;
+
+			await expect(
+				api
+					.requireTool("fleet_observe")
+					.execute(
+						`malformed-${candidate.name}`,
+						{ action: candidate.action, runId },
+						new AbortController().signal,
+						() => {},
+						context.value,
+					),
+			).rejects.toThrow(/Fleet action/i);
+			expect(context.entries).toEqual([]);
+			expect(await ledger.read(context.sessionId)).toEqual(new Map());
+			expect(context.statusUpdates).toHaveLength(statusUpdates);
+			expect(context.widgetUpdates).toHaveLength(widgetUpdates);
+			await api.invokeSessionShutdown(context);
+			expect(context.notifications).toEqual([]);
+		}
+	});
+	test("reconciliation preserves an attachment persisted during a delayed restore", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const runId = "run-concurrent-attachment";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({
+				runId,
+				repoPath,
+				lifecycle: "running",
+				createdAt: "2030-01-02T03:00:00.000Z",
+				deadlineAt: "2030-01-02T09:00:00.000Z",
+			}),
+		);
+		store.states.set(
+			runId,
+			makeState({ runId, updatedAt: FIXED_NOW.toISOString() }),
+		);
+		store.events.set(runId, []);
+
+		let markDelayedReadStarted: () => void = () => {};
+		let releaseDelayedRead: () => void = () => {};
+		const delayedReadStarted = new Promise<void>((resolve) => {
+			markDelayedReadStarted = resolve;
+		});
+		const delayedReadReleased = new Promise<void>((resolve) => {
+			releaseDelayedRead = resolve;
+		});
+		class DelayedReconciliationLedger extends MemoryAttachmentLedger {
+			delayNextRead = false;
+
+			override async read(sessionId: string): Promise<Map<string, number>> {
+				if (this.delayNextRead) {
+					this.delayNextRead = false;
+					markDelayedReadStarted();
+					await delayedReadReleased;
+				}
+				return await super.read(sessionId);
+			}
+		}
+		const ledger = new DelayedReconciliationLedger();
+		const api = installExtension({
+			control: controlDependencies(
+				repoPath,
+				stateRoot,
+				store,
+				new FakeHerdr(),
+				{ env: {} },
+			),
+			attachmentLedger: ledger,
+			executeAction: async (action) => ({
+				action,
+				text: "Fleet status observation.",
+				runId,
+				lifecycle: "running",
+				workerPrefix: "worker-",
+				coordinatorHandle: "agent-abcdef012345",
+				deadlineAt: "2030-01-02T09:00:00.000Z",
+				observationHealth: "current",
+				workerCount: 0,
+				reportCount: 0,
+			}),
+		});
+		const context = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, context.value);
+
+		ledger.delayNextRead = true;
+		const pendingReconciliation = context.runInterval();
+		await delayedReadStarted;
+		await api
+			.requireTool("fleet_observe")
+			.execute(
+				"observe-during-restore",
+				{ action: "status", runId },
+				new AbortController().signal,
+				() => {},
+				context.value,
+			);
+		store.events.set(runId, [
+			agentEvent(
+				runId,
+				"worker-concurrent-attachment",
+				"blocked",
+				"2030-01-02T04:00:00.000Z",
+			),
+		]);
+		releaseDelayedRead();
+		await pendingReconciliation;
+
+		expect(context.entries).toHaveLength(1);
+		expect(api.sentNotices).toHaveLength(1);
+		expect(api.sentNotices[0]?.message.content).toContain(`run ${runId}`);
+		expect(api.sentNotices[0]?.message.content).toContain("BLOCKED observed");
+		await api.invokeSessionShutdown(context);
+		expect(context.notifications).toEqual([
+			{
+				level: "warning",
+				text: expect.stringContaining(runId),
+			},
+		]);
+	});
 	test("fleet_observe does not attach a run after cancellation", async () => {
 		const { repoPath, stateRoot } = await fixturePaths();
 		const store = new MemoryFleetStore();
@@ -2392,6 +2598,59 @@ describe("fleet extension", () => {
 		expect(context.clearedTimers).toEqual([timerHandle]);
 		await api.invokeSessionShutdown(context);
 		expect(context.clearedTimers).toEqual([timerHandle]);
+	});
+	test("shutdown clears timer and UI when the live-run warning throws", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const runId = "run-throwing-shutdown-warning";
+		const store = new MemoryFleetStore();
+		store.manifests.set(
+			runId,
+			makeManifest({ runId, repoPath, lifecycle: "running" }),
+		);
+		store.states.set(
+			runId,
+			makeState({ runId, updatedAt: FIXED_NOW.toISOString() }),
+		);
+		store.events.set(runId, []);
+		const ledger = new MemoryAttachmentLedger();
+		await ledger.write("session-test", runId, 0);
+		const api = installExtension({
+			control: controlDependencies(
+				repoPath,
+				stateRoot,
+				store,
+				new FakeHerdr(),
+				{ env: {} },
+			),
+			attachmentLedger: ledger,
+		});
+		const context = new FakeExtensionContext(repoPath);
+		context.entries.push({
+			type: "custom",
+			customType: ATTACHMENT_CUSTOM_TYPE,
+			data: makeAttachment({ runId }),
+		});
+		await api.requireSessionStart()({}, context.value);
+		const timerHandle = context.intervals[0]?.handle;
+		const ui = context.value.ui as {
+			notify(text: string, level: string): void;
+		};
+		ui.notify = () => {
+			throw new Error("shutdown notify failed");
+		};
+
+		await expect(api.invokeSessionShutdown(context)).rejects.toThrow(
+			"shutdown notify failed",
+		);
+		expect(context.clearedTimers).toEqual([timerHandle]);
+		expect(context.statusUpdates.at(-1)).toEqual({
+			id: "fleet",
+			text: undefined,
+		});
+		expect(context.widgetUpdates.at(-1)).toEqual({
+			id: "fleet",
+			content: undefined,
+		});
 	});
 
 	test("reconciliation filters by repository, workspace, and coordinator", async () => {

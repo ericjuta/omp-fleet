@@ -28,7 +28,6 @@ import {
 	type FleetControlDeps,
 	FleetControlError,
 	type FleetStore,
-	OBSERVATION_HEALTHS,
 	resolveFleetRepository,
 	resolveFleetStateRoot,
 } from "./control.ts";
@@ -38,6 +37,7 @@ import {
 	assertAgentHandle,
 	assertFleetAttachment,
 	assertIsoTimestamp,
+	assertObservationHealth,
 	assertOpaqueId,
 	assertRunEvent,
 	assertRunId,
@@ -94,7 +94,6 @@ const ATTACHMENT_LEDGER_DIRECTORY = ".attachment-ledger";
 const attachmentLedgerMutationTails = new Map<string, Promise<void>>();
 const NOTICE_CUSTOM_TYPE = "omp-fleet-notice";
 const NOTICE_DELIVERY_ID_FIELD = "deliveryId";
-const OBSERVATION_HEALTH_VALUES = new Set(OBSERVATION_HEALTHS);
 
 export interface ParsedFleetCommand {
 	action: FleetAction;
@@ -198,6 +197,7 @@ interface ReconciliationSession {
 	sessionId: string;
 	cursorStore: FleetNoticeCursorStore;
 	attachments: Map<string, FleetAttachment>;
+	attachmentRevision: number;
 	ledger: FleetAttachmentLedger;
 	store: FleetStore;
 	deliveries: Map<string, NoticeDelivery>;
@@ -819,6 +819,7 @@ async function runSharedAction(
 		...dependencies.control,
 		cwd: context.cwd,
 	});
+	assertFleetActionResult(result);
 	if (result.action !== request.action) {
 		throw new FleetControlError("Fleet action result is invalid.");
 	}
@@ -910,6 +911,7 @@ export async function persistObservedAttachment(
 	signal: AbortSignal | undefined,
 	onPersisted?: PersistedAttachmentListener,
 ): Promise<FleetAttachment> {
+	assertFleetActionResult(result);
 	if (result.action !== "status" && result.action !== "reports") {
 		throw new FleetControlError("Fleet observation result is invalid.");
 	}
@@ -1016,8 +1018,10 @@ function definedActionDetails(
 	};
 }
 
-function renderActionResult(result: FleetActionResult): string {
-	if (!isFleetAction(result.action)) {
+function assertFleetActionResult(
+	result: unknown,
+): asserts result is FleetActionResult {
+	if (!isUnknownRecord(result) || !isFleetAction(result.action)) {
 		throw new FleetControlError("Fleet action result is invalid.");
 	}
 	assertRunId(result.runId);
@@ -1031,40 +1035,44 @@ function renderActionResult(result: FleetActionResult): string {
 	if (result.deadlineAt !== undefined) {
 		assertIsoTimestamp(result.deadlineAt, "deadlineAt");
 	}
+	const observationHealth = result.observationHealth;
+	if (observationHealth !== undefined) {
+		assertObservationHealth(observationHealth);
+	}
+	const workerCount = result.workerCount;
 	if (
-		result.observationHealth !== undefined &&
-		!OBSERVATION_HEALTH_VALUES.has(result.observationHealth)
+		workerCount !== undefined &&
+		(typeof workerCount !== "number" ||
+			!Number.isSafeInteger(workerCount) ||
+			workerCount < 0)
 	) {
 		throw new FleetControlError("Fleet action result is invalid.");
 	}
+	const reportCount = result.reportCount;
 	if (
-		result.workerCount !== undefined &&
-		(!Number.isSafeInteger(result.workerCount) || result.workerCount < 0)
-	) {
-		throw new FleetControlError("Fleet action result is invalid.");
-	}
-	if (
-		result.reportCount !== undefined &&
-		(!Number.isSafeInteger(result.reportCount) ||
-			result.reportCount < 0 ||
-			result.reportCount > REPORT_LIMIT)
+		reportCount !== undefined &&
+		(typeof reportCount !== "number" ||
+			!Number.isSafeInteger(reportCount) ||
+			reportCount < 0 ||
+			reportCount > REPORT_LIMIT)
 	) {
 		throw new FleetControlError("Fleet action result is invalid.");
 	}
 	if (result.action === "reports" && result.reportCount === undefined) {
 		throw new FleetControlError("Fleet action result is invalid.");
 	}
+	const text = result.text;
 	if (
-		typeof result.text !== "string" ||
-		result.text.length === 0 ||
-		result.text.length > ACTION_RESULT_MAX_LENGTH ||
-		ABSOLUTE_PATH_TOKEN.test(result.text)
+		typeof text !== "string" ||
+		text.length === 0 ||
+		text.length > ACTION_RESULT_MAX_LENGTH ||
+		ABSOLUTE_PATH_TOKEN.test(text)
 	) {
 		throw new FleetControlError("Fleet action result is invalid.");
 	}
 	let lineCount = 1;
-	for (let index = 0; index < result.text.length; index += 1) {
-		const codeUnit = result.text.charCodeAt(index);
+	for (let index = 0; index < text.length; index += 1) {
+		const codeUnit = text.charCodeAt(index);
 		if (codeUnit === 0x0a) {
 			lineCount += 1;
 			continue;
@@ -1081,6 +1089,10 @@ function renderActionResult(result: FleetActionResult): string {
 	if (lineCount > ACTION_RESULT_MAX_LINES) {
 		throw new FleetControlError("Fleet action result is invalid.");
 	}
+}
+
+function renderActionResult(result: FleetActionResult): string {
+	assertFleetActionResult(result);
 	const metadataText = result.text.startsWith(`${UNTRUSTED_METADATA_WARNING}\n`)
 		? result.text
 		: `${UNTRUSTED_METADATA_WARNING}\n${result.text}`;
@@ -1852,6 +1864,7 @@ function registerReconciliation(
 			sessionId: currentSessionId(context),
 			cursorStore,
 			attachments,
+			attachmentRevision: 0,
 			ledger,
 			store,
 			deliveries: new Map<string, NoticeDelivery>(),
@@ -1882,20 +1895,24 @@ function registerReconciliation(
 			reconciling = true;
 			try {
 				const hadAttachments = session.attachments.size > 0;
+				const attachmentRevision = session.attachmentRevision;
 				const restored = await readSessionAttachments(
 					session.context,
 					session.ledger,
 					session.store,
 				);
-				session.attachments.clear();
-				for (const [runId, attachment] of restored) {
-					session.attachments.set(runId, attachment);
-				}
-				if (!hadAttachments && session.attachments.size > 0) {
-					session.cursorStore = createSessionNoticeCursorStore(
-						session.attachments,
-						session.ledger,
-					);
+				if (sessionGeneration !== generation) return;
+				if (attachmentRevision === session.attachmentRevision) {
+					session.attachments.clear();
+					for (const [runId, attachment] of restored) {
+						session.attachments.set(runId, attachment);
+					}
+					if (!hadAttachments && session.attachments.size > 0) {
+						session.cursorStore = createSessionNoticeCursorStore(
+							session.attachments,
+							session.ledger,
+						);
+					}
 				}
 				updateFleetActivity(session.context, session.attachments);
 				await proveNoticeDeliveries(session);
@@ -1985,8 +2002,11 @@ function registerReconciliation(
 	});
 
 	pi.on("session_shutdown", (_event, context) => {
-		warnAboutLiveAttachments(context);
-		clearManagedTimer();
+		try {
+			warnAboutLiveAttachments(context);
+		} finally {
+			clearManagedTimer();
+		}
 	});
 	return (context, attachment): void => {
 		const session = activeSession;
@@ -2000,6 +2020,7 @@ function registerReconciliation(
 		}
 		const hadAttachments = session.attachments.size > 0;
 		session.attachments.set(attachment.runId, attachment);
+		session.attachmentRevision += 1;
 		if (!hadAttachments) {
 			session.cursorStore = createSessionNoticeCursorStore(
 				session.attachments,
@@ -2081,7 +2102,7 @@ export function createFleetExtension(
 					throwIfObservationCancelled(signal);
 					if (result.runId !== requestedRunId) {
 						throw new FleetControlError(
-							"Fleet observe result does not match requested runId.",
+							"Fleet action result does not match requested runId.",
 						);
 					}
 					throwIfObservationCancelled(signal);
