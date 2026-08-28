@@ -23,9 +23,9 @@ exact-prefix Fleet observation. **observe** — Fleet's bounded role.
 capture.
 
 Use the installed OMP Fleet extension as the only supervisor implementation.
-Director/Vibe retention, stable session binding, mode-aware exit warnings, and
-passive notice delivery require the patched/new OMP host contract. Do not claim
-compatibility with older unpatched hosts merely because the extension loads.
+Director/Vibe retention re-activates `fleet_observe` through the host
+active-tool API after Vibe strips the toolset. Stable session binding,
+mode-aware exit warnings, and passive notice delivery require OMP 18.0.8+.
 Do not add a second or overlapping supervisor, unmanaged supervision,
 automatic worker launch as Fleet, automatic Fleet renewal,
 grading, deployment, or background cleanup.

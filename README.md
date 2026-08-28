@@ -9,14 +9,10 @@ Shared auto-handoff is parent-session composition through Herdr tooling, not a F
 Shared for every caller:
 
 - Bun 1.3.0 or newer
-- a patched/new OMP host exposing stable session identity, session mode, passive
-  `sendMessage(..., { triggerTurn: false })`, and Director essential-tool retention.
-  OMP 18.0.8 is the minimum supported release.
-  Fleet's Director retention and secure attachment restoration require this host
-  contract; compatibility with older unpatched OMP releases is not claimed.
-  The extension checks the `director-tools` host feature before registering and
-  fails closed when the behavior is unavailable.
-- a patched/new OMP build implementing the host contract above; a numeric legacy version floor alone is insufficient
+- OMP 18.0.8 or newer with stable session identity, session mode, passive
+  `sendMessage(..., { triggerTurn: false })`, and `getActiveTools` /
+  `setActiveTools`. In Vibe/Director, Fleet re-activates `fleet_observe`
+  through that active-tool API after the host strips the toolset.
 - an existing Git worktree as the current directory; its root must be an absolute path other than `/` or the user's home directory
 
 `start` and `stop` are Herdr-only. Those mutating actions also require:

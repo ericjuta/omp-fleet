@@ -112,21 +112,22 @@ export interface FleetObserveToolParameters {
 	runId: string;
 }
 
-type DirectorToolDefinition = Parameters<ExtensionAPI["registerTool"]>[0] & {
-	directorMode: "read-only";
-};
-type DirectorToolHostApi = ExtensionAPI & {
-	supportsFeature?(feature: string): boolean;
-};
+const FLEET_OBSERVE_TOOL_NAME = "fleet_observe";
 
-function assertDirectorToolHost(api: ExtensionAPI): void {
-	if (
-		(api as DirectorToolHostApi).supportsFeature?.("director-tools") !== true
-	) {
-		throw new FleetControlError(
-			"OMP Fleet requires a host with Director tool retention.",
-		);
+async function retainFleetObserveTool(
+	pi: ExtensionAPI,
+	context: ExtensionContext,
+): Promise<void> {
+	let mode: string | undefined;
+	try {
+		mode = sessionMode(context);
+	} catch {
+		return;
 	}
+	if (mode !== "vibe") return;
+	const active = pi.getActiveTools();
+	if (active.includes(FLEET_OBSERVE_TOOL_NAME)) return;
+	await pi.setActiveTools([...active, FLEET_OBSERVE_TOOL_NAME]);
 }
 
 function throwIfObservationCancelled(signal: AbortSignal | undefined): void {
@@ -1756,7 +1757,26 @@ function registerReconciliation(
 		delete session.sentDeliveryId;
 	};
 
-	pi.on("before_agent_start", () => {
+	const retainOrAbort = async (context: ExtensionContext): Promise<boolean> => {
+		try {
+			await retainFleetObserveTool(pi, context);
+			return true;
+		} catch (error) {
+			const detail =
+				error instanceof Error && error.message.length > 0
+					? error.message
+					: "host active-tool API failed";
+			context.ui.notify(
+				`Fleet could not retain fleet_observe in Vibe: ${detail}`,
+				"error",
+			);
+			context.abort();
+			return false;
+		}
+	};
+
+	pi.on("before_agent_start", async (_event, context) => {
+		if (!(await retainOrAbort(context))) return;
 		const session = activeSession;
 		if (session === undefined) return;
 		if (session.sentDeliveryId !== undefined) return;
@@ -1811,6 +1831,7 @@ function registerReconciliation(
 		_event: unknown,
 		context: ExtensionContext,
 	): Promise<void> => {
+		await retainOrAbort(context);
 		clearManagedTimer();
 		const sessionGeneration = generation;
 		const control: FleetControlDeps = {
@@ -2036,7 +2057,6 @@ export function createFleetExtension(
 	dependencies: FleetExtensionDeps = {},
 ): ExtensionFactory {
 	return (pi: ExtensionAPI): void => {
-		assertDirectorToolHost(pi);
 		const notePersistedAttachment = registerReconciliation(pi, dependencies);
 		pi.registerCommand("fleet", {
 			description:
@@ -2061,7 +2081,7 @@ export function createFleetExtension(
 		keywordApi.registerInputKeyword?.("fleet");
 
 		const z = pi.zod;
-		const observeTool: DirectorToolDefinition = {
+		const observeTool: Parameters<ExtensionAPI["registerTool"]>[0] = {
 			name: "fleet_observe",
 			label: "Fleet Observe",
 			description:
@@ -2079,7 +2099,6 @@ export function createFleetExtension(
 				})
 				.strict(),
 			approval: "read",
-			directorMode: "read-only",
 			strict: false,
 			loadMode: "essential",
 			async execute(_toolCallId, parameters, signal, _onUpdate, context) {

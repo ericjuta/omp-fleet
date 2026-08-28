@@ -429,7 +429,6 @@ interface ToolRegistration {
 	description: string;
 	parameters: unknown;
 	approval: string;
-	directorMode?: string;
 	strict: boolean;
 	loadMode: string;
 	execute(
@@ -574,11 +573,15 @@ class FakeExtensionApi {
 	command: CommandRegistration | undefined;
 	readonly tools = new Map<string, ToolRegistration>();
 	readonly inputKeywords: string[] = [];
+	activeTools: string[] = [];
 	#entryContext: FakeExtensionContext | undefined;
-	constructor(private readonly directorTools = true) {}
 
-	supportsFeature(feature: string): boolean {
-		return this.directorTools && feature === "director-tools";
+	getActiveTools(): string[] {
+		return [...this.activeTools];
+	}
+
+	async setActiveTools(toolNames: string[]): Promise<void> {
+		this.activeTools = [...toolNames];
 	}
 
 	registerCommand(name: string, registration: unknown): void {
@@ -795,6 +798,7 @@ class FakeExtensionContext {
 	readonly sessionFile: string;
 	idle = true;
 	pendingMessages = false;
+	aborted = false;
 	journalError: Error | undefined;
 	sessionId = "session-test";
 	readonly value: Readonly<Record<string, unknown>>;
@@ -842,6 +846,9 @@ class FakeExtensionContext {
 			},
 			isIdle: (): boolean => this.idle,
 			hasPendingMessages: (): boolean => this.pendingMessages,
+			abort: (): void => {
+				this.aborted = true;
+			},
 			setInterval: (
 				callback: () => void | Promise<void>,
 				milliseconds: number,
@@ -1107,14 +1114,75 @@ function agentEvent(
 }
 
 describe("fleet extension", () => {
-	test("refuses hosts without Director tool retention before registration", () => {
-		const api = new FakeExtensionApi(false);
-		expect(() =>
-			createFleetExtension({})(api as unknown as ExtensionAPI),
-		).toThrow("OMP Fleet requires a host with Director tool retention.");
-		expect(api.commandName).toBeUndefined();
-		expect(api.tools.size).toBe(0);
-		expect(api.handlers.size).toBe(0);
+	test("re-activates fleet_observe across vibe enter, a turn, and session switch", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const api = installExtension({
+			control: controlDependencies(
+				repoPath,
+				stateRoot,
+				new MemoryFleetStore(),
+				new FakeHerdr(),
+				{ env: {} },
+			),
+		});
+		const session = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, session.value);
+
+		api.activeTools = ["read", "vibe_spawn"];
+		const vibeTurn = new FakeExtensionContext(repoPath);
+		vibeTurn.entries.push({ type: "mode_change", mode: "vibe" });
+		await api.invokeBeforeAgentStart(vibeTurn);
+		expect(api.activeTools).toEqual(["read", "vibe_spawn", "fleet_observe"]);
+
+		await api.invokeBeforeAgentStart(vibeTurn);
+		expect(api.activeTools).toEqual(["read", "vibe_spawn", "fleet_observe"]);
+
+		const restored = new FakeExtensionContext(repoPath);
+		restored.entries.push({ type: "mode_change", mode: "none" });
+		api.activeTools = ["read", "bash", "fleet_observe", "fleet_supervisor"];
+		await api.invokeSessionTransition("session_switch", restored);
+		expect(api.activeTools).toEqual([
+			"read",
+			"bash",
+			"fleet_observe",
+			"fleet_supervisor",
+		]);
+
+		const switchedVibe = new FakeExtensionContext(repoPath);
+		switchedVibe.entries.push({ type: "mode_change", mode: "vibe" });
+		api.activeTools = ["read", "vibe_spawn"];
+		await api.invokeSessionTransition("session_switch", switchedVibe);
+		expect(api.activeTools).toEqual(["read", "vibe_spawn", "fleet_observe"]);
+	});
+
+	test("surfaces a rejecting setActiveTools during vibe retention", async () => {
+		const { repoPath, stateRoot } = await fixturePaths();
+		const api = installExtension({
+			control: controlDependencies(
+				repoPath,
+				stateRoot,
+				new MemoryFleetStore(),
+				new FakeHerdr(),
+				{ env: {} },
+			),
+		});
+		const session = new FakeExtensionContext(repoPath);
+		await api.requireSessionStart()({}, session.value);
+		api.activeTools = ["read", "vibe_spawn"];
+		api.setActiveTools = async (): Promise<void> => {
+			throw new Error("active tools rejected");
+		};
+		const vibeTurn = new FakeExtensionContext(repoPath);
+		vibeTurn.entries.push({ type: "mode_change", mode: "vibe" });
+		expect(await api.invokeBeforeAgentStart(vibeTurn)).toBeUndefined();
+		expect(vibeTurn.aborted).toBe(true);
+		expect(vibeTurn.notifications).toEqual([
+			{
+				level: "error",
+				text: "Fleet could not retain fleet_observe in Vibe: active tools rejected",
+			},
+		]);
+		expect(api.activeTools).toEqual(["read", "vibe_spawn"]);
 	});
 
 	test("registration uses the keyword API when the host exposes it", () => {
@@ -1134,7 +1202,6 @@ describe("fleet extension", () => {
 		expect(api.requireTool("fleet_observe")).toMatchObject({
 			name: "fleet_observe",
 			approval: "read",
-			directorMode: "read-only",
 			strict: false,
 			loadMode: "essential",
 		});
